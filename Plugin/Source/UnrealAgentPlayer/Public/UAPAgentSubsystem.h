@@ -1,0 +1,97 @@
+#pragma once
+
+#include "CoreMinimal.h"
+#include "EditorSubsystem.h"
+#include "UAPAgentTypes.h"
+#include "UAPAgentSubsystem.generated.h"
+
+UCLASS()
+class UNREALAGENTPLAYER_API UUAPAgentSubsystem : public UEditorSubsystem
+{
+    GENERATED_BODY()
+
+public:
+    virtual void Initialize(FSubsystemCollectionBase& Collection) override;
+    virtual void Deinitialize() override;
+
+    UFUNCTION(BlueprintCallable, Category="Agent|Status")
+    FString GetPluginVersion() const;
+
+    UFUNCTION(BlueprintCallable, Category="Agent|Status")
+    FString ExecuteConsoleCommand(FString Command);
+
+    // Brings the editor's main window to the foreground. Works from inside the editor
+    // process (no cross-process foreground lock), so an external agent can make the
+    // editor frontmost before capturing screenshots or injecting clicks. Windows only.
+    UFUNCTION(BlueprintCallable, Category="Agent|Editor")
+    bool FocusEditorWindow();
+
+    UFUNCTION(BlueprintCallable, Category="Agent|PIE")
+    EAgentPIEPhase GetPIEPhase() const;
+
+    UFUNCTION(BlueprintCallable, Category="Agent|PIE")
+    double GetPIEElapsedSeconds() const;
+
+    UFUNCTION(BlueprintCallable, Category="Agent|Log")
+    int64 GetLogCursor() const;
+
+    UFUNCTION(BlueprintCallable, Category="Agent|Log")
+    FString GetLogsSince(int64 AfterCursor, int32 MaxLines,
+                         FString CategoryFilter, EAgentLogVerbosity MinVerbosity) const;
+
+    UFUNCTION(BlueprintCallable, Category="Agent|Input")
+    bool InjectKey(FString KeyName, bool bPressed, bool bRepeat);
+
+    UFUNCTION(BlueprintCallable, Category="Agent|Input")
+    bool InjectMouseMove(float X, float Y, bool bAbsolute);
+
+    UFUNCTION(BlueprintCallable, Category="Agent|Input")
+    bool InjectMouseButton(EAgentMouseButton Button, bool bPressed);
+
+    UFUNCTION(BlueprintCallable, Category="Agent|Input")
+    bool InjectAxis(FString AxisName, float Value);
+
+    UFUNCTION(BlueprintCallable, Category="Agent|Input")
+    bool InjectGamepad(EAgentGamepadButton Button, bool bPressed, float AnalogValue);
+
+    UFUNCTION(BlueprintCallable, Category="Agent|Input")
+    bool InjectXRButton(EAgentXRHand Hand, FString ButtonKeyName, bool bPressed);
+
+    UFUNCTION(BlueprintCallable, Category="Agent|Input")
+    bool InjectXRControllerPose(EAgentXRHand Hand, FVector Position, FRotator Orientation, bool bTracked);
+
+    UFUNCTION(BlueprintCallable, Category="Agent|Input")
+    bool ClearXRControllerOverride(EAgentXRHand Hand);
+
+    UFUNCTION(BlueprintCallable, Category="Agent|Helpers")
+    TArray<FAgentHelperDescriptor> ListTestHelpers();
+
+    UFUNCTION(BlueprintCallable, Category="Agent|Helpers")
+    FString CallTestHelper(FString Name, FString JsonArgs);
+
+    UFUNCTION(BlueprintCallable, Category="Agent|Perf")
+    FString GetStatGroupText(FString GroupName);
+
+private:
+    void OnPostPIEStarted(bool bSimulating);
+    void OnPrePIEEnded(bool bSimulating);
+    void OnEndPIE(bool bSimulating);
+    void OnPausePIE(bool bSimulating);
+    void OnResumePIE(bool bSimulating);
+    void OnCancelPIE();
+
+    EAgentPIEPhase CurrentPhase = EAgentPIEPhase::NotPlaying;
+    double PIEStartTimeSeconds = 0.0;
+
+    FDelegateHandle HPostPIEStarted;
+    FDelegateHandle HPrePIEEnded;
+    FDelegateHandle HEndPIE;
+    FDelegateHandle HPausePIE;
+    FDelegateHandle HResumePIE;
+    FDelegateHandle HCancelPIE;
+
+    TSharedPtr<class FAgentLogCapture> LogCapture;
+
+    TArray<FAgentHelperDescriptor> HelperCache;
+    void RefreshHelperCache();
+};

@@ -1,0 +1,38 @@
+name: ci-ue
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "Plugin/**"
+      - "examples/loopback-project/**"
+      - ".github/workflows/ci-ue.yml"
+
+jobs:
+  build-and-test:
+    runs-on: [self-hosted, windows, ue56]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Symlink plugin into loopback project
+        run: |
+          if (Test-Path examples\loopback-project\Plugins\UnrealAgentPlayer) {
+            Remove-Item -Recurse -Force examples\loopback-project\Plugins\UnrealAgentPlayer
+          }
+          New-Item -ItemType Junction -Path examples\loopback-project\Plugins\UnrealAgentPlayer -Target $PWD\Plugin
+      - name: Build editor module
+        run: |
+          & "$env:UE_ROOT\Engine\Binaries\DotNET\UnrealBuildTool\UnrealBuildTool.exe" `
+            LoopbackProjectEditor Win64 Development `
+            -Project="$PWD\examples\loopback-project\LoopbackProject.uproject" -WaitMutex
+      - name: Run UE Automation tests
+        run: |
+          & "$env:UE_ROOT\Engine\Binaries\Win64\UnrealEditor-Cmd.exe" `
+            "$PWD\examples\loopback-project\LoopbackProject.uproject" `
+            -ExecCmds="Automation RunTests UAP; Quit" `
+            -Unattended -NullRHI -ReportOutputPath="$PWD\TestReport"
+      - name: Upload report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ue-test-report
+          path: TestReport/

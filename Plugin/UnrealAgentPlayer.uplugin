@@ -1,0 +1,31 @@
+{
+  "FileVersion": 3,
+  "Version": 1,
+  "VersionName": "0.0.1",
+  "FriendlyName": "Unreal Agent Player",
+  "Description": "Agent-driven self-testing for Unreal Editor. Input injection, log capture, PIE phase, test helpers.",
+  "Category": "Developer",
+  "CreatedBy": "Rei Vieira / Imagine Games, LLC",
+  "CreatedByURL": "https://github.com/reivieira",
+  "DocsURL": "",
+  "MarketplaceURL": "",
+  "SupportURL": "",
+  "CanContainContent": false,
+  "IsBetaVersion": true,
+  "IsExperimentalVersion": false,
+  "Installed": false,
+  "SupportedTargetPlatforms": [ "Win64" ],
+  "Modules": [
+    {
+      "Name": "UnrealAgentPlayer",
+      "Type": "Editor",
+      "LoadingPhase": "PostEngineInit",
+      "PlatformAllowList": [ "Win64" ]
+    }
+  ],
+  "Plugins": [
+    { "Name": "RemoteControl",             "Enabled": true },
+    { "Name": "RemoteControlWebInterface", "Enabled": true },
+    { "Name": "PythonScriptPlugin",        "Enabled": true }
+  ]
+}
