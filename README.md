@@ -67,6 +67,7 @@ Input injection is **in-process via Slate** — `FSlateApplication::ProcessKeyDo
 | **Console** | `exec_console` | Run any console command. |
 | **Python** | `exec_python` | Run arbitrary `import unreal` editor scripting (level load, state reads, etc.). |
 | **Actors** | `actor_find` `actor_get_properties` `actor_set_property` | Introspect and tweak actors in the world. |
+| **Read UI** | `read_viewport_ui` | Read on-screen UMG text + focus so the agent can respond to prompts/menus instead of guessing. |
 | **Screenshots** | `screenshot_viewport` | Capture the viewport (HighResShot — see [gaps](#whats-proven-vs-known-gaps)). |
 | **Test helpers** | `helper_list` + `CallTestHelper` | Auto-discover and call project-specific Blueprint/C++ assertion helpers (e.g. `IsDoorOpen`). |
 | **Editor menus** | `ui_menu_click` `ui_find_window` `ui_list_menus` | Drive native editor menu bar via Windows UIAutomation. |
@@ -114,11 +115,12 @@ Expected: `ue_running: true`, `rc_reachable: true`, `remote_exec_reachable: true
 
 **Proven (runtime-verified on a shipping VR project):**
 - In-process key injection drives the PIE player pawn while the editor is **not** the foreground window, and works across two open editors.
+- `read_viewport_ui` reads live on-screen UMG text + focus (verified reading real connection/onboarding screens).
 - Real `stat unit` draw/GPU/render-thread timings; perf baseline save/compare.
 - PIE lifecycle, log capture, console + Python bridges, actor introspection, Blueprint helper discovery, editor-menu UIAutomation, in-process editor focus.
 
 **Known gaps / roadmap:**
-- **Screenshots omit UMG.** `screenshot_viewport` uses `HighResShot`, which does not capture the UMG layer — so on-screen UI/prompts don't appear. A backbuffer/desktop capture path (and an in-game **UMG text/focus reader** so the agent can *read* on-screen prompts instead of guessing) is the next perception feature.
+- **Screenshots omit UMG.** `screenshot_viewport` uses `HighResShot`, which does not capture the UMG layer — so on-screen UI/prompts don't appear *in the image*. To **read** on-screen UI, use `read_viewport_ui` (deterministic text + focus). A backbuffer/desktop capture path for pixel-level UI (icon/glyph prompts with no text) is still on the roadmap.
 - **VR HMD pose injection is deferred** — no clean modular-feature hook; needs a fake `IXRTrackingSystem`.
 - **VR controller pose-follow is limited in HMD-less PIE** — a real XR runtime (e.g. Meta XR Simulator) wins modular-feature precedence over the agent's fake controller. Button injection is unaffected. See [docs/architecture.md](docs/architecture.md).
 - **Windows only.** See below.

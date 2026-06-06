@@ -31,6 +31,7 @@ from unreal_agent_player.tools.baseline import perf_baseline_save, perf_baseline
 from unreal_agent_player.tools.ui import ui_find_window, ui_list_menus, ui_menu_click
 from unreal_agent_player.baselines import BaselineStore
 from unreal_agent_player.uia import UIADriver
+from unreal_agent_player.tools.ui_read import read_viewport_ui
 from unreal_agent_player.transport import PythonRemoteExecClient, RemoteControlClient
 
 
@@ -254,6 +255,13 @@ def register_all(
              inputSchema={"type":"object",
                  "properties":{"window_title":{"type":"string"}},
                  "required":["window_title"], "additionalProperties":False}),
+        Tool(name="read_viewport_ui",
+             description=(
+                 "Read the on-screen UMG of the running PIE game: visible text, screen position, "
+                 "and which element is focused. Use this to read prompts/labels (e.g. 'Press E') "
+                 "and menu highlight before injecting input, instead of guessing. "
+                 "Returns {available, count, focused, texts:[{text,x,y,focused}]}."),
+             inputSchema={"type":"object","properties":{},"additionalProperties":False}),
     ]
 
     handlers: dict[str, ToolHandler] = {
@@ -291,6 +299,7 @@ def register_all(
         "ui_menu_click":  lambda **kw: ui_menu_click(driver=ui_driver, **kw),
         "ui_find_window": lambda **kw: ui_find_window(driver=ui_driver, **kw),
         "ui_list_menus":  lambda **kw: ui_list_menus(driver=ui_driver, **kw),
+        "read_viewport_ui": lambda **kw: read_viewport_ui(rc=rc, py_exec=py_exec, **kw),
     }
 
     @server.list_tools()

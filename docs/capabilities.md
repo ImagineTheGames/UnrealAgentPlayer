@@ -117,13 +117,39 @@ Useful for asserting on world state ("did the door actor's `bIsOpen` flip?") and
 
 ---
 
+## Read on-screen UI (UMG)
+
+### `read_viewport_ui`
+Reads the live UMG layer of the running PIE game so the agent can **see** prompts, labels, and menu buttons — and respond to them — instead of injecting input blind.
+
+**Inputs:** none.
+**Returns:**
+```json
+{
+  "available": true,
+  "count": 14,
+  "focused": "Next >",
+  "texts": [
+    {"text": "Press E to open", "x": 960.0, "y": 540.0, "focused": false},
+    {"text": "Next >",          "x": 1394.0, "y": 950.0, "focused": true}
+  ]
+}
+```
+- `texts` — every visible UMG text element (`UTextBlock`/`UCommonTextBlock` subclasses + `URichTextBlock`), with absolute screen-pixel position. Unpainted/off-screen ghosts (position `0,0`) are filtered out.
+- `focused` — the text under the currently keyboard/user-focused widget (the highlighted menu item in gamepad/CommonUI navigation), or `""`.
+- `available` — `false` when there is no active PIE session.
+
+Use it to read a prompt's required key (`"Press E"` → inject `E`), enumerate menu buttons, and know which one is highlighted before navigating. Backed by the plugin's `DumpViewportUI` UFUNCTION (UMG layer, so it captures what `HighResShot` screenshots cannot).
+
+---
+
 ## Screenshots
 
 ### `screenshot_viewport`
 **Inputs:** `resolution` (e.g. `1920x1080`), filename, flags.
 **Captures** the game viewport via `HighResShot`.
 
-> **Limitation:** `HighResShot` does **not** include the UMG layer, so on-screen UI/HUD/prompts will not appear. For reading on-screen UI today, use `exec_python` to introspect the widget tree; a backbuffer/desktop capture path and a dedicated UMG text reader are on the roadmap (see [README → gaps](../README.md#whats-proven-vs-known-gaps)).
+> **Limitation:** `HighResShot` does **not** include the UMG layer, so on-screen UI/HUD/prompts will not appear in the image. To *read* on-screen UI, use **`read_viewport_ui`** above (deterministic text, no pixels). A backbuffer/desktop capture path for pixel-level UI (icons/glyphs with no text) is still on the roadmap.
 
 ---
 

@@ -72,6 +72,12 @@ public:
     UFUNCTION(BlueprintCallable, Category="Agent|Perf")
     FString GetStatGroupText(FString GroupName);
 
+    // Reads the on-screen UMG layer of the running PIE game (visible text, screen
+    // position, focus) as a JSON string, so an agent can read prompts/labels instead
+    // of injecting input blind. Empty/`available:false` when not in PIE.
+    UFUNCTION(BlueprintCallable, Category="Agent|UI")
+    FString DumpViewportUI();
+
 private:
     void OnPostPIEStarted(bool bSimulating);
     void OnPrePIEEnded(bool bSimulating);

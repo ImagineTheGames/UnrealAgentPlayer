@@ -19,6 +19,7 @@
 #include "RHIGlobals.h"
 #include "RenderTimer.h"
 #include "AgentMotionController.h"
+#include "AgentUIReader.h"
 #include "Framework/Application/SlateApplication.h"
 #include "Widgets/SWindow.h"
 #include "GenericPlatform/GenericWindow.h"
@@ -267,6 +268,11 @@ bool UUAPAgentSubsystem::ClearXRControllerOverride(EAgentXRHand Hand)
     if (!MC) { return false; }
     MC->ClearPose(Hand);
     return true;
+}
+
+FString UUAPAgentSubsystem::DumpViewportUI()
+{
+    return FAgentUIReader::DumpViewportUI();
 }
 
 void UUAPAgentSubsystem::RefreshHelperCache()

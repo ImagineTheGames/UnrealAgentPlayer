@@ -19,6 +19,7 @@ public class UnrealAgentPlayer : ModuleRules
         {
             "Slate",
             "SlateCore",
+            "UMG",
             "ApplicationCore",
             "EditorSubsystem",
             "UnrealEd",
