@@ -33,6 +33,12 @@ from unreal_agent_player.baselines import BaselineStore
 from unreal_agent_player.uia import UIADriver
 from unreal_agent_player.tools.ui_read import read_viewport_ui
 from unreal_agent_player.transport import PythonRemoteExecClient, RemoteControlClient
+from unreal_agent_player.tools.report import (
+    report_assert, report_caption, report_finish, report_note, report_start,
+)
+from unreal_agent_player.reporting import session as report_session
+from unreal_agent_player.reporting.session import record_call
+import time as _time
 
 
 ToolHandler = Callable[..., Awaitable[dict[str, Any]]]
@@ -262,6 +268,26 @@ def register_all(
                  "and menu highlight before injecting input, instead of guessing. "
                  "Returns {available, count, focused, texts:[{text,x,y,focused}]}."),
              inputSchema={"type":"object","properties":{},"additionalProperties":False}),
+        Tool(name="report_start",
+             description="Begin an agent run report. Auto-captures subsequent tool calls + screenshots until report_finish.",
+             inputSchema={"type":"object","properties":{"task":{"type":"string"},"project":{"type":"string"}},
+                 "required":["task"],"additionalProperties":False}),
+        Tool(name="report_assert",
+             description="Record a pass/fail check with evidence into the active report.",
+             inputSchema={"type":"object","properties":{"label":{"type":"string"},"passed":{"type":"boolean"},"evidence":{"type":"string"}},
+                 "required":["label","passed"],"additionalProperties":False}),
+        Tool(name="report_note",
+             description="Add a curated note to the active report (optional section heading).",
+             inputSchema={"type":"object","properties":{"text":{"type":"string"},"section":{"type":"string"}},
+                 "required":["text"],"additionalProperties":False}),
+        Tool(name="report_caption",
+             description="Set a caption on a gallery screenshot (by index/filename; omit for most recent).",
+             inputSchema={"type":"object","properties":{"caption":{"type":"string"},"screenshot":{}},
+                 "required":["caption"],"additionalProperties":False}),
+        Tool(name="report_finish",
+             description="Finish the report: verdict 'pass'/'fail' + summary. Renders tabbed HTML and opens it.",
+             inputSchema={"type":"object","properties":{"verdict":{"type":"string","enum":["pass","fail"]},"summary":{"type":"string"}},
+                 "required":["verdict","summary"],"additionalProperties":False}),
     ]
 
     handlers: dict[str, ToolHandler] = {
@@ -300,6 +326,11 @@ def register_all(
         "ui_find_window": lambda **kw: ui_find_window(driver=ui_driver, **kw),
         "ui_list_menus":  lambda **kw: ui_list_menus(driver=ui_driver, **kw),
         "read_viewport_ui": lambda **kw: read_viewport_ui(rc=rc, py_exec=py_exec, **kw),
+        "report_start":   lambda **kw: report_start(rc=rc, py_exec=py_exec, **kw),
+        "report_assert":  lambda **kw: report_assert(rc=rc, py_exec=py_exec, **kw),
+        "report_note":    lambda **kw: report_note(rc=rc, py_exec=py_exec, **kw),
+        "report_caption": lambda **kw: report_caption(rc=rc, py_exec=py_exec, **kw),
+        "report_finish":  lambda **kw: report_finish(rc=rc, py_exec=py_exec, **kw),
     }
 
     @server.list_tools()
@@ -321,7 +352,12 @@ def register_all(
             }
         else:
             try:
+                _t0 = _time.monotonic()
                 body = await handler(**arguments)
+                _ms = int((_time.monotonic() - _t0) * 1000)
+                _sess = report_session.active()
+                if _sess is not None and name != "report_finish":
+                    record_call(_sess, name, arguments, body, _ms)
             except AgentError as exc:
                 body = exc.to_response()
             except Exception as exc:
