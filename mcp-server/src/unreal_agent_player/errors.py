@@ -24,6 +24,7 @@ class ErrorCode(str, Enum):
     TIMEOUT = "TIMEOUT"
     UIA_UNAVAILABLE = "UIA_UNAVAILABLE"
     UIA_PATH_NOT_FOUND = "UIA_PATH_NOT_FOUND"
+    REPORT_NO_SESSION = "REPORT_NO_SESSION"
 
     @classmethod
     def domain_of(cls, code: "ErrorCode") -> str:
