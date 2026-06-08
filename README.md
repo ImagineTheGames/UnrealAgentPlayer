@@ -68,6 +68,7 @@ Input injection is **in-process via Slate** — `FSlateApplication::ProcessKeyDo
 | **Python** | `exec_python` | Run arbitrary `import unreal` editor scripting (level load, state reads, etc.). |
 | **Actors** | `actor_find` `actor_get_properties` `actor_set_property` | Introspect and tweak actors in the world. |
 | **Read UI** | `read_viewport_ui` | Read on-screen UMG text + focus so the agent can respond to prompts/menus instead of guessing. |
+| **Reporting** | `report_start` `report_assert` `report_note` `report_caption` `report_finish` | Auto-capture a run into a tabbed HTML report (verdict, checks, screenshot gallery, tool timeline, diagnostics) and auto-open it. |
 | **Screenshots** | `screenshot_viewport` | Capture the viewport (HighResShot — see [gaps](#whats-proven-vs-known-gaps)). |
 | **Test helpers** | `helper_list` + `CallTestHelper` | Auto-discover and call project-specific Blueprint/C++ assertion helpers (e.g. `IsDoorOpen`). |
 | **Editor menus** | `ui_menu_click` `ui_find_window` `ui_list_menus` | Drive native editor menu bar via Windows UIAutomation. |
@@ -118,6 +119,7 @@ Expected: `ue_running: true`, `rc_reachable: true`, `remote_exec_reachable: true
 - `read_viewport_ui` reads live on-screen UMG text + focus (verified reading real connection/onboarding screens).
 - Real `stat unit` draw/GPU/render-thread timings; perf baseline save/compare.
 - PIE lifecycle, log capture, console + Python bridges, actor introspection, Blueprint helper discovery, editor-menu UIAutomation, in-process editor focus.
+- `report_*` produces a tabbed HTML run report with auto-captured timeline + screenshot gallery.
 
 **Known gaps / roadmap:**
 - **Screenshots omit UMG.** `screenshot_viewport` uses `HighResShot`, which does not capture the UMG layer — so on-screen UI/prompts don't appear *in the image*. To **read** on-screen UI, use `read_viewport_ui` (deterministic text + focus). A backbuffer/desktop capture path for pixel-level UI (icon/glyph prompts with no text) is still on the roadmap.

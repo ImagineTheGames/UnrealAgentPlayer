@@ -153,6 +153,23 @@ Use it to read a prompt's required key (`"Press E"` → inject `E`), enumerate m
 
 ---
 
+## Run reporting
+
+Capture an agent run into a self-contained, tabbed HTML report and open it.
+
+| Tool | Purpose |
+| --- | --- |
+| `report_start` | Begin a run report (task, optional project). Auto-captures every subsequent tool call + screenshots/perf/logs/env until finish. |
+| `report_assert` | Record a pass/fail check with evidence. |
+| `report_note` | Add a curated note (optional section). |
+| `report_caption` | Caption a gallery screenshot (by index/filename; omit for most recent). |
+| `report_finish` | `verdict` (`pass`/`fail`) + `summary`; renders `index.html` (Overview/Screenshots/Timeline/Diagnostics tabs) and auto-opens it. |
+
+Reports are written to `~/.uap-reports/<timestamp>__<task>/` (override with
+`UAP_REPORTS_DIR`): `index.html` + `screenshots/*.png` + `data.json`.
+
+---
+
 ## Project test helpers
 
 A project can expose its own assertion functions (C++ `UFUNCTION`s or Blueprint functions) tagged for discovery. The plugin finds them; the agent calls them by name.
