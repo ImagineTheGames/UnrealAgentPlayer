@@ -49,7 +49,7 @@ def _overview(d: dict) -> str:
     for a in d.get("assertions", []):
         cls = "pass" if a.get("passed") else "fail"
         parts.append(f"<div class='check {cls}'>{_e(a.get('label'))}"
-                     f"<span class='evi'>{a.get('evidence', '')}</span></div>")
+                     f"<span class='evi'>{_e(a.get('evidence', ''))}</span></div>")
     return "".join(parts)
 
 
@@ -99,7 +99,7 @@ def _diag(d: dict) -> str:
 
 def render(data: dict) -> str:
     status = data.get("status", "running")
-    verdict = {"pass": "PASS", "fail": "FAIL"}.get(status, status.upper())
+    verdict = {"pass": "&#x2705; PASS", "fail": "&#x274C; FAIL"}.get(status, status.upper())
     meta = f"{_e(data.get('started'))} &middot; {_e(data.get('duration_s'))}s &middot; {_e(data.get('project'))}"
     panels = {
         "Overview": _overview(data), "Screenshots": _shots(data),

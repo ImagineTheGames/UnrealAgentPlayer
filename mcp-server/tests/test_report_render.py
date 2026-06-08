@@ -38,7 +38,8 @@ def test_render_has_four_tabs():
 
 def test_render_includes_assertions_and_screenshot_img():
     html = render(_data())
-    assert "pawn moved" in html and "9400->9874" in html
+    # evidence "9400->9874": the > is HTML-escaped to &gt;
+    assert "pawn moved" in html and "9400-&gt;9874" in html
     assert '<img' in html and "screenshots/000.png" in html
 
 
@@ -52,6 +53,19 @@ def test_render_fail_status_class():
     html = render(_data(status="fail"))
     assert "FAIL" in html
     assert "status-fail" in html
+
+
+def test_render_escapes_html_in_assertion_evidence():
+    d = _data(assertions=[
+        {"label": "moved <far>", "passed": True, "evidence": "9400-&gt;9874 or <b>boom</b>"},
+    ])
+    html = render(d)
+    # raw injection strings must not appear verbatim
+    assert "<far>" not in html
+    assert "<b>boom</b>" not in html
+    # escaped forms must be present
+    assert "&lt;far&gt;" in html
+    assert "&lt;b&gt;" in html
 
 
 def test_render_deterministic():
