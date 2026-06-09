@@ -78,6 +78,13 @@ public:
     UFUNCTION(BlueprintCallable, Category="Agent|UI")
     FString DumpViewportUI();
 
+    // Requests a screenshot of the composited game backbuffer INCLUDING the UMG/Slate
+    // overlay (unlike HighResShot, which captures only the 3D scene). The engine writes
+    // the PNG to Filename on the next rendered frame; poll for the file. Filename should
+    // be an absolute path ending in .png. Returns false if no request could be made.
+    UFUNCTION(BlueprintCallable, Category="Agent|Capture")
+    bool CaptureViewportWithUI(FString Filename);
+
 private:
     void OnPostPIEStarted(bool bSimulating);
     void OnPrePIEEnded(bool bSimulating);

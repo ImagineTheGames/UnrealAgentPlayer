@@ -20,6 +20,8 @@
 #include "RenderTimer.h"
 #include "AgentMotionController.h"
 #include "AgentUIReader.h"
+#include "UnrealClient.h"
+#include "HAL/IConsoleManager.h"
 #include "Framework/Application/SlateApplication.h"
 #include "Widgets/SWindow.h"
 #include "GenericPlatform/GenericWindow.h"
@@ -273,6 +275,30 @@ bool UUAPAgentSubsystem::ClearXRControllerOverride(EAgentXRHand Hand)
 FString UUAPAgentSubsystem::DumpViewportUI()
 {
     return FAgentUIReader::DumpViewportUI();
+}
+
+bool UUAPAgentSubsystem::CaptureViewportWithUI(FString Filename)
+{
+    if (Filename.IsEmpty())
+    {
+        return false;
+    }
+    // Keep rendering while the editor is not the foreground window, otherwise the
+    // backbuffer can be stale/black when an external agent triggers the capture.
+    if (IConsoleVariable* CVar = IConsoleManager::Get().FindConsoleVariable(TEXT("t.IdleWhenNotForeground")))
+    {
+        CVar->Set(0, ECVF_SetByCode);
+    }
+
+    // bShowUI=true reads back the composited backbuffer (3D scene + UMG/Slate), unlike
+    // HighResShot (scene only). The filename overload reliably processes the request
+    // in-editor and writes the PNG on the next rendered frame; the caller polls for it.
+    // NOTE: in embedded PIE the backbuffer is the whole editor window, so the shot
+    // includes editor chrome around the game viewport. Cropping to just the viewport is
+    // a known follow-up (best done in the MCP layer to avoid engine screenshot-timing
+    // fragility).
+    FScreenshotRequest::RequestScreenshot(Filename, /*bShowUI=*/true, /*bAddUniqueSuffix=*/false);
+    return true;
 }
 
 void UUAPAgentSubsystem::RefreshHelperCache()

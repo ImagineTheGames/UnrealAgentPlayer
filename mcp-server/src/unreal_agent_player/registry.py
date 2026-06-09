@@ -125,13 +125,16 @@ def register_all(
                  "required": ["path", "function"], "additionalProperties": False}),
         Tool(
             name="screenshot_viewport",
-            description="Capture the PIE/editor viewport via HighResShot. Returns file path; set inline=true for base64.",
+            description=("Capture the PIE/editor viewport. Default (ui=true) grabs the composited "
+                         "backbuffer INCLUDING on-screen UMG (window resolution). Set ui=false for a "
+                         "HighResShot of the 3D scene only (no UMG, but arbitrary resolution/HDR). "
+                         "Returns file path; set inline=true for base64."),
             inputSchema={
                 "type": "object",
                 "properties": {
                     "resolution": {"type": "string", "default": "1920x1080", "pattern": r"^\d{2,5}x\d{2,5}$"},
                     "hdr": {"type": "boolean", "default": False},
-                    "ui": {"type": "boolean", "default": False},
+                    "ui": {"type": "boolean", "default": True},
                     "inline": {"type": "boolean", "default": False},
                 },
                 "additionalProperties": False,

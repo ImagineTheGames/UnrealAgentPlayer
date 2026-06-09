@@ -9,7 +9,7 @@ import time
 from typing import Any
 
 from unreal_agent_player.errors import AgentError, ErrorCode
-from unreal_agent_player.transport import RemoteControlClient
+from unreal_agent_player.transport import RemoteControlClient, SUBSYSTEM_OBJECT_PATH
 
 
 _RES_RE = re.compile(r"^(\d{2,5})x(\d{2,5})$")
@@ -26,7 +26,7 @@ async def screenshot_viewport(
     *, rc: RemoteControlClient, py_exec: Any,
     resolution: str = "1920x1080",
     hdr: bool = False,
-    ui: bool = False,
+    ui: bool = True,
     inline: bool = False,
     _output_path_override: str | None = None,
 ) -> dict[str, Any]:
@@ -40,11 +40,21 @@ async def screenshot_viewport(
             f"uap_{int(time.time() * 1000)}.png",
         )
 
-    flags: list[str] = []
-    if ui:  flags.append("ForceUISharingLayer=1")
-    if hdr: flags.append("HDR=1")
-    cmd = f"HighResShot {width}x{height} filename=\"{out_path}\" {' '.join(flags)}".strip()
-    await rc.exec_console(cmd)
+    if ui:
+        # Composited backbuffer (3D scene + UMG/Slate overlay). Window resolution,
+        # not arbitrary high-res, but shows the on-screen UI. This is the default.
+        await rc.call_function(
+            SUBSYSTEM_OBJECT_PATH, "CaptureViewportWithUI",
+            parameters={"Filename": out_path},
+        )
+    else:
+        # HighResShot: tiled re-render of the 3D scene only (no UMG), but supports
+        # arbitrary resolution / HDR.
+        flags: list[str] = []
+        if hdr:
+            flags.append("HDR=1")
+        cmd = f"HighResShot {width}x{height} filename=\"{out_path}\" {' '.join(flags)}".strip()
+        await rc.exec_console(cmd)
 
     deadline = time.monotonic() + 8.0
     while time.monotonic() < deadline:
