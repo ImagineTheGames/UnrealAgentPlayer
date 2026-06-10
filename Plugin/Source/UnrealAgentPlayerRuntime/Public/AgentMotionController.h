@@ -10,7 +10,7 @@
  * When an override for a hand is cleared, GetControllerOrientationAndPosition returns false
  * for that source so real devices (if any) win.
  */
-class FAgentMotionController : public IMotionController
+class UNREALAGENTPLAYERRUNTIME_API FAgentMotionController : public IMotionController
 {
 public:
     FAgentMotionController();

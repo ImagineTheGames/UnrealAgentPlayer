@@ -13,7 +13,7 @@ struct FAgentLogEntry
     FString Message;
 };
 
-class FAgentLogCapture : public FOutputDevice
+class UNREALAGENTPLAYERRUNTIME_API FAgentLogCapture : public FOutputDevice
 {
 public:
     FAgentLogCapture(int32 Capacity);

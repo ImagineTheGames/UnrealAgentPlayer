@@ -1,6 +1,5 @@
 #include "UnrealAgentPlayerModule.h"
 #include "AgentRemoteControlBootstrap.h"
-#include "AgentMotionController.h"
 #include "AgentHelperBlueprintDetails.h"
 #include "PropertyEditorModule.h"
 #include "K2Node_FunctionEntry.h"
@@ -26,8 +25,6 @@ void FUnrealAgentPlayerModule::StartupModule()
                            SPIF_SENDWININICHANGE | SPIF_UPDATEINIFILE);
 #endif
     FAgentRemoteControlBootstrap::Startup();
-    MotionController = MakeShared<FAgentMotionController>();
-    MotionController->Register();
 
     FPropertyEditorModule& PropEd = FModuleManager::LoadModuleChecked<FPropertyEditorModule>("PropertyEditor");
     PropEd.RegisterCustomClassLayout(
@@ -42,19 +39,8 @@ void FUnrealAgentPlayerModule::ShutdownModule()
         FPropertyEditorModule& PropEd = FModuleManager::GetModuleChecked<FPropertyEditorModule>("PropertyEditor");
         PropEd.UnregisterCustomClassLayout(UK2Node_FunctionEntry::StaticClass()->GetFName());
     }
-    if (MotionController.IsValid())
-    {
-        MotionController->Unregister();
-        MotionController.Reset();
-    }
     FAgentRemoteControlBootstrap::Shutdown();
     UE_LOG(LogUAP, Log, TEXT("UnrealAgentPlayer module shutdown."));
-}
-
-FAgentMotionController* FUnrealAgentPlayerModule::GetMotionController()
-{
-    FUnrealAgentPlayerModule* Mod = FModuleManager::GetModulePtr<FUnrealAgentPlayerModule>("UnrealAgentPlayer");
-    return Mod ? Mod->MotionController.Get() : nullptr;
 }
 
 #undef LOCTEXT_NAMESPACE

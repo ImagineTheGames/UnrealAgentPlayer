@@ -1,4 +1,5 @@
 #include "UnrealAgentPlayerRuntimeModule.h"
+#include "AgentMotionController.h"
 
 DEFINE_LOG_CATEGORY(LogUAPRuntime);
 #define LOCTEXT_NAMESPACE "FUnrealAgentPlayerRuntimeModule"
@@ -6,10 +7,17 @@ DEFINE_LOG_CATEGORY(LogUAPRuntime);
 void FUnrealAgentPlayerRuntimeModule::StartupModule()
 {
     UE_LOG(LogUAPRuntime, Log, TEXT("UnrealAgentPlayerRuntime started."));
+    MotionController = MakeShared<FAgentMotionController>();
+    MotionController->Register();
 }
 
 void FUnrealAgentPlayerRuntimeModule::ShutdownModule()
 {
+    if (MotionController.IsValid())
+    {
+        MotionController->Unregister();
+        MotionController.Reset();
+    }
 }
 
 FUnrealAgentPlayerRuntimeModule* FUnrealAgentPlayerRuntimeModule::Get()

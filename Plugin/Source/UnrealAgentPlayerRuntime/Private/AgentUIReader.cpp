@@ -1,7 +1,7 @@
 #include "AgentUIReader.h"
+#include "AgentWorld.h"
 
 #include "UObject/UObjectIterator.h"
-#include "Editor.h"
 #include "Engine/Engine.h"
 #include "Engine/World.h"
 #include "GameFramework/PlayerController.h"
@@ -14,19 +14,6 @@
 
 namespace
 {
-    UWorld* GetPIEWorld()
-    {
-        if (!GEditor) { return nullptr; }
-        for (const FWorldContext& Ctx : GEditor->GetWorldContexts())
-        {
-            if (Ctx.WorldType == EWorldType::PIE && Ctx.World())
-            {
-                return Ctx.World();
-            }
-        }
-        return nullptr;
-    }
-
     // True if the widget or any UMG ancestor currently holds keyboard / user focus
     // (the focused button highlights its child label, which itself never takes focus).
     bool AncestorHasFocus(UWidget* Widget, APlayerController* PC)
@@ -55,7 +42,7 @@ namespace
 
 FString FAgentUIReader::DumpViewportUI()
 {
-    UWorld* World = GetPIEWorld();
+    UWorld* World = FAgentWorld::GetActiveGameWorld();
     if (!World)
     {
         return SerializeEmpty(false);

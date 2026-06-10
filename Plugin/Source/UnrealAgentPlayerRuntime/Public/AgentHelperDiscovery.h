@@ -7,7 +7,7 @@ class UClass;
 class UFunction;
 class UObject;
 
-class FAgentHelperDiscovery
+class UNREALAGENTPLAYERRUNTIME_API FAgentHelperDiscovery
 {
 public:
     static void RescanAll(TArray<FAgentHelperDescriptor>& OutList);

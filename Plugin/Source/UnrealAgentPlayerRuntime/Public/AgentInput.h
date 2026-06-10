@@ -6,7 +6,7 @@
 
 class SWidget;
 
-class FAgentInput
+class UNREALAGENTPLAYERRUNTIME_API FAgentInput
 {
 public:
     static bool InjectKey(FKey Key, bool bPressed, bool bRepeat);

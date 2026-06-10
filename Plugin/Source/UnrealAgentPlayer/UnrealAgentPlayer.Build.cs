@@ -13,6 +13,7 @@ public class UnrealAgentPlayer : ModuleRules
             "CoreUObject",
             "Engine",
             "InputCore",
+            "UnrealAgentPlayerRuntime",
         });
 
         PrivateDependencyModuleNames.AddRange(new[]

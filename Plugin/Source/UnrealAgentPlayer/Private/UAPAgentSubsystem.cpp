@@ -1,6 +1,7 @@
 #include "UAPAgentSubsystem.h"
 
 #include "UnrealAgentPlayerModule.h"
+#include "UnrealAgentPlayerRuntimeModule.h"
 #include "Editor.h"
 #include "HAL/PlatformTime.h"
 #include "Engine/Engine.h"
@@ -254,7 +255,8 @@ bool UUAPAgentSubsystem::InjectXRButton(EAgentXRHand Hand, FString ButtonKeyName
 
 bool UUAPAgentSubsystem::InjectXRControllerPose(EAgentXRHand Hand, FVector Position, FRotator Orientation, bool bTracked)
 {
-    FAgentMotionController* MC = FUnrealAgentPlayerModule::GetMotionController();
+    FUnrealAgentPlayerRuntimeModule* Rtm = FUnrealAgentPlayerRuntimeModule::Get();
+    FAgentMotionController* MC = Rtm ? Rtm->GetMotionController() : nullptr;
     if (!MC) { return false; }
     FAgentControllerPose Pose;
     Pose.Position = Position;
@@ -266,7 +268,8 @@ bool UUAPAgentSubsystem::InjectXRControllerPose(EAgentXRHand Hand, FVector Posit
 
 bool UUAPAgentSubsystem::ClearXRControllerOverride(EAgentXRHand Hand)
 {
-    FAgentMotionController* MC = FUnrealAgentPlayerModule::GetMotionController();
+    FUnrealAgentPlayerRuntimeModule* Rtm = FUnrealAgentPlayerRuntimeModule::Get();
+    FAgentMotionController* MC = Rtm ? Rtm->GetMotionController() : nullptr;
     if (!MC) { return false; }
     MC->ClearPose(Hand);
     return true;

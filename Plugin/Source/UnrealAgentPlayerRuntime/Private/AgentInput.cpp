@@ -1,8 +1,7 @@
 #include "AgentInput.h"
 
-#include "UnrealAgentPlayerModule.h"
-#include "Editor.h"
-#include "Editor/EditorEngine.h"
+#include "UnrealAgentPlayerRuntimeModule.h"
+#include "AgentWorld.h"
 #include "Framework/Application/SlateApplication.h"
 #include "GenericPlatform/GenericApplication.h"
 #include "Engine/GameViewportClient.h"
@@ -13,18 +12,8 @@
 
 TSharedPtr<SWidget> FAgentInput::FindPIEViewportWidget()
 {
-    if (!GEditor) { return nullptr; }
-    const FWorldContext* PIEContext = nullptr;
-    for (const FWorldContext& Ctx : GEditor->GetWorldContexts())
-    {
-        if (Ctx.WorldType == EWorldType::PIE && Ctx.World())
-        {
-            PIEContext = &Ctx;
-            break;
-        }
-    }
-    if (!PIEContext || !PIEContext->GameViewport) { return nullptr; }
-    return PIEContext->GameViewport->GetGameViewportWidget();
+    UGameViewportClient* GV = FAgentWorld::GetActiveGameViewport();
+    return GV ? GV->GetGameViewportWidget() : nullptr;
 }
 
 FKey FAgentInput::MouseButtonToKey(EAgentMouseButton Btn)
