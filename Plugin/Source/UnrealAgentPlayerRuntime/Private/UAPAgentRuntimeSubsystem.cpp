@@ -16,6 +16,9 @@
 #include "Serialization/JsonWriter.h"
 #include "UnrealClient.h"
 #include "AgentRuntimeRCBootstrap.h"
+#include "RemoteControlSettings.h"
+#include "Misc/CommandLine.h"
+#include "Misc/Parse.h"
 
 namespace
 {
@@ -37,6 +40,29 @@ void UUAPAgentRuntimeSubsystem::Initialize(FSubsystemCollectionBase& Collection)
     LogCapture = MakeShared<FAgentLogCapture>(4096);
     GLog->AddOutputDevice(LogCapture.Get());
     FAgentRuntimeRCBootstrap::Expose(this);
+
+#if WITH_EDITOR
+    // Per-instance RemoteControl port for standalone -game processes. The default
+    // (30010) collides with the editor and with other instances; -UAPRCPort=N rebinds
+    // the RC HTTP server to N. WebRemoteControl restarts the server on its
+    // OnSettingChanged handler (active because -game from the editor binary is WITH_EDITOR).
+    {
+        int32 RCPort = 0;
+        if (FParse::Value(FCommandLine::Get(), TEXT("UAPRCPort="), RCPort) && RCPort > 0)
+        {
+            URemoteControlSettings* RCSettings = GetMutableDefault<URemoteControlSettings>();
+            if (RCSettings && RCSettings->RemoteControlHttpServerPort != (uint32)RCPort)
+            {
+                RCSettings->RemoteControlHttpServerPort = (uint32)RCPort;
+                FProperty* Prop = URemoteControlSettings::StaticClass()->FindPropertyByName(TEXT("RemoteControlHttpServerPort"));
+                FPropertyChangedEvent Evt(Prop);
+                RCSettings->OnSettingChanged().Broadcast(RCSettings, Evt);
+                UE_LOG(LogUAPRuntime, Log, TEXT("Agent RC HTTP port set to %d via -UAPRCPort."), RCPort);
+            }
+        }
+    }
+#endif
+
     UE_LOG(LogUAPRuntime, Log, TEXT("UAPAgentRuntimeSubsystem initialized."));
 }
 
