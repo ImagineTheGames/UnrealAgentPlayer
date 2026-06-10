@@ -13,13 +13,20 @@ def _track_proc(instance_id: str, proc: Any) -> None:
     _PROCS[instance_id] = proc
 
 
-def _spawn(port: int, mapname: Optional[str], extra: Optional[list[str]]) -> subprocess.Popen:
+def _spawn(port: int, mapname: Optional[str], extra: Optional[list[str]],
+           no_vr: bool = True) -> subprocess.Popen:
     exe = os.environ.get("UAP_EDITOR_EXE", r"E:\ImagineGames\IG_MetaEngine\Engine\Binaries\Win64\UnrealEditor.exe")
     uproject = os.environ.get("UAP_UPROJECT", r"E:\ImagineGames\SchoolsOutVR\SchoolsOut.uproject")
     args = [exe, uproject]
     if mapname:
         args.append(mapname)
     args += ["-game", "-windowed", "-ResX=1280", "-ResY=720", "-RCWebControlEnable", f"-UAPRCPort={port}"]
+    if no_vr:
+        # Run flat (no HMD) so the boot flow takes the desktop/FPS path and doesn't wait
+        # for a headset to be worn — required for headless agent auto-testing. The game's
+        # BootGameMode already has a no-HMD path; -nohmd makes IsHeadMountedDisplayEnabled
+        # false so it triggers. (Run with the editor closed to avoid GPU contention.)
+        args.append("-nohmd")
     if extra:
         args += extra
     return subprocess.Popen(args)
@@ -45,10 +52,10 @@ async def _wait_rc_ready(port: int, timeout: float = 90.0) -> bool:
 async def game_launch(
     *, registry: InstanceRegistry, rc: Any = None, py_exec: Any = None,
     target: str = "standalone", map: Optional[str] = None,
-    extra_args: Optional[list[str]] = None,
+    extra_args: Optional[list[str]] = None, no_vr: bool = True,
 ) -> dict[str, Any]:
     port = registry.next_free_port()
-    proc = _spawn(port, map, extra_args)
+    proc = _spawn(port, map, extra_args, no_vr)
     if not await _wait_rc_ready(port):
         try:
             proc.kill()

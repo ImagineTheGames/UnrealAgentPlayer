@@ -14,7 +14,7 @@ class FakeProc:
 @pytest.mark.asyncio
 async def test_game_launch_registers(monkeypatch):
     reg = InstanceRegistry(editor_port=30010)
-    monkeypatch.setattr(game_mod, "_spawn", lambda port, mapname, extra: FakeProc())
+    monkeypatch.setattr(game_mod, "_spawn", lambda port, mapname, extra, no_vr=True: FakeProc())
     async def _ready(port): return True
     monkeypatch.setattr(game_mod, "_wait_rc_ready", _ready)
     r = await game_mod.game_launch(registry=reg, target="standalone", map="/Game/M", extra_args=None)
@@ -26,7 +26,7 @@ async def test_game_launch_registers(monkeypatch):
 async def test_game_launch_timeout_kills(monkeypatch):
     reg = InstanceRegistry(editor_port=30010)
     proc = FakeProc()
-    monkeypatch.setattr(game_mod, "_spawn", lambda port, mapname, extra: proc)
+    monkeypatch.setattr(game_mod, "_spawn", lambda port, mapname, extra, no_vr=True: proc)
     async def _never(port): return False
     monkeypatch.setattr(game_mod, "_wait_rc_ready", _never)
     r = await game_mod.game_launch(registry=reg, target="standalone", map=None, extra_args=None)

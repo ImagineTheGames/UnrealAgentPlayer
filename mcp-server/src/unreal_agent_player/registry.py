@@ -310,10 +310,14 @@ def register_all(
              inputSchema={"type":"object","properties":{"verdict":{"type":"string","enum":["pass","fail"]},"summary":{"type":"string"}},
                  "required":["verdict","summary"],"additionalProperties":False}),
         Tool(name="game_launch",
-             description="Launch a standalone game instance. Returns instance_id + port for use as target in play tools.",
+             description=("Launch a standalone game instance (its own RemoteControl port) and drive it like a "
+                          "player. Returns instance_id + port for use as `target` in play tools. no_vr=true "
+                          "(default) runs flat without a headset (-nohmd) for auto-testing; best with the "
+                          "editor closed to avoid GPU contention."),
              inputSchema={"type":"object",
                  "properties":{"target":{"type":"string","default":"standalone"},
                                "map":{"type":"string"},
+                               "no_vr":{"type":"boolean","default":True},
                                "extra_args":{"type":"array","items":{"type":"string"}}},
                  "additionalProperties":False}),
         Tool(name="game_attach",

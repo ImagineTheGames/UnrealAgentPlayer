@@ -128,7 +128,7 @@ Expected: `ue_running: true`, `rc_reachable: true`, `remote_exec_reachable: true
 - **VR HMD pose injection is deferred** — no clean modular-feature hook; needs a fake `IXRTrackingSystem`.
 - **VR controller pose-follow is limited in HMD-less PIE** — a real XR runtime (e.g. Meta XR Simulator) wins modular-feature precedence over the agent's fake controller. Button injection is unaffected. See [docs/architecture.md](docs/architecture.md).
 - **Windows only.** See below.
-- **VR boot map in standalone:** The SchoolsOut VR project boot map waits for an HMD in a pure `-game` process; full menu navigation in standalone requires a non-VR map or an XR simulator. The pre-HMD connection screen and the RC/play surface work. Per-instance ports require `-game` launched from the editor binary (`WITH_EDITOR`); packaged-build per-instance ports are a follow-up.
+- **Non-VR standalone:** `game_launch` defaults to `no_vr=true`, adding `-nohmd` so a VR project's boot flow takes its no-HMD/desktop path instead of waiting for a headset — verified end-to-end (boot → EOS login → onboarding menu, readable + clickable by the agent). Run with the **editor closed** to avoid GPU contention (a standalone sharing the GPU with a live editor can stall its render thread → RC times out). Per-instance ports require `-game` launched from the editor binary (`WITH_EDITOR`); packaged-build per-instance ports are a follow-up.
 
 ## Platform support
 
