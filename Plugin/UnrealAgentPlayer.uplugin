@@ -17,6 +17,12 @@
   "SupportedTargetPlatforms": [ "Win64" ],
   "Modules": [
     {
+      "Name": "UnrealAgentPlayerRuntime",
+      "Type": "DeveloperTool",
+      "LoadingPhase": "PostEngineInit",
+      "PlatformAllowList": [ "Win64" ]
+    },
+    {
       "Name": "UnrealAgentPlayer",
       "Type": "Editor",
       "LoadingPhase": "PostEngineInit",
