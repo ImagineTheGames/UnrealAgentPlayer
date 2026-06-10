@@ -73,6 +73,7 @@ Input injection is **in-process via Slate** — `FSlateApplication::ProcessKeyDo
 | **Test helpers** | `helper_list` + `CallTestHelper` | Auto-discover and call project-specific Blueprint/C++ assertion helpers (e.g. `IsDoorOpen`). |
 | **Editor menus** | `ui_menu_click` `ui_find_window` `ui_list_menus` | Drive native editor menu bar via Windows UIAutomation. |
 | **Editor focus** | `FocusEditorWindow` (UFUNCTION) | Bring the editor window to front from in-process, for capture/native-chrome driving. |
+| **Standalone** | `game_launch` `game_attach` `game_list` `game_stop` | Launch/attach standalone game instances (each on its own RemoteControl port) and drive them like a player; play tools take a `target`. Parallel instances + editor coexist. |
 
 Full reference with parameters and return shapes: **[docs/capabilities.md](docs/capabilities.md)**.
 
@@ -120,12 +121,14 @@ Expected: `ue_running: true`, `rc_reachable: true`, `remote_exec_reachable: true
 - Real `stat unit` draw/GPU/render-thread timings; perf baseline save/compare.
 - PIE lifecycle, log capture, console + Python bridges, actor introspection, Blueprint helper discovery, editor-menu UIAutomation, in-process editor focus.
 - `report_*` produces a tabbed HTML run report with auto-captured timeline + screenshot gallery.
+- Runtime module (DeveloperTool, Win64-only) drives a standalone `-game` process; verified two instances + the editor on distinct RC ports simultaneously.
 
 **Known gaps / roadmap:**
 - **Screenshots omit UMG.** `screenshot_viewport` uses `HighResShot`, which does not capture the UMG layer — so on-screen UI/prompts don't appear *in the image*. To **read** on-screen UI, use `read_viewport_ui` (deterministic text + focus). A backbuffer/desktop capture path for pixel-level UI (icon/glyph prompts with no text) is still on the roadmap.
 - **VR HMD pose injection is deferred** — no clean modular-feature hook; needs a fake `IXRTrackingSystem`.
 - **VR controller pose-follow is limited in HMD-less PIE** — a real XR runtime (e.g. Meta XR Simulator) wins modular-feature precedence over the agent's fake controller. Button injection is unaffected. See [docs/architecture.md](docs/architecture.md).
 - **Windows only.** See below.
+- **VR boot map in standalone:** The SchoolsOut VR project boot map waits for an HMD in a pure `-game` process; full menu navigation in standalone requires a non-VR map or an XR simulator. The pre-HMD connection screen and the RC/play surface work. Per-instance ports require `-game` launched from the editor binary (`WITH_EDITOR`); packaged-build per-instance ports are a follow-up.
 
 ## Platform support
 

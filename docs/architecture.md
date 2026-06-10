@@ -8,6 +8,19 @@ TL;DR:
 - External Python MCP server (stdio) talks to UE via Remote Control HTTP (127.0.0.1:30010) and Python Remote Execution (UDP 239.0.0.1:6766 multicast).
 - The agent-visible surface is ~22 MCP tools across 8 families. The Python layer grows without engine recompiles.
 
+## Module split (post-v1)
+
+The plugin has two modules:
+
+- **`UnrealAgentPlayer`** (Type `Editor`, `PlatformAllowList: [Win64]`) — editor-only subsystem (`UAPAgentSubsystem`), log capture ring buffer, in-process Slate input injection, fake `IMotionController`, Blueprint helper discovery. Present in editor builds only; excluded from any Game target.
+- **`UnrealAgentPlayerRuntime`** (Type `DeveloperTool`, `PlatformAllowList: [Win64]`) — play helpers + `UAPAgentRuntimeSubsystem` (`UGameInstanceSubsystem`). Loads in editor builds and Windows Development standalone (`-game`); excluded from Shipping and Android by UBT (DeveloperTool modules are stripped from non-development targets; Win64-only PlatformAllowList blocks Android). Verified via UBT `JsonExport` against `SchoolsOut` targets.
+
+**World lookup** is generalized via `FAgentWorld`: in PIE it resolves the PIE world from the editor; in a standalone `-game` process it resolves `GWorld` directly. The same subsystem code drives both execution contexts.
+
+Plugin-level `SupportedTargetPlatforms: ["Win64"]` provides an additional hard gate: UBT will not include the entire plugin on Android regardless of module type.
+
+---
+
 ## Post-v1 additions
 
 ### VR input (V2)

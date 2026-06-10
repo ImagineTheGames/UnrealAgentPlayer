@@ -206,6 +206,25 @@ Brings the editor's main window to the foreground **from inside the editor proce
 
 ---
 
+## Standalone game instances
+
+Launch and drive standalone `-game` processes independently from the editor, each on its own Remote Control port.
+
+| Tool | Inputs | Purpose |
+| --- | --- | --- |
+| `game_launch` | `port` (int), `map` (optional), `extra_args` (list, optional) | Spawn a `-game` process with `-RCWebControlEnable -UAPRCPort=<port>`, wait for RC to become reachable, return `instance_id` + `port`. |
+| `game_attach` | `port` (int) | Register an already-running game process by port; returns `instance_id`. |
+| `game_list` | — | Return all live instances (id, port, pid). |
+| `game_stop` | `instance_id` | Terminate the managed instance and deregister it. |
+
+**`target` parameter on play tools:** all input injection, log, perf, console, actor, and screenshot tools accept an optional `target` argument. Pass an `instance_id` (from `game_launch`/`game_attach`) to route the call to that standalone process; omit (or pass `"editor"`) to address the editor as usual. Multiple standalone instances and the editor are addressed independently by their RC port.
+
+**Runtime object path:** the subsystem inside a standalone game is at `/Script/UnrealAgentPlayerRuntime.Default__UAPAgentRuntimeSubsystem`.
+
+**Requirements:** `-game` must be launched from the editor binary (built `WITH_EDITOR`); the `UnrealAgentPlayerRuntime` module (Type `DeveloperTool`, `PlatformAllowList: [Win64]`) loads automatically in Development builds and is excluded from Shipping and Android.
+
+---
+
 ## Plugin UFUNCTION surface
 
 The C++ functions on `UAPAgentSubsystem`, callable directly over Remote Control:
