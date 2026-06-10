@@ -40,8 +40,6 @@ class UIADriver:
     def _find_window(self, window_title: str):
         """Return the first top-level window element whose name contains window_title."""
         root = self._uia.GetRootElement()
-        UIA = self._UIA
-        cond = self._uia.CreateTrueCondition()
         walker = self._uia.ControlViewWalker
         child = walker.GetFirstChildElement(root)
         while child:
@@ -55,24 +53,22 @@ class UIADriver:
         return None
 
     def _find_descendant_by_name(self, element, name: str):
-        UIA = self._UIA
-        cond = self._uia.CreatePropertyCondition(UIA.UIA_NamePropertyId, name)
-        return element.FindFirst(UIA.TreeScope_Descendants, cond)
+        cond = self._uia.CreatePropertyCondition(self._UIA.UIA_NamePropertyId, name)
+        return element.FindFirst(self._UIA.TreeScope_Descendants, cond)
 
     def _invoke_or_expand(self, element) -> bool:
-        UIA = self._UIA
         # Prefer ExpandCollapse (submenus); fall back to Invoke (leaf items).
         try:
-            ec = element.GetCurrentPattern(UIA.UIA_ExpandCollapsePatternId)
+            ec = element.GetCurrentPattern(self._UIA.UIA_ExpandCollapsePatternId)
             if ec:
-                ec.QueryInterface(UIA.IUIAutomationExpandCollapsePattern).Expand()
+                ec.QueryInterface(self._UIA.IUIAutomationExpandCollapsePattern).Expand()
                 return True
         except Exception:
             pass
         try:
-            inv = element.GetCurrentPattern(UIA.UIA_InvokePatternId)
+            inv = element.GetCurrentPattern(self._UIA.UIA_InvokePatternId)
             if inv:
-                inv.QueryInterface(UIA.IUIAutomationInvokePattern).Invoke()
+                inv.QueryInterface(self._UIA.IUIAutomationInvokePattern).Invoke()
                 return True
         except Exception:
             pass
@@ -88,14 +84,13 @@ class UIADriver:
     def list_menus(self, window_title: str) -> list[str]:
         if not self.available:
             return []
-        UIA = self._UIA
         win = self._find_window(window_title)
         if win is None:
             return []
         cond = self._uia.CreatePropertyCondition(
-            UIA.UIA_ControlTypePropertyId, UIA.UIA_MenuItemControlTypeId
+            self._UIA.UIA_ControlTypePropertyId, self._UIA.UIA_MenuItemControlTypeId
         )
-        found = win.FindAll(UIA.TreeScope_Descendants, cond)
+        found = win.FindAll(self._UIA.TreeScope_Descendants, cond)
         names: list[str] = []
         for i in range(found.Length):
             el = found.GetElement(i)

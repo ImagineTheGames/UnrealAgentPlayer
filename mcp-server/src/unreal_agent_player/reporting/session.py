@@ -203,8 +203,8 @@ def record_call(session: "ReportSession", tool: str, args: dict,
                 },
             })
         elif tool in ("log_tail", "log_since") and isinstance(body.get("lines"), list):
-            kept = [l for l in body["lines"]
-                    if str(l.get("verbosity")) in ("Warning", "Error", "Fatal")]
+            kept = [ln for ln in body["lines"]
+                    if str(ln.get("verbosity")) in ("Warning", "Error", "Fatal")]
             if kept:
                 session.add_logs(kept)
     except Exception:

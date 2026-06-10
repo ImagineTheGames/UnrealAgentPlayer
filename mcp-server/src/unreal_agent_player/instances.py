@@ -1,5 +1,6 @@
 from __future__ import annotations
-import socket, threading
+import socket
+import threading
 from typing import Any, Optional
 from unreal_agent_player.errors import AgentError, ErrorCode
 

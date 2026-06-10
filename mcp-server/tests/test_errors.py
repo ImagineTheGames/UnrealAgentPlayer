@@ -1,4 +1,3 @@
-import pytest
 from unreal_agent_player.errors import AgentError, ErrorCode, error_response, ok_response
 
 

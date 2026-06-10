@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import webbrowser
-from pathlib import Path
 from typing import Any, Optional
 
 from unreal_agent_player.errors import ErrorCode, error_response, ok_response

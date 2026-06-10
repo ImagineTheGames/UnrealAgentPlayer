@@ -6,7 +6,7 @@ import pytest
 from unreal_agent_player.errors import ErrorCode
 from unreal_agent_player.reporting import session as sess_mod
 from unreal_agent_player.tools.report import (
-    report_assert, report_caption, report_finish, report_note, report_start,
+    report_assert, report_finish, report_start,
 )
 
 

@@ -1,12 +1,11 @@
 name: ci-ue
 
+# Manual only. This job needs a self-hosted Windows runner with the UE Meta fork
+# (label `ue56`); GitHub-hosted runners cannot build the engine. Without that runner
+# a push-triggered run sits queued until it is cancelled (24h), so it does not run
+# automatically. Trigger from the Actions tab once a self-hosted runner is available.
 on:
-  push:
-    branches: [main]
-    paths:
-      - "Plugin/**"
-      - "examples/loopback-project/**"
-      - ".github/workflows/ci-ue.yml"
+  workflow_dispatch:
 
 jobs:
   build-and-test:

@@ -37,3 +37,8 @@ asyncio_mode = "auto"
 [tool.ruff]
 line-length = 100
 target-version = "py310"
+
+[tool.ruff.lint.per-file-ignores]
+# Tests use compact stub patterns: semicolon-joined stub bodies, throwaway vars,
+# and append-style imports partway down a file.
+"tests/**" = ["E402", "E702", "E741", "F841"]

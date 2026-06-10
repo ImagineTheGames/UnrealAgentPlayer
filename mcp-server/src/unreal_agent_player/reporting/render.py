@@ -92,8 +92,8 @@ def _diag(d: dict) -> str:
     logs = d.get("logs") or []
     if logs:
         parts.append(f"<div class='sub'>Log warnings/errors ({len(logs)})</div>")
-        for l in logs:
-            parts.append(f"<div class='mono'>[{_e(l.get('verbosity'))}] {_e(l.get('category'))}: {_e(l.get('line'))}</div>")
+        for ln in logs:
+            parts.append(f"<div class='mono'>[{_e(ln.get('verbosity'))}] {_e(ln.get('category'))}: {_e(ln.get('line'))}</div>")
     return "".join(parts) or "No diagnostics captured."
 
 

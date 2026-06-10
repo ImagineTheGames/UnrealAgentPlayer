@@ -2,8 +2,7 @@ import pytest
 from pytest_httpx import HTTPXMock
 
 from unreal_agent_player.tools.input import (
-    input_axis, input_gamepad, input_key, input_mouse_button,
-    input_mouse_move, input_sequence,
+    input_gamepad, input_key, input_sequence,
 )
 from unreal_agent_player.transport import RemoteControlClient
 
