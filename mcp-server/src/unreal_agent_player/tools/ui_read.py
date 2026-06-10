@@ -14,13 +14,16 @@ from unreal_agent_player.errors import AgentError, ErrorCode
 from unreal_agent_player.transport import RemoteControlClient, SUBSYSTEM_OBJECT_PATH
 
 
-async def read_viewport_ui(*, rc: RemoteControlClient, py_exec: Any) -> dict[str, Any]:
+async def read_viewport_ui(
+    *, rc: RemoteControlClient, py_exec: Any,
+    _object_path: str = SUBSYSTEM_OBJECT_PATH,
+) -> dict[str, Any]:
     """Return visible UMG text with screen position + focus.
 
     Shape: {available, count, focused, texts: [{text, x, y, focused}, ...]}.
     `available` is False when there is no active PIE session.
     """
-    resp = await rc.call_function(SUBSYSTEM_OBJECT_PATH, "DumpViewportUI", parameters={})
+    resp = await rc.call_function(_object_path, "DumpViewportUI", parameters={})
     raw = resp.get("ReturnValue")
     if not raw:
         return {"available": False, "count": 0, "focused": "", "texts": []}

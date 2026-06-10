@@ -32,13 +32,17 @@ from unreal_agent_player.tools.ui import ui_find_window, ui_list_menus, ui_menu_
 from unreal_agent_player.baselines import BaselineStore
 from unreal_agent_player.uia import UIADriver
 from unreal_agent_player.tools.ui_read import read_viewport_ui
-from unreal_agent_player.transport import PythonRemoteExecClient, RemoteControlClient
+from unreal_agent_player.transport import PythonRemoteExecClient, RemoteControlClient, SUBSYSTEM_OBJECT_PATH, rc_for_port
 from unreal_agent_player.tools.report import (
     report_assert, report_caption, report_finish, report_note, report_start,
 )
 from unreal_agent_player.reporting import session as report_session
 from unreal_agent_player.reporting.session import record_call
+from unreal_agent_player.instances import InstanceRegistry
+from unreal_agent_player.tools.game import game_launch, game_attach, game_list, game_stop
 import time as _time
+
+_GAME_RUNTIME_OBJ = "/Script/UnrealAgentPlayerRuntime.Default__UAPAgentRuntimeSubsystem"
 
 
 ToolHandler = Callable[..., Awaitable[dict[str, Any]]]
@@ -136,6 +140,7 @@ def register_all(
                     "hdr": {"type": "boolean", "default": False},
                     "ui": {"type": "boolean", "default": True},
                     "inline": {"type": "boolean", "default": False},
+                    "target": {"type": "string", "description": "Instance id or 'editor' (default)"},
                 },
                 "additionalProperties": False,
             },
@@ -145,7 +150,8 @@ def register_all(
              inputSchema={"type": "object",
                  "properties": {"lines": {"type": "integer", "default": 200, "minimum": 1, "maximum": 5000},
                                 "category": {"type": "string", "default": ""},
-                                "min_verbosity": {"type": "string", "enum": ["Fatal", "Error", "Warning", "Display", "Log", "Verbose", "VeryVerbose"], "default": "Log"}},
+                                "min_verbosity": {"type": "string", "enum": ["Fatal", "Error", "Warning", "Display", "Log", "Verbose", "VeryVerbose"], "default": "Log"},
+                                "target": {"type": "string", "description": "Instance id or 'editor' (default)"}},
                  "additionalProperties": False}),
         Tool(name="log_since",
              description="Return log lines newer than `cursor`. Use with cursor from a prior call for streaming.",
@@ -153,49 +159,57 @@ def register_all(
                  "properties": {"cursor": {"type": "integer", "minimum": 0},
                                 "max_lines": {"type": "integer", "default": 500, "minimum": 1, "maximum": 5000},
                                 "category": {"type": "string", "default": ""},
-                                "min_verbosity": {"type": "string", "enum": ["Fatal", "Error", "Warning", "Display", "Log", "Verbose", "VeryVerbose"], "default": "Log"}},
+                                "min_verbosity": {"type": "string", "enum": ["Fatal", "Error", "Warning", "Display", "Log", "Verbose", "VeryVerbose"], "default": "Log"},
+                                "target": {"type": "string", "description": "Instance id or 'editor' (default)"}},
                  "required": ["cursor"], "additionalProperties": False}),
         Tool(name="input_key",
              description="Press or release a key. Optional duration_ms auto-releases.",
              inputSchema={"type":"object",
                  "properties": {"key":{"type":"string"}, "pressed":{"type":"boolean"},
                                  "repeat":{"type":"boolean","default":False},
-                                 "duration_ms":{"type":"integer","minimum":1,"maximum":10000}},
+                                 "duration_ms":{"type":"integer","minimum":1,"maximum":10000},
+                                 "target":{"type":"string","description":"Instance id or 'editor' (default)"}},
                  "required":["key","pressed"], "additionalProperties":False}),
         Tool(name="input_mouse_move",
              description="Move mouse relative (dx,dy) or absolute (x,y, absolute=true).",
              inputSchema={"type":"object",
                  "properties": {"dx":{"type":"number"}, "dy":{"type":"number"},
                                  "x":{"type":"number"},  "y":{"type":"number"},
-                                 "absolute":{"type":"boolean","default":False}},
+                                 "absolute":{"type":"boolean","default":False},
+                                 "target":{"type":"string","description":"Instance id or 'editor' (default)"}},
                  "additionalProperties":False}),
         Tool(name="input_mouse_button",
              description="Press or release a mouse button.",
              inputSchema={"type":"object",
                  "properties": {"button":{"type":"string","enum":["left","right","middle","x1","x2"]},
-                                 "pressed":{"type":"boolean"}},
+                                 "pressed":{"type":"boolean"},
+                                 "target":{"type":"string","description":"Instance id or 'editor' (default)"}},
                  "required":["button","pressed"], "additionalProperties":False}),
         Tool(name="input_axis",
              description="Inject a named axis value (triggers axis input mappings).",
              inputSchema={"type":"object",
-                 "properties": {"axis_name":{"type":"string"}, "value":{"type":"number"}},
+                 "properties": {"axis_name":{"type":"string"}, "value":{"type":"number"},
+                                 "target":{"type":"string","description":"Instance id or 'editor' (default)"}},
                  "required":["axis_name","value"], "additionalProperties":False}),
         Tool(name="input_gamepad",
              description="Press/release or set analog value for a gamepad control.",
              inputSchema={"type":"object",
                  "properties": {"button":{"type":"string"}, "pressed":{"type":"boolean"},
-                                 "analog":{"type":"number","default":1.0}},
+                                 "analog":{"type":"number","default":1.0},
+                                 "target":{"type":"string","description":"Instance id or 'editor' (default)"}},
                  "required":["button","pressed"], "additionalProperties":False}),
         Tool(name="input_sequence",
              description="Run a sequence of input steps with per-step wait_ms. Cheaper than many calls.",
              inputSchema={"type":"object",
-                 "properties": {"steps":{"type":"array","items":{"type":"object"}}},
+                 "properties": {"steps":{"type":"array","items":{"type":"object"}},
+                                 "target":{"type":"string","description":"Instance id or 'editor' (default)"}},
                  "required":["steps"], "additionalProperties":False}),
         Tool(name="input_xr_button",
              description="Press/release a Quest Touch controller button (OculusTouch_* FKey) for a hand. VR (V2).",
              inputSchema={"type":"object",
                  "properties": {"hand":{"type":"string","enum":["Left","Right"]},
-                                "key":{"type":"string"}, "pressed":{"type":"boolean"}},
+                                "key":{"type":"string"}, "pressed":{"type":"boolean"},
+                                "target":{"type":"string","description":"Instance id or 'editor' (default)"}},
                  "required":["hand","key","pressed"], "additionalProperties":False}),
         Tool(name="input_xr_pose",
              description="Override a motion-controller pose (position cm + orientation pitch/yaw/roll) for a hand. VR (V2).",
@@ -203,22 +217,26 @@ def register_all(
                  "properties": {"hand":{"type":"string","enum":["Left","Right"]},
                                 "position":{"type":"array","items":{"type":"number"},"minItems":3,"maxItems":3},
                                 "orientation":{"type":"array","items":{"type":"number"},"minItems":3,"maxItems":3},
-                                "tracked":{"type":"boolean","default":True}},
+                                "tracked":{"type":"boolean","default":True},
+                                "target":{"type":"string","description":"Instance id or 'editor' (default)"}},
                  "required":["hand","position","orientation"], "additionalProperties":False}),
         Tool(name="input_xr_clear",
              description="Clear the agent pose override for a hand so real devices win again. VR (V2).",
              inputSchema={"type":"object",
-                 "properties": {"hand":{"type":"string","enum":["Left","Right"]}},
+                 "properties": {"hand":{"type":"string","enum":["Left","Right"]},
+                                "target":{"type":"string","description":"Instance id or 'editor' (default)"}},
                  "required":["hand"], "additionalProperties":False}),
         Tool(name="helper_list",
              description="List all AgentTestHelper UFUNCTIONs with arg/return JSON schemas.",
              inputSchema={"type":"object",
-                 "properties":{"category":{"type":"string"}},
+                 "properties":{"category":{"type":"string"},
+                               "target":{"type":"string","description":"Instance id or 'editor' (default)"}},
                  "additionalProperties":False}),
         Tool(name="helper_call",
              description="Invoke an AgentTestHelper by name with JSON args. Returns its result.",
              inputSchema={"type":"object",
-                 "properties":{"name":{"type":"string"}, "args":{"type":"object"}},
+                 "properties":{"name":{"type":"string"}, "args":{"type":"object"},
+                               "target":{"type":"string","description":"Instance id or 'editor' (default)"}},
                  "required":["name"], "additionalProperties":False}),
         Tool(name="perf_stat",
              description="Read stat unit or fps and return parsed values + raw text.",
@@ -291,7 +309,43 @@ def register_all(
              description="Finish the report: verdict 'pass'/'fail' + summary. Renders tabbed HTML and opens it.",
              inputSchema={"type":"object","properties":{"verdict":{"type":"string","enum":["pass","fail"]},"summary":{"type":"string"}},
                  "required":["verdict","summary"],"additionalProperties":False}),
+        Tool(name="game_launch",
+             description="Launch a standalone game instance. Returns instance_id + port for use as target in play tools.",
+             inputSchema={"type":"object",
+                 "properties":{"target":{"type":"string","default":"standalone"},
+                               "map":{"type":"string"},
+                               "extra_args":{"type":"array","items":{"type":"string"}}},
+                 "additionalProperties":False}),
+        Tool(name="game_attach",
+             description="Attach to an already-running game instance by its RemoteControl port.",
+             inputSchema={"type":"object",
+                 "properties":{"port":{"type":"integer"}},
+                 "required":["port"],"additionalProperties":False}),
+        Tool(name="game_list",
+             description="List all registered game instances.",
+             inputSchema={"type":"object","properties":{},"additionalProperties":False}),
+        Tool(name="game_stop",
+             description="Stop and deregister a game instance by instance_id.",
+             inputSchema={"type":"object",
+                 "properties":{"instance_id":{"type":"string"}},
+                 "required":["instance_id"],"additionalProperties":False}),
     ]
+
+    registry = InstanceRegistry(editor_port=30010)
+
+    def _resolve_rc_and_obj(kw: dict) -> tuple:
+        """Pop target from kw; return (use_rc, obj_path)."""
+        target = kw.pop("target", None)
+        port = registry.resolve_port(target)
+        if port == 30010:
+            return rc, SUBSYSTEM_OBJECT_PATH
+        return rc_for_port(port), _GAME_RUNTIME_OBJ
+
+    def _wrap(fn):
+        async def handler(**kw):
+            use_rc, obj = _resolve_rc_and_obj(kw)
+            return await fn(rc=use_rc, py_exec=py_exec, _object_path=obj, **kw)
+        return handler
 
     handlers: dict[str, ToolHandler] = {
         "bridge_status": lambda **_: bridge_status(rc=rc, py_exec=py_exec),
@@ -302,24 +356,24 @@ def register_all(
         "pie_status": lambda **_:  pie_status(rc=rc, py_exec=py_exec),
         "exec_console": lambda **kw: tool_exec_console(rc=rc, py_exec=py_exec, **kw),
         "exec_python": lambda **kw: tool_exec_python(rc=rc, py_exec=py_exec, **kw),
-        "log_tail":  lambda **kw: log_tail(rc=rc, py_exec=py_exec, **kw),
-        "log_since": lambda **kw: log_since(rc=rc, py_exec=py_exec, **kw),
-        "screenshot_viewport": lambda **kw: screenshot_viewport(rc=rc, py_exec=py_exec, **kw),
+        "log_tail":  _wrap(log_tail),
+        "log_since": _wrap(log_since),
+        "screenshot_viewport": _wrap(screenshot_viewport),
         "actor_find":           lambda **kw: actor_find(rc=rc, py_exec=py_exec, **kw),
         "actor_get_properties": lambda **kw: actor_get_properties(rc=rc, py_exec=py_exec, **kw),
         "actor_set_property":   lambda **kw: actor_set_property(rc=rc, py_exec=py_exec, **kw),
         "actor_call_function":  lambda **kw: actor_call_function(rc=rc, py_exec=py_exec, **kw),
-        "input_key":          lambda **kw: input_key(rc=rc, py_exec=py_exec, **kw),
-        "input_mouse_move":   lambda **kw: input_mouse_move(rc=rc, py_exec=py_exec, **kw),
-        "input_mouse_button": lambda **kw: input_mouse_button(rc=rc, py_exec=py_exec, **kw),
-        "input_axis":         lambda **kw: input_axis(rc=rc, py_exec=py_exec, **kw),
-        "input_gamepad":      lambda **kw: input_gamepad(rc=rc, py_exec=py_exec, **kw),
-        "input_sequence":     lambda **kw: input_sequence(rc=rc, py_exec=py_exec, **kw),
-        "input_xr_button":    lambda **kw: input_xr_button(rc=rc, py_exec=py_exec, **kw),
-        "input_xr_pose":      lambda **kw: input_xr_pose(rc=rc, py_exec=py_exec, **kw),
-        "input_xr_clear":     lambda **kw: input_xr_clear(rc=rc, py_exec=py_exec, **kw),
-        "helper_list": lambda **kw: helper_list(rc=rc, py_exec=py_exec, **kw),
-        "helper_call": lambda **kw: helper_call(rc=rc, py_exec=py_exec, **kw),
+        "input_key":          _wrap(input_key),
+        "input_mouse_move":   _wrap(input_mouse_move),
+        "input_mouse_button": _wrap(input_mouse_button),
+        "input_axis":         _wrap(input_axis),
+        "input_gamepad":      _wrap(input_gamepad),
+        "input_sequence":     _wrap(input_sequence),
+        "input_xr_button":    _wrap(input_xr_button),
+        "input_xr_pose":      _wrap(input_xr_pose),
+        "input_xr_clear":     _wrap(input_xr_clear),
+        "helper_list": _wrap(helper_list),
+        "helper_call": _wrap(helper_call),
         "perf_stat":        lambda **kw: perf_stat(rc=rc, py_exec=py_exec, **kw),
         "perf_trace_start": lambda **kw: perf_trace_start(rc=rc, py_exec=py_exec, **kw),
         "perf_trace_stop":  lambda **kw: perf_trace_stop(rc=rc, py_exec=py_exec, **kw),
@@ -328,12 +382,16 @@ def register_all(
         "ui_menu_click":  lambda **kw: ui_menu_click(driver=ui_driver, **kw),
         "ui_find_window": lambda **kw: ui_find_window(driver=ui_driver, **kw),
         "ui_list_menus":  lambda **kw: ui_list_menus(driver=ui_driver, **kw),
-        "read_viewport_ui": lambda **kw: read_viewport_ui(rc=rc, py_exec=py_exec, **kw),
+        "read_viewport_ui": _wrap(read_viewport_ui),
         "report_start":   lambda **kw: report_start(rc=rc, py_exec=py_exec, **kw),
         "report_assert":  lambda **kw: report_assert(rc=rc, py_exec=py_exec, **kw),
         "report_note":    lambda **kw: report_note(rc=rc, py_exec=py_exec, **kw),
         "report_caption": lambda **kw: report_caption(rc=rc, py_exec=py_exec, **kw),
         "report_finish":  lambda **kw: report_finish(rc=rc, py_exec=py_exec, **kw),
+        "game_launch": lambda **kw: game_launch(registry=registry, rc=rc, py_exec=py_exec, **kw),
+        "game_attach": lambda **kw: game_attach(registry=registry, rc=rc, py_exec=py_exec, **kw),
+        "game_list":   lambda **_: game_list(registry=registry, rc=rc, py_exec=py_exec),
+        "game_stop":   lambda **kw: game_stop(registry=registry, rc=rc, py_exec=py_exec, **kw),
     }
 
     @server.list_tools()

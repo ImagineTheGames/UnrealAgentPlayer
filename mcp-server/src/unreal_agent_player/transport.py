@@ -25,6 +25,10 @@ SUBSYSTEM_OBJECT_PATH = "/Engine/Transient.UAPAgentSubsystem_0"
 DEFAULT_PRESET_NAME = "UAP_Preset"
 
 
+def rc_for_port(port: int, timeout: float = 10.0) -> "RemoteControlClient":
+    return RemoteControlClient(port=port, timeout=timeout)
+
+
 class RemoteControlClient:
     """Async client for Remote Control HTTP API."""
 

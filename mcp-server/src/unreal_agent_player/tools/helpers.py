@@ -8,8 +8,9 @@ from unreal_agent_player.transport import RemoteControlClient, SUBSYSTEM_OBJECT_
 
 async def helper_list(
     *, rc: RemoteControlClient, py_exec: Any, category: str | None = None,
+    _object_path: str = SUBSYSTEM_OBJECT_PATH,
 ) -> dict[str, Any]:
-    resp = await rc.call_function(SUBSYSTEM_OBJECT_PATH, "ListTestHelpers", parameters={})
+    resp = await rc.call_function(_object_path, "ListTestHelpers", parameters={})
     raw = resp.get("ReturnValue") or []
     out = []
     for d in raw:
@@ -31,9 +32,10 @@ async def helper_list(
 async def helper_call(
     *, rc: RemoteControlClient, py_exec: Any,
     name: str, args: dict[str, Any] | None = None,
+    _object_path: str = SUBSYSTEM_OBJECT_PATH,
 ) -> dict[str, Any]:
     resp = await rc.call_function(
-        SUBSYSTEM_OBJECT_PATH, "CallTestHelper",
+        _object_path, "CallTestHelper",
         parameters={"Name": name, "JsonArgs": json.dumps(args or {})},
     )
     raw = str(resp.get("ReturnValue", "{}"))

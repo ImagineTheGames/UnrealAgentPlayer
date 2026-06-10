@@ -29,6 +29,7 @@ async def screenshot_viewport(
     ui: bool = True,
     inline: bool = False,
     _output_path_override: str | None = None,
+    _object_path: str = SUBSYSTEM_OBJECT_PATH,
 ) -> dict[str, Any]:
     width, height = _parse_resolution(resolution)
 
@@ -44,7 +45,7 @@ async def screenshot_viewport(
         # Composited backbuffer (3D scene + UMG/Slate overlay). Window resolution,
         # not arbitrary high-res, but shows the on-screen UI. This is the default.
         await rc.call_function(
-            SUBSYSTEM_OBJECT_PATH, "CaptureViewportWithUI",
+            _object_path, "CaptureViewportWithUI",
             parameters={"Filename": out_path},
         )
     else:
