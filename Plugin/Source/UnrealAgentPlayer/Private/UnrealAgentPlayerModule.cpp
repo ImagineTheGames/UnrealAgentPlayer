@@ -1,5 +1,4 @@
 #include "UnrealAgentPlayerModule.h"
-#include "AgentRemoteControlBootstrap.h"
 #include "AgentHelperBlueprintDetails.h"
 #include "PropertyEditorModule.h"
 #include "K2Node_FunctionEntry.h"
@@ -24,7 +23,6 @@ void FUnrealAgentPlayerModule::StartupModule()
     ::SystemParametersInfo(SPI_SETFOREGROUNDLOCKTIMEOUT, 0, (PVOID)0,
                            SPIF_SENDWININICHANGE | SPIF_UPDATEINIFILE);
 #endif
-    FAgentRemoteControlBootstrap::Startup();
 
     FPropertyEditorModule& PropEd = FModuleManager::LoadModuleChecked<FPropertyEditorModule>("PropertyEditor");
     PropEd.RegisterCustomClassLayout(
@@ -39,7 +37,6 @@ void FUnrealAgentPlayerModule::ShutdownModule()
         FPropertyEditorModule& PropEd = FModuleManager::GetModuleChecked<FPropertyEditorModule>("PropertyEditor");
         PropEd.UnregisterCustomClassLayout(UK2Node_FunctionEntry::StaticClass()->GetFName());
     }
-    FAgentRemoteControlBootstrap::Shutdown();
     UE_LOG(LogUAP, Log, TEXT("UnrealAgentPlayer module shutdown."));
 }
 

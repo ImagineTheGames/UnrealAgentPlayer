@@ -2,6 +2,7 @@
 
 #include "UnrealAgentPlayerModule.h"
 #include "UnrealAgentPlayerRuntimeModule.h"
+#include "AgentRemoteControlBootstrap.h"
 #include "Editor.h"
 #include "HAL/PlatformTime.h"
 #include "Engine/Engine.h"
@@ -58,11 +59,18 @@ void UUAPAgentSubsystem::Initialize(FSubsystemCollectionBase& Collection)
     const UUAPAgentSettings* Settings = GetDefault<UUAPAgentSettings>();
     LogCapture = MakeShared<FAgentLogCapture>(Settings ? Settings->LogBufferCapacity : 4096);
     GLog->AddOutputDevice(LogCapture.Get());
+
+    // Expose this subsystem over RemoteControl from Initialize (reliably runs) rather than
+    // an OnPostEngineInit module delegate (binds too late in a PostEngineInit-phase module
+    // and never fires). Mirrors the runtime subsystem.
+    FAgentRemoteControlBootstrap::Expose(this);
+
     UE_LOG(LogUAP, Log, TEXT("UAPAgentSubsystem initialized."));
 }
 
 void UUAPAgentSubsystem::Deinitialize()
 {
+    FAgentRemoteControlBootstrap::Unexpose();
     if (LogCapture.IsValid())
     {
         GLog->RemoveOutputDevice(LogCapture.Get());

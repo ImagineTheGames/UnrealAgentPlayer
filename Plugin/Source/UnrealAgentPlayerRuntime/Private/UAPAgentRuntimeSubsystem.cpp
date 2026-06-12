@@ -238,7 +238,14 @@ FString UUAPAgentRuntimeSubsystem::CallTestHelper(FString Name, FString JsonArgs
 
     // Runtime: no PIE phase gating — game is always "Playing" when this subsystem is live.
     // Still respect the Phase metadata to catch misuse (e.g. editor-only helpers called at runtime).
+    // UFunction metadata is editor-only (WITH_EDITORONLY_DATA); this DeveloperTool module also
+    // compiles into non-editor Development builds where the metadata API does not exist - there
+    // is no metadata to read there, so default to "Any". Matches AgentHelperDiscovery.cpp guard.
+#if WITH_EDITORONLY_DATA
     const FString Phase = Fn->HasMetaData(TEXT("Phase")) ? Fn->GetMetaData(TEXT("Phase")) : TEXT("Any");
+#else
+    const FString Phase = TEXT("Any");
+#endif
     if (Phase == TEXT("NotPlaying"))
     {
         return FString::Printf(
