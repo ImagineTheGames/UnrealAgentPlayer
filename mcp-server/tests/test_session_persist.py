@@ -20,3 +20,10 @@ def test_active_pointer_roundtrip(tmp_path, monkeypatch):
     assert sess.get_active_run() is None
     s = sess.start_session(task="hello world")
     assert sess.get_active_run() == s.run_dir
+
+
+def test_clear_active_pointer(tmp_path, monkeypatch):
+    monkeypatch.setenv("UAP_REPORTS_DIR", str(tmp_path))
+    s = sess.start_session(task="hello world")
+    sess.clear_active_run()
+    assert sess.get_active_run() is None

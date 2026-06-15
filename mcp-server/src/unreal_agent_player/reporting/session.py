@@ -132,8 +132,7 @@ class ReportSession:
 
     @classmethod
     def load(cls, run_dir) -> "ReportSession":
-        from pathlib import Path as _P
-        run_dir = _P(run_dir)
+        run_dir = Path(run_dir)
         data = json.loads((run_dir / "data.json").read_text(encoding="utf-8"))
         # Build without re-running __init__ (which would reset lists + recreate dirs).
         self = cls.__new__(cls)
@@ -153,6 +152,7 @@ class ReportSession:
         self.screenshots = data.get("screenshots", [])
         self.logs = data.get("logs", [])
         self.run_dir = run_dir
+        (self.run_dir / "screenshots").mkdir(parents=True, exist_ok=True)
         return self
 
 
