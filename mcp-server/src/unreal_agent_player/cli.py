@@ -59,6 +59,18 @@ def _report_note(args) -> int:
     return 0
 
 
+def _report_screenshot(args) -> int:
+    """Attach an EXISTING image file to the active report (vs the top-level `screenshot`
+    verb, which captures from the editor via RC and attaches). Useful when the image was
+    produced another way (e.g. `uap exec` HighResShot from an editor RC can't reach)."""
+    s = _require_active()
+    if s is None:
+        return 2
+    rel = s.add_screenshot(args.file, args.caption)
+    _emit({"ok": rel is not None, "attached": rel, "file": args.file})
+    return 0 if rel is not None else 1
+
+
 def _report_finish(args) -> int:
     s = _require_active()
     if s is None:
@@ -80,9 +92,18 @@ def _report_finish(args) -> int:
     return 0
 
 
+def _rc_port() -> int:
+    """RC HTTP port. Defaults to 30010; override with UAP_RC_PORT (e.g. when a second
+    editor already holds 30010 and this project's RC bound a different port)."""
+    try:
+        return int(os.environ.get("UAP_RC_PORT", "30010"))
+    except ValueError:
+        return 30010
+
+
 def _rc_call(func: str, params: dict):
     async def _go():
-        rc = RemoteControlClient()
+        rc = RemoteControlClient(port=_rc_port())
         try:
             return await rc.call_preset(func, params)
         finally:
@@ -246,6 +267,10 @@ def build_parser() -> argparse.ArgumentParser:
     rn = rep.add_parser("note")
     rn.add_argument("text")
     rn.set_defaults(func=_report_note)
+    rsh = rep.add_parser("screenshot")
+    rsh.add_argument("file")
+    rsh.add_argument("--caption", default="")
+    rsh.set_defaults(func=_report_screenshot)
     rf = rep.add_parser("finish")
     rf.add_argument("verdict", choices=["pass", "fail"])
     rf.add_argument("summary")
