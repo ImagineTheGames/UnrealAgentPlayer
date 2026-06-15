@@ -21,3 +21,20 @@ def test_status_maps_unreachable(monkeypatch, capsys):
     out = capsys.readouterr().out
     assert '"rc_reachable": false' in out
     assert rc == 1
+
+
+def test_exec_file_reads_and_runs(tmp_path, monkeypatch):
+    captured = {}
+
+    class _FakeExec:
+        def __init__(self, **kw):
+            pass
+        def exec_python(self, code):
+            captured["code"] = code
+            return {"success": True, "result": "ok", "output": []}
+
+    monkeypatch.setattr(cli, "PythonRemoteExecClient", _FakeExec)
+    f = tmp_path / "snippet.py"
+    f.write_text("print('hi from file')", encoding="utf-8")
+    assert cli.main(["exec-file", str(f)]) == 0
+    assert captured["code"] == "print('hi from file')"

@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+import os
 import sys
 import time
 import webbrowser
@@ -140,11 +141,19 @@ def _exec(args) -> int:
         body["result"] = res.get("result")
         body["output"] = [o.get("output", "") for o in (res.get("output") or [])]
         body["ok"] = bool(res.get("success", True))
+        if not body["ok"]:
+            body["error"] = "exec returned success=false; see output"
     except AgentError as exc:
         body = {"ok": False, "error": str(exc)}
     _capture("exec", {"code": code[:200]}, body, int((time.monotonic() - t0) * 1000))
     _emit(body)
     return 0 if body["ok"] else 1
+
+
+def _exec_file(args) -> int:
+    with open(args.path, encoding="utf-8") as f:
+        code = f.read()
+    return _exec(argparse.Namespace(code=code, project=args.project))
 
 
 def _read_ui(args) -> int:
@@ -160,21 +169,20 @@ def _read_ui(args) -> int:
 
 
 def _screenshot(args) -> int:
-    import os as _os
     t0 = time.monotonic()
     body: dict = {"ok": True, "caption": args.caption}
     try:
         _rc_call("CaptureViewportWithUI", {"Filename": args.file})
         deadline = time.monotonic() + 8.0
-        while time.monotonic() < deadline and not _os.path.exists(args.file):
+        while time.monotonic() < deadline and not os.path.exists(args.file):
             time.sleep(0.25)
         body["path"] = args.file
-        body["exists"] = _os.path.exists(args.file)
+        body["exists"] = os.path.exists(args.file)
     except AgentError as exc:
         body = {"ok": False, "error": str(exc)}
     _capture("screenshot", {"file": args.file}, body, int((time.monotonic() - t0) * 1000))
     _emit(body)
-    return 0 if body["ok"] else 1
+    return 0 if (body["ok"] and body.get("exists", False)) else 1
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -212,7 +220,7 @@ def build_parser() -> argparse.ArgumentParser:
     exf = sub.add_parser("exec-file")
     exf.add_argument("path")
     exf.add_argument("--project", default="SchoolsOut")
-    exf.set_defaults(func=lambda a: _exec(argparse.Namespace(code=open(a.path, encoding="utf-8").read(), project=a.project)))
+    exf.set_defaults(func=_exec_file)
     ru = sub.add_parser("read-ui")
     ru.set_defaults(func=_read_ui)
     sc = sub.add_parser("screenshot")
