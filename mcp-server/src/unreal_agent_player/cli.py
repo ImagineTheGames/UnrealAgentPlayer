@@ -118,8 +118,52 @@ def _status(args) -> int:
     return 0 if out["rc_reachable"] else 1
 
 
+def _coerce(v: str):
+    """Coerce a key=value string value to bool/int/float, else leave as string."""
+    low = v.lower()
+    if low == "true":
+        return True
+    if low == "false":
+        return False
+    try:
+        return int(v)
+    except ValueError:
+        pass
+    try:
+        return float(v)
+    except ValueError:
+        pass
+    return v
+
+
+def _parse_rc_params(tokens: list[str]) -> dict:
+    """Parse rc params from CLI tokens.
+
+    Two forms (the first dodges Windows shell quoting, which mangles embedded
+    double-quotes in a JSON string arg):
+      - key=value pairs:  Command=stat\\ fps   KeyName=E   bPressed=true
+      - a single JSON object token:  '{"Command":"stat fps"}'  (when the caller
+        can pass quotes through intact).
+    """
+    if not tokens:
+        return {}
+    if len(tokens) == 1 and tokens[0].lstrip().startswith("{"):
+        return json.loads(tokens[0])
+    out: dict = {}
+    for tok in tokens:
+        if "=" not in tok:
+            raise ValueError(f"param must be key=value or a single JSON object, got: {tok!r}")
+        k, v = tok.split("=", 1)
+        out[k] = _coerce(v)
+    return out
+
+
 def _rc(args) -> int:
-    params = json.loads(args.params) if args.params else {}
+    try:
+        params = _parse_rc_params(args.params)
+    except (ValueError, json.JSONDecodeError) as exc:
+        _emit({"ok": False, "error": f"bad rc params: {exc}"})
+        return 2
     t0 = time.monotonic()
     body: dict = {"ok": True}
     try:
@@ -211,7 +255,9 @@ def build_parser() -> argparse.ArgumentParser:
     st.set_defaults(func=_status)
     rcp = sub.add_parser("rc")
     rcp.add_argument("rc_func")
-    rcp.add_argument("params", nargs="?", default="")
+    rcp.add_argument("params", nargs="*",
+                     help="key=value pairs (e.g. Command=stat fps KeyName=E bPressed=true) "
+                          "or a single JSON object")
     rcp.set_defaults(func=_rc)
     ex = sub.add_parser("exec")
     ex.add_argument("code")

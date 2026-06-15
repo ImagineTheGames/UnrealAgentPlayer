@@ -38,3 +38,18 @@ def test_exec_file_reads_and_runs(tmp_path, monkeypatch):
     f.write_text("print('hi from file')", encoding="utf-8")
     assert cli.main(["exec-file", str(f)]) == 0
     assert captured["code"] == "print('hi from file')"
+
+
+def test_parse_rc_params_keyvalue_and_json():
+    from unreal_agent_player.cli import _parse_rc_params
+    assert _parse_rc_params([]) == {}
+    # key=value with coercion
+    assert _parse_rc_params(["Command=stat fps"]) == {"Command": "stat fps"}
+    assert _parse_rc_params(["KeyName=E", "bPressed=true", "Count=3"]) == {
+        "KeyName": "E", "bPressed": True, "Count": 3}
+    # single JSON-object token escape hatch
+    assert _parse_rc_params(['{"Command":"stat fps"}']) == {"Command": "stat fps"}
+    # bad token (no '=' and not JSON) -> ValueError
+    import pytest as _pt
+    with _pt.raises(ValueError):
+        _parse_rc_params(["notakeyvalue"])
