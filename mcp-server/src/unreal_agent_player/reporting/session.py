@@ -130,6 +130,31 @@ class ReportSession:
         (self.run_dir / "data.json").write_text(
             json.dumps(self.to_dict(), indent=2), encoding="utf-8")
 
+    @classmethod
+    def load(cls, run_dir) -> "ReportSession":
+        from pathlib import Path as _P
+        run_dir = _P(run_dir)
+        data = json.loads((run_dir / "data.json").read_text(encoding="utf-8"))
+        # Build without re-running __init__ (which would reset lists + recreate dirs).
+        self = cls.__new__(cls)
+        self.task = data.get("task", "")
+        self.project = data.get("project")
+        self.quote = data.get("quote", "")
+        self.status = data.get("status", "running")
+        self.started = datetime.fromisoformat(data["started"]) if data.get("started") else datetime.now()
+        self.finished = datetime.fromisoformat(data["finished"]) if data.get("finished") else None
+        self.duration_s = data.get("duration_s")
+        self.summary = data.get("summary", "")
+        self.env = data.get("env", {})
+        self.perf = data.get("perf")
+        self.notes = data.get("notes", [])
+        self.assertions = data.get("assertions", [])
+        self.timeline = data.get("timeline", [])
+        self.screenshots = data.get("screenshots", [])
+        self.logs = data.get("logs", [])
+        self.run_dir = run_dir
+        return self
+
 
 # --- Active session registry ---
 
@@ -146,6 +171,30 @@ def _reports_root() -> Path:
     return Path(root) if root else (Path.home() / ".uap-reports")
 
 
+def _active_pointer() -> Path:
+    return _reports_root() / ".active"
+
+
+def set_active_run(run_dir) -> None:
+    p = _active_pointer()
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text(str(run_dir), encoding="utf-8")
+
+
+def get_active_run() -> Optional[Path]:
+    p = _active_pointer()
+    if not p.exists():
+        return None
+    raw = p.read_text(encoding="utf-8").strip()
+    return Path(raw) if raw else None
+
+
+def clear_active_run() -> None:
+    p = _active_pointer()
+    if p.exists():
+        p.unlink()
+
+
 def start_session(*, task: str, project: Optional[str] = None) -> ReportSession:
     global _active
     from unreal_agent_player.reporting.quotes import pick_quote
@@ -154,6 +203,7 @@ def start_session(*, task: str, project: Optional[str] = None) -> ReportSession:
     started = datetime.now()
     run_dir = _reports_root() / f"{started:%Y%m%d-%H%M%S}__{_slug(task)}"
     _active = ReportSession(task=task, project=project, run_dir=run_dir, quote=pick_quote())
+    set_active_run(_active.run_dir)
     return _active
 
 
