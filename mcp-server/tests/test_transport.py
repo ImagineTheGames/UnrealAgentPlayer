@@ -34,14 +34,14 @@ async def test_call_function_connection_error_maps_to_ue_unreachable(httpx_mock:
 @pytest.mark.asyncio
 async def test_exec_console_command_uses_standard_endpoint(httpx_mock: HTTPXMock):
     httpx_mock.add_response(
-        url="http://127.0.0.1:30010/remote/object/call",
+        url="http://127.0.0.1:30010/remote/preset/UAP_Preset/function/ExecuteConsoleCommand",
         method="PUT",
-        json={"ReturnValue": ""},
+        json={"ReturnedValues": [{"ReturnValue": ""}]},
     )
     client = RemoteControlClient()
     await client.exec_console("stat fps")
     request = httpx_mock.get_requests()[0]
-    assert b"ExecuteConsoleCommand" in request.content
+    assert b"ExecuteConsoleCommand" in request.url.path.encode()
     assert b"stat fps" in request.content
     await client.aclose()
 

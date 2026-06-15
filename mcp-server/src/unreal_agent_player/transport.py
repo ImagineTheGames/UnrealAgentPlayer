@@ -23,6 +23,7 @@ from unreal_agent_player.errors import AgentError, ErrorCode
 
 SUBSYSTEM_OBJECT_PATH = "/Engine/Transient.UAPAgentSubsystem_0"
 DEFAULT_PRESET_NAME = "UAP_Preset"
+PRESET_FUNCTION_URL = "/remote/preset/{preset}/function/{func}"
 
 
 def rc_for_port(port: int, timeout: float = 10.0) -> "RemoteControlClient":
@@ -93,14 +94,46 @@ class RemoteControlClient:
         except json.JSONDecodeError:
             return {}
 
+    async def call_preset(
+        self,
+        function_name: str,
+        parameters: dict[str, Any] | None = None,
+        *,
+        preset: str = DEFAULT_PRESET_NAME,
+    ) -> Any:
+        """Call a UFUNCTION via the stable embedded-preset endpoint.
+
+        Returns the unwrapped ReturnValue (preset calls wrap results in
+        ReturnedValues[0].ReturnValue), or {} when there is no return value.
+        """
+        path = PRESET_FUNCTION_URL.format(preset=preset, func=function_name)
+        try:
+            resp = await self._client.put(f"{self._base}{path}", json={"Parameters": parameters or {}})
+        except httpx.ConnectError as exc:
+            raise AgentError(
+                ErrorCode.UE_UNREACHABLE,
+                f"Could not reach Remote Control at {self._base}: {exc}",
+                retry_hint="start UE editor and enable Remote Control HTTP server",
+            ) from exc
+        if resp.status_code >= 400:
+            raise AgentError(
+                ErrorCode.UE_UNREACHABLE,
+                f"Remote Control preset call returned {resp.status_code}: {resp.text[:200]}",
+                recoverable=False,
+            )
+        try:
+            body = resp.json()
+        except json.JSONDecodeError:
+            return {}
+        vals = body.get("ReturnedValues") or []
+        if vals and isinstance(vals[0], dict) and "ReturnValue" in vals[0]:
+            return vals[0]["ReturnValue"]
+        return body
+
     async def exec_console(self, command: str) -> str:
-        """Execute a console command through the auto-exposed subsystem."""
-        result = await self.call_function(
-            SUBSYSTEM_OBJECT_PATH,
-            "ExecuteConsoleCommand",
-            parameters={"Command": command},
-        )
-        return str(result.get("ReturnValue", ""))
+        """Execute a console command through the stable preset endpoint."""
+        result = await self.call_preset("ExecuteConsoleCommand", {"Command": command})
+        return str(result if isinstance(result, str) else "")
 
 
 class PythonRemoteExecClient:
