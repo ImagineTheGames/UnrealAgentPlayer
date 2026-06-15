@@ -1,12 +1,16 @@
 from __future__ import annotations
 
 import argparse
+import asyncio
 import json
 import sys
+import time
 import webbrowser
 
 from unreal_agent_player.reporting import session as sess
 from unreal_agent_player.reporting.render import render
+from unreal_agent_player.transport import RemoteControlClient, PythonRemoteExecClient
+from unreal_agent_player.errors import AgentError
 
 
 def _load_active() -> "sess.ReportSession | None":
@@ -75,6 +79,104 @@ def _report_finish(args) -> int:
     return 0
 
 
+def _rc_call(func: str, params: dict):
+    async def _go():
+        rc = RemoteControlClient()
+        try:
+            return await rc.call_preset(func, params)
+        finally:
+            await rc.aclose()
+    return asyncio.run(_go())
+
+
+def _capture(tool: str, args: dict, body: dict, ms: int) -> None:
+    s = _load_active()
+    if s is None:
+        return
+    try:
+        ok = bool(body.get("ok", True)) and "error" not in body
+        s.add_tool_call(tool, args, ok=ok, ms=ms, error=body.get("error"))
+        if tool == "screenshot" and body.get("path"):
+            s.add_screenshot(body["path"], body.get("caption", ""))
+    except Exception:
+        pass
+
+
+def _status(args) -> int:
+    t0 = time.monotonic()
+    out = {"ok": True, "rc_reachable": False, "plugin_version": None}
+    try:
+        ver = _rc_call("GetPluginVersion", {})
+        out["rc_reachable"] = True
+        out["plugin_version"] = ver
+    except AgentError as exc:
+        out["ok"] = False
+        out["error"] = str(exc)
+    _capture("status", {}, out, int((time.monotonic() - t0) * 1000))
+    _emit(out)
+    return 0 if out["rc_reachable"] else 1
+
+
+def _rc(args) -> int:
+    params = json.loads(args.params) if args.params else {}
+    t0 = time.monotonic()
+    body: dict = {"ok": True}
+    try:
+        body["result"] = _rc_call(args.rc_func, params)
+    except AgentError as exc:
+        body = {"ok": False, "error": str(exc)}
+    _capture(f"rc:{args.rc_func}", {"params": params}, body, int((time.monotonic() - t0) * 1000))
+    _emit(body)
+    return 0 if body["ok"] else 1
+
+
+def _exec(args) -> int:
+    code = args.code
+    t0 = time.monotonic()
+    body: dict = {"ok": True}
+    try:
+        client = PythonRemoteExecClient(node_project_substr=args.project)
+        res = client.exec_python(code)
+        body["result"] = res.get("result")
+        body["output"] = [o.get("output", "") for o in (res.get("output") or [])]
+        body["ok"] = bool(res.get("success", True))
+    except AgentError as exc:
+        body = {"ok": False, "error": str(exc)}
+    _capture("exec", {"code": code[:200]}, body, int((time.monotonic() - t0) * 1000))
+    _emit(body)
+    return 0 if body["ok"] else 1
+
+
+def _read_ui(args) -> int:
+    t0 = time.monotonic()
+    body: dict = {"ok": True}
+    try:
+        body["ui"] = _rc_call("DumpViewportUI", {})
+    except AgentError as exc:
+        body = {"ok": False, "error": str(exc)}
+    _capture("read-ui", {}, body, int((time.monotonic() - t0) * 1000))
+    _emit(body)
+    return 0 if body["ok"] else 1
+
+
+def _screenshot(args) -> int:
+    import os as _os
+    t0 = time.monotonic()
+    body: dict = {"ok": True, "caption": args.caption}
+    try:
+        _rc_call("CaptureViewportWithUI", {"Filename": args.file})
+        deadline = time.monotonic() + 8.0
+        while time.monotonic() < deadline and not _os.path.exists(args.file):
+            time.sleep(0.25)
+        body["path"] = args.file
+        body["exists"] = _os.path.exists(args.file)
+    except AgentError as exc:
+        body = {"ok": False, "error": str(exc)}
+    _capture("screenshot", {"file": args.file}, body, int((time.monotonic() - t0) * 1000))
+    _emit(body)
+    return 0 if body["ok"] else 1
+
+
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="uap")
     sub = p.add_subparsers(dest="cmd", required=True)
@@ -96,6 +198,27 @@ def build_parser() -> argparse.ArgumentParser:
     rf.add_argument("verdict", choices=["pass", "fail"])
     rf.add_argument("summary")
     rf.set_defaults(func=_report_finish)
+
+    st = sub.add_parser("status")
+    st.set_defaults(func=_status)
+    rcp = sub.add_parser("rc")
+    rcp.add_argument("rc_func")
+    rcp.add_argument("params", nargs="?", default="")
+    rcp.set_defaults(func=_rc)
+    ex = sub.add_parser("exec")
+    ex.add_argument("code")
+    ex.add_argument("--project", default="SchoolsOut")
+    ex.set_defaults(func=_exec)
+    exf = sub.add_parser("exec-file")
+    exf.add_argument("path")
+    exf.add_argument("--project", default="SchoolsOut")
+    exf.set_defaults(func=lambda a: _exec(argparse.Namespace(code=open(a.path, encoding="utf-8").read(), project=a.project)))
+    ru = sub.add_parser("read-ui")
+    ru.set_defaults(func=_read_ui)
+    sc = sub.add_parser("screenshot")
+    sc.add_argument("file")
+    sc.add_argument("--caption", default="")
+    sc.set_defaults(func=_screenshot)
     return p
 
 
