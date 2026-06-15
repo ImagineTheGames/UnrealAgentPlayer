@@ -115,6 +115,10 @@ class RemoteControlClient:
                 f"Could not reach Remote Control at {self._base}: {exc}",
                 retry_hint="start UE editor and enable Remote Control HTTP server",
             ) from exc
+        except httpx.HTTPError as exc:
+            raise AgentError(
+                ErrorCode.UE_UNREACHABLE, f"HTTP error talking to Remote Control: {exc}"
+            ) from exc
         if resp.status_code >= 400:
             raise AgentError(
                 ErrorCode.UE_UNREACHABLE,
@@ -133,6 +137,7 @@ class RemoteControlClient:
     async def exec_console(self, command: str) -> str:
         """Execute a console command through the stable preset endpoint."""
         result = await self.call_preset("ExecuteConsoleCommand", {"Command": command})
+        # Console commands typically have no return value; non-string/empty -> "".
         return str(result if isinstance(result, str) else "")
 
 
