@@ -2,7 +2,7 @@ from pathlib import Path
 from unreal_agent_player.cli import main
 
 
-def test_report_lifecycle(tmp_path, monkeypatch, capsys):
+def test_report_lifecycle(tmp_path, monkeypatch):
     monkeypatch.setenv("UAP_REPORTS_DIR", str(tmp_path))
     assert main(["report", "start", "does the door open"]) == 0
     assert main(["report", "assert", "door opens", "pass", "bIsOpen=true"]) == 0
