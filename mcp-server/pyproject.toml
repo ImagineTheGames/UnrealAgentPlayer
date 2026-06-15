@@ -26,6 +26,7 @@ windows = [
 
 [project.scripts]
 unreal-agent-player = "unreal_agent_player.__main__:main"
+uap = "unreal_agent_player.cli:main"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/unreal_agent_player"]
