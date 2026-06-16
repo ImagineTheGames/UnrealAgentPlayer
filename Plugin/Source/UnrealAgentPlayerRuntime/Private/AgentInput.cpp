@@ -9,6 +9,9 @@
 #include "GameFramework/PlayerController.h"
 #include "GameFramework/PlayerInput.h"
 #include "Widgets/SViewport.h"
+#include "InputKeyEventArgs.h"
+#include "GenericPlatform/GenericPlatformInputDeviceMapper.h"
+#include "HAL/PlatformTime.h"
 
 TSharedPtr<SWidget> FAgentInput::FindPIEViewportWidget()
 {
@@ -60,27 +63,27 @@ FKey FAgentInput::GamepadButtonToKey(EAgentGamepadButton Btn)
 
 bool FAgentInput::InjectKey(FKey Key, bool bPressed, bool bRepeat)
 {
-    TSharedPtr<SWidget> Target = FindPIEViewportWidget();
-    if (!Target.IsValid()) { return false; }
-    FSlateApplication& App = FSlateApplication::Get();
+    // Route the key straight through the game viewport client -> PlayerController ->
+    // (Enhanced)Input -- the same call a focused SViewport makes on a real keypress, but
+    // invoked directly so it does NOT depend on Slate keyboard focus or this editor being
+    // the OS-foreground window. The old path (SetAllUserFocus + ProcessKeyDownEvent) routed
+    // down the Slate focus path, which silently dropped the key whenever the PIE viewport
+    // was not in the focus path -- i.e. whenever the editor was backgrounded or PIE played
+    // inside the level viewport. This path works whether or not the editor is foreground,
+    // so headless / multi-editor auto-testing reaches the game. (Still fully in-process; two
+    // editors in separate processes each drive their own game independently.)
+    UGameViewportClient* GV = FAgentWorld::GetActiveGameViewport();
+    if (!GV || !GV->Viewport) { return false; }
 
-    // ProcessKeyDownEvent routes down the CURRENT Slate keyboard-focus path, not to
-    // Target. Force focus onto the PIE viewport first so the key reaches
-    // SViewport->FSceneViewport->GameViewportClient::InputKey even when this editor is
-    // not the OS-foreground window. This is fully in-process (no Win32 foreground lock),
-    // so two editors in separate processes can each receive injected keys independently.
-    App.SetAllUserFocus(Target.ToSharedRef(), EFocusCause::SetDirectly);
-
-    FKeyEvent Evt(
-        Key, App.GetModifierKeys(),
-        /*UserIndex*/ 0,
-        /*bIsRepeat*/ bRepeat,
-        /*CharacterCode*/ 0,
-        /*KeyCode*/ 0
-    );
-
-    if (bPressed) { return App.ProcessKeyDownEvent(Evt); }
-    return App.ProcessKeyUpEvent(Evt);
+    FInputKeyEventArgs Args(
+        GV->Viewport,
+        IPlatformInputDeviceMapper::Get().GetDefaultInputDevice(),
+        Key,
+        bPressed ? IE_Pressed : IE_Released,
+        /*AmountDepressed*/ 1.0f,
+        /*bIsTouchEvent*/ false,
+        /*EventTimestamp*/ FPlatformTime::Cycles64());
+    return GV->InputKey(Args);
 }
 
 bool FAgentInput::InjectMouseMove(FVector2D Delta, bool bAbsolute)
