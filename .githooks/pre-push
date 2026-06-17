@@ -1,0 +1,33 @@
+#!/bin/sh
+# pre-push hook: mirror the ci-python GitHub Action (ruff lint + pytest) locally so a
+# push that would fail CI is blocked before it leaves the machine.
+#
+# Activate (one time per clone):  git config core.hooksPath .githooks
+#
+# Skips the editor-dependent test `test_exec_python_no_editor_raises` -- it only passes
+# when NO Unreal editor is running (CI has none; local dev usually does), so running it
+# here would false-block legitimate pushes.
+
+root=$(git rev-parse --show-toplevel) || exit 0
+cd "$root/mcp-server" 2>/dev/null || exit 0   # no python package here -> nothing to check
+
+PY="./.venv/Scripts/python.exe"
+[ -x "$PY" ] || PY="python"
+
+echo "[pre-push] ruff check src tests"
+if ! "$PY" -m ruff check src tests; then
+    echo ""
+    echo "[pre-push] BLOCKED: ruff lint errors (this is exactly what fails ci-python)."
+    echo "           Fix with: (cd mcp-server && .venv/Scripts/python.exe -m ruff check --fix src tests)"
+    exit 1
+fi
+
+echo "[pre-push] pytest -q (excluding editor-dependent remote-exec test)"
+if ! "$PY" -m pytest -q --deselect tests/test_python_remote_exec.py::test_exec_python_no_editor_raises; then
+    echo ""
+    echo "[pre-push] BLOCKED: tests failing."
+    exit 1
+fi
+
+echo "[pre-push] OK -- lint clean, tests green."
+exit 0
