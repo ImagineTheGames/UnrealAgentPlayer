@@ -1,5 +1,3 @@
-import json
-from pathlib import Path
 from unreal_agent_player.reporting import session as sess
 from unreal_agent_player.reporting.session import ReportSession
 
