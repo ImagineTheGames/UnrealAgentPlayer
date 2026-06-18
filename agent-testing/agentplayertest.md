@@ -29,10 +29,13 @@ reverse-engineer tools by dumping `dir()` on the subsystem.
 
 ## Quick recipes (copy-paste)
 
-There is no single `click`/`tab` verb yet -- compose the primitives:
+`uap click` handles buttons; `tab`/`nav` are still composed via `exec` for now:
 
 ```
-# Click an on-screen UMG button by its label:
+# Click an on-screen UMG button by its label (one call):
+uap click "VR TRAINING"
+
+# ...or the underlying chain (what `uap click` runs) for a precise spot:
 uap read-ui                                         # find the button's x,y in the dump
 uap rc InjectMouseMove X=<x> Y=<y> bAbsolute=true
 uap rc InjectMouseButton Button=Left bPressed=true

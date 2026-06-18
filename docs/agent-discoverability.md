@@ -26,12 +26,13 @@ reading them. UAP is meant to be the *easy* path; the discovery surface was too 
   XR button, test helpers, tab-via-exec). The catalog leads with recipes, not philosophy.
 - **`agentplayertest.md` now opens with a "Quick recipes" block** + a pointer to `uap help` and
   to `docs/agent-testing.md` / `capabilities.md` / `known-issues.md`. Agents stop spelunking.
+- **`uap click "<label>"`** -- one-call UMG button click (read-ui -> match text -> inject mouse).
+  CLI-only (composes existing verbs). Live-verify pending; clicks the element's reported
+  position (top-left) until read-ui exposes a center coord (see D).
 
 ## Planned (needs live-editor verification; do when editors are free)
 
-- **A. First-class UI verbs** (the missing easy path):
-  - `uap click "<label>"` -- read-ui, match label, click its center. (Composable today via the
-    recipe; promote to a verb so it's one call. Needs read-ui center coords -- see D.)
+- **A. Remaining UI verbs** (need plugin C++ + a rebuild):
   - `uap tab "<TabId>"` -- CommonUI `CommonTabListWidgetBase::SelectTabByID` (menus are
     tab-driven; highest-value single addition).
   - `uap nav up|down|left|right|accept|back` -- CommonUI focus navigation.

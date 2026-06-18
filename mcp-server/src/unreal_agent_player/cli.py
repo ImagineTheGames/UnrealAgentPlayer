@@ -407,6 +407,45 @@ def _pie(args) -> int:
     return 0 if body["ok"] else 1
 
 
+def _find_clickable(elements: list, label: str) -> "dict | None":
+    """Choose the on-screen element to click for a label: exact (case-insensitive) match
+    first, then a substring match. Returns the element dict (with x/y) or None."""
+    low = label.strip().lower()
+    exact = [e for e in elements if str(e.get("text", "")).strip().lower() == low]
+    if exact:
+        return exact[0]
+    subs = [e for e in elements if low in str(e.get("text", "")).lower()]
+    return subs[0] if subs else None
+
+
+def _click(args) -> int:
+    """Click an on-screen UMG element by its visible text -- read-ui to find it, then inject a
+    real mouse move+down+up at its position. The easy path that used to require composing
+    read-ui + InjectMouse* by hand. (Clicks the element's reported position; a future read-ui
+    center coord will improve precision for large widgets -- see docs/agent-discoverability.md.)"""
+    t0 = time.monotonic()
+    body: dict = {"ok": True, "label": args.label}
+    try:
+        ui_raw = _rc_call("DumpViewportUI", {}, args.project)
+        ui = json.loads(ui_raw) if isinstance(ui_raw, str) else (ui_raw or {})
+        elements = ui.get("texts") or []
+        match = _find_clickable(elements, args.label)
+        if match is None:
+            body = {"ok": False, "error": f"no on-screen element matching {args.label!r}",
+                    "seen": [e.get("text") for e in elements]}
+        else:
+            x, y = float(match["x"]), float(match["y"])
+            body.update({"matched": match.get("text"), "x": x, "y": y})
+            _rc_call("InjectMouseMove", {"X": x, "Y": y, "bAbsolute": True}, args.project)
+            _rc_call("InjectMouseButton", {"Button": "Left", "bPressed": True}, args.project)
+            _rc_call("InjectMouseButton", {"Button": "Left", "bPressed": False}, args.project)
+    except (AgentError, ValueError, KeyError, json.JSONDecodeError) as exc:
+        body = {"ok": False, "error": str(exc)}
+    _capture("click", {"label": args.label}, body, int((time.monotonic() - t0) * 1000))
+    _emit(body)
+    return 0 if body["ok"] else 1
+
+
 def _read_ui(args) -> int:
     t0 = time.monotonic()
     body: dict = {"ok": True}
@@ -471,10 +510,13 @@ DRIVE + OBSERVE
   uap rc <Func> [key=value ...]   call a plugin UFUNCTION (input injection lives here)
   uap exec "<python>"             run `import unreal; ...` in the editor (escape hatch)
   uap read-ui                     dump on-screen UMG: [{text, x, y}, ...] + focused
+  uap click "<label>"             click an on-screen UMG element by its visible text
   uap screenshot <file>           capture composited game+UMG frame (needs live PIE)
 
-RECIPES (compose the primitives -- there is no single click/tab verb yet)
-  Click an on-screen button by label:
+RECIPES
+  Click an on-screen button by label (one call):
+    uap click "VR TRAINING"
+  ...or the underlying chain (what `uap click` does), e.g. to click a precise spot:
     uap read-ui                                   # find the element's x,y
     uap rc InjectMouseMove X=<x> Y=<y> bAbsolute=true
     uap rc InjectMouseButton Button=Left bPressed=true
@@ -572,6 +614,9 @@ def build_parser() -> argparse.ArgumentParser:
 
     ru = sub.add_parser("read-ui", parents=[proj])
     ru.set_defaults(func=_read_ui)
+    cl = sub.add_parser("click", parents=[proj], help="click an on-screen UMG element by its text")
+    cl.add_argument("label", help="visible text of the element to click")
+    cl.set_defaults(func=_click)
     sc = sub.add_parser("screenshot", parents=[proj])
     sc.add_argument("file")
     sc.add_argument("--caption", default="")

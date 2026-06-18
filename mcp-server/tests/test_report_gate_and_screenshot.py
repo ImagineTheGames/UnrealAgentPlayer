@@ -39,6 +39,31 @@ def test_pie_start_and_stop_route_to_pie():
         assert args.pie_cmd == verb
 
 
+def test_find_clickable_prefers_exact_then_substring():
+    from unreal_agent_player.cli import _find_clickable
+    els = [
+        {"text": "VR TRAINING", "x": 100, "y": 50},
+        {"text": "Settings", "x": 100, "y": 90},
+        {"text": "Start VR Match", "x": 100, "y": 130},
+    ]
+    # exact (case-insensitive) wins even though "vr" also appears elsewhere
+    assert _find_clickable(els, "vr training")["x"] == 100
+    assert _find_clickable(els, "vr training")["y"] == 50
+    # substring fallback
+    assert _find_clickable(els, "Settings")["y"] == 90
+    assert _find_clickable(els, "Match")["text"] == "Start VR Match"
+    # no match
+    assert _find_clickable(els, "Quit") is None
+
+
+def test_click_routes_with_label_and_project():
+    from unreal_agent_player.cli import _click
+    a = build_parser().parse_args(["click", "VR TRAINING", "--project", "PBW"])
+    assert a.func is _click
+    assert a.label == "VR TRAINING"
+    assert a.project == "PBW"
+
+
 def test_help_catalog_has_recipes(capsys):
     from unreal_agent_player.cli import _help
     assert build_parser().parse_args(["help"]).func is _help
