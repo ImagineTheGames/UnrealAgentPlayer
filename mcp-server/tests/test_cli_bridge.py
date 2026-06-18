@@ -4,7 +4,8 @@ from unreal_agent_player.reporting import session as sess
 
 def test_rc_verb_calls_preset_and_autocaptures(tmp_path, monkeypatch, capsys):
     monkeypatch.setenv("UAP_REPORTS_DIR", str(tmp_path))
-    monkeypatch.setattr(cli, "_rc_call", lambda func, params: "0.0.1")
+    monkeypatch.setenv("UAP_RC_PORT", "30010")  # pin the port (no exec resolution in tests)
+    monkeypatch.setattr(cli, "_rc_call", lambda func, params, project=None: "0.0.1")
     assert cli.main(["report", "start", "q"]) == 0
     assert cli.main(["rc", "GetPluginVersion"]) == 0
     run = sess.get_active_run()
@@ -13,7 +14,9 @@ def test_rc_verb_calls_preset_and_autocaptures(tmp_path, monkeypatch, capsys):
 
 
 def test_status_maps_unreachable(monkeypatch, capsys):
-    def boom(func, params):
+    monkeypatch.setenv("UAP_RC_PORT", "30010")  # pin the port (no exec resolution in tests)
+
+    def boom(func, params, project=None):
         from unreal_agent_player.errors import AgentError, ErrorCode
         raise AgentError(ErrorCode.UE_UNREACHABLE, "down")
     monkeypatch.setattr(cli, "_rc_call", boom)

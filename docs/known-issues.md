@@ -89,7 +89,31 @@ to record the game's frame rate. `report finish` warns when env is empty. Verifi
 perf populated (e.g. `frame_ms 333.33, draw_ms 5.57, gpu_ms 11.81, fps 3.0` -- the low fps was the
 editor's background-CPU throttle, captured truthfully).
 
+## 7. Two editors could not both run RemoteControl (port 30010 collision) -- FIXED
+
+Was: RC HTTP is a single bind on port 30010 with no fallback. A second editor failed to bind
+and had NO RC -- and `IWebRemoteControlModule::IsHttpServerRunning()` could not detect this: it
+returns true even when the socket bind failed, so the second editor wrongly believed it owned
+30010 (verified: netstat showed the first editor on 30010 while the second logged "running on
+port 30010" yet listened on nothing). Python remote-exec already worked in both editors (UDP
+multicast, addressed per-project); only RC was broken.
+
+Fixed (editor): each editor assigns itself a DETERMINISTIC base port per project
+(`30011 + crc32(projectName) % 80`, never the default 30010) and probes upward for the first
+genuinely free TCP port, then rebinds RC to it -- so two DIFFERENT projects never collide, and a
+socket bind test (reliable, unlike IsHttpServerRunning) is the only signal trusted.
+`GetRemoteControlPort` reports the configured port only if a self socket-probe confirms it is
+actually held (else 0), so a caller never drives the wrong editor.
+
+Fixed (CLI): RC verbs (`status`/`rc`/`pie`/`read-ui`/`screenshot`) take `--project`; the RC port
+is resolved per project by asking that editor (over exec) for `GetRemoteControlPort`, cached, with
+a re-resolve on connection failure. `UAP_RC_PORT` still pins the port explicitly.
+
+Note: editors no longer keep 30010 -- each uses its per-project port (e.g. SchoolsOut -> 30079).
+External RC tooling hardcoded to 30010 should read the per-project port (via `uap status --project`).
+Verified live on SchoolsOut (port 30079, RC reachable via `uap status --project SchoolsOut`).
+
 ## Status
 
-All six resolved. 1 and 5 were doc fixes; 2, 3, 4 were code changes that retire the
+All seven resolved. 1 and 5 were doc fixes; 2, 3, 4 were code changes that retire the
 fragile-API and false-positive footguns (2 also removes the cause of 1).

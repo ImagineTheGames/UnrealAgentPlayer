@@ -92,6 +92,11 @@ FString UUAPAgentSubsystem::GetPluginVersion() const
     return TEXT("0.0.1");
 }
 
+int32 UUAPAgentSubsystem::GetRemoteControlPort() const
+{
+    return FUnrealAgentPlayerRuntimeModule::GetConfiguredRCPort();
+}
+
 FString UUAPAgentSubsystem::ExecuteConsoleCommand(FString Command)
 {
     if (!GEditor)

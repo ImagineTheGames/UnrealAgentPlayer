@@ -17,7 +17,8 @@ public class UnrealAgentPlayerRuntime : ModuleRules
             "Slate", "SlateCore", "ApplicationCore", "UMG",
             "RHI", "RenderCore", "HeadMountedDisplay",
             "Json", "JsonUtilities",
-            "RemoteControl", "RemoteControlCommon",
+            "RemoteControl", "RemoteControlCommon", "WebRemoteControl",
+            "Sockets", "Networking",
             "DeveloperSettings", "Projects",
         });
     }

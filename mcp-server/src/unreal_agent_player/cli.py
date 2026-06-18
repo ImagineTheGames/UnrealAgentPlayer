@@ -4,6 +4,8 @@ import argparse
 import asyncio
 import json
 import os
+import pathlib
+import re
 import sys
 import time
 import webbrowser
@@ -158,10 +160,11 @@ def _report_finish(args) -> int:
         _emit({"ok": False, "error": f"render failed: {exc}"})
         return 1
     sess.clear_active_run()
-    try:
-        webbrowser.open(html_path.as_uri())
-    except Exception:
-        pass
+    if not os.environ.get("UAP_NO_BROWSER"):
+        try:
+            webbrowser.open(html_path.as_uri())
+        except Exception:
+            pass
     out = {"ok": True, "html": str(html_path), "verdict": s.status,
            "downgraded": s.status != args.verdict}
     if not s.env:
@@ -171,23 +174,97 @@ def _report_finish(args) -> int:
     return 0
 
 
-def _rc_port() -> int:
-    """RC HTTP port. Defaults to 30010; override with UAP_RC_PORT (e.g. when a second
-    editor already holds 30010 and this project's RC bound a different port)."""
+def _rcport_cache_dir() -> pathlib.Path:
+    root = os.environ.get("UAP_REPORTS_DIR")
+    base = pathlib.Path(root) if root else (pathlib.Path.home() / ".uap-reports")
+    return base / ".rcports"
+
+
+def _port_cache_file(project: str) -> pathlib.Path:
+    slug = re.sub(r"[^A-Za-z0-9]+", "-", project).strip("-").lower() or "default"
+    return _rcport_cache_dir() / f"{slug}.txt"
+
+
+def _read_port_cache(project: str) -> int:
     try:
-        return int(os.environ.get("UAP_RC_PORT", "30010"))
-    except ValueError:
-        return 30010
+        return int(_port_cache_file(project).read_text(encoding="utf-8").strip())
+    except (OSError, ValueError):
+        return 0
 
 
-def _rc_call(func: str, params: dict):
-    async def _go():
-        rc = RemoteControlClient(port=_rc_port())
+def _write_port_cache(project: str, port: int) -> None:
+    try:
+        f = _port_cache_file(project)
+        f.parent.mkdir(parents=True, exist_ok=True)
+        f.write_text(str(port), encoding="utf-8")
+    except OSError:
+        pass
+
+
+def _exec_rc_port(project: str) -> int:
+    """Ask the editor matching `project` (over Python remote-exec, which is addressed
+    per-editor) for the RC HTTP port it actually bound. 0 if unreachable / no match."""
+    code = ("import unreal\n"
+            "print('UAPRCPORT:' + str("
+            "unreal.get_editor_subsystem(unreal.UAPAgentSubsystem).get_remote_control_port()))\n")
+    try:
+        res = PythonRemoteExecClient(node_project_substr=project).exec_python(code)
+    except AgentError:
+        return 0
+    for o in (res.get("output") or []):
+        line = o.get("output", "")
+        if "UAPRCPORT:" in line:
+            try:
+                return int(line.split("UAPRCPORT:", 1)[1].strip())
+            except ValueError:
+                return 0
+    return 0
+
+
+def _rc_port_for(project: "str | None") -> int:
+    """Resolve the RC HTTP port. UAP_RC_PORT env overrides everything; else resolve the
+    editor's advertised port by project (cached), so two editors are each addressed on their
+    own port. Falls back to 30010."""
+    env = os.environ.get("UAP_RC_PORT")
+    if env:
         try:
-            return await rc.call_preset(func, params)
-        finally:
-            await rc.aclose()
-    return asyncio.run(_go())
+            return int(env)
+        except ValueError:
+            pass
+    if project:
+        cached = _read_port_cache(project)
+        if cached:
+            return cached
+        resolved = _exec_rc_port(project)
+        if resolved:
+            _write_port_cache(project, resolved)
+            return resolved
+    return 30010
+
+
+def _rc_call(func: str, params: dict, project: "str | None" = None):
+    port = _rc_port_for(project)
+
+    def _call(p: int):
+        async def _go():
+            rc = RemoteControlClient(port=p)
+            try:
+                return await rc.call_preset(func, params)
+            finally:
+                await rc.aclose()
+        return asyncio.run(_go())
+
+    try:
+        return _call(port)
+    except AgentError:
+        # The cached/default port may be stale (editor restarted on a different port).
+        # Re-resolve once via exec and retry -- unless an explicit env override pins the port.
+        if project and not os.environ.get("UAP_RC_PORT"):
+            fresh = _exec_rc_port(project)
+            if fresh and fresh != port:
+                _write_port_cache(project, fresh)
+                return _call(fresh)
+        raise
 
 
 def _capture(tool: str, args: dict, body: dict, ms: int) -> None:
@@ -205,9 +282,9 @@ def _capture(tool: str, args: dict, body: dict, ms: int) -> None:
 
 def _status(args) -> int:
     t0 = time.monotonic()
-    out = {"ok": True, "rc_reachable": False, "plugin_version": None}
+    out = {"ok": True, "rc_reachable": False, "plugin_version": None, "rc_port": _rc_port_for(args.project)}
     try:
-        ver = _rc_call("GetPluginVersion", {})
+        ver = _rc_call("GetPluginVersion", {}, args.project)
         out["rc_reachable"] = True
         out["plugin_version"] = ver
     except AgentError as exc:
@@ -267,7 +344,7 @@ def _rc(args) -> int:
     t0 = time.monotonic()
     body: dict = {"ok": True}
     try:
-        body["result"] = _rc_call(args.rc_func, params)
+        body["result"] = _rc_call(args.rc_func, params, args.project)
     except AgentError as exc:
         body = {"ok": False, "error": str(exc)}
     _capture(f"rc:{args.rc_func}", {"params": params}, body, int((time.monotonic() - t0) * 1000))
@@ -308,15 +385,15 @@ def _pie(args) -> int:
     body: dict = {"ok": True}
     try:
         if sub == "start":
-            body["result"] = _rc_call("StartPIE", {})
+            body["result"] = _rc_call("StartPIE", {}, args.project)
         elif sub == "stop":
-            body["result"] = _rc_call("StopPIE", {})
+            body["result"] = _rc_call("StopPIE", {}, args.project)
         elif sub == "wait":
             deadline = time.monotonic() + args.seconds
-            playing = bool(_rc_call("IsInPIE", {}))
+            playing = bool(_rc_call("IsInPIE", {}, args.project))
             while not playing and time.monotonic() < deadline:
                 time.sleep(0.5)
-                playing = bool(_rc_call("IsInPIE", {}))
+                playing = bool(_rc_call("IsInPIE", {}, args.project))
             body["playing"] = playing
             body["ok"] = playing
             if not playing:
@@ -332,7 +409,7 @@ def _read_ui(args) -> int:
     t0 = time.monotonic()
     body: dict = {"ok": True}
     try:
-        body["ui"] = _rc_call("DumpViewportUI", {})
+        body["ui"] = _rc_call("DumpViewportUI", {}, args.project)
     except AgentError as exc:
         body = {"ok": False, "error": str(exc)}
     _capture("read-ui", {}, body, int((time.monotonic() - t0) * 1000))
@@ -357,7 +434,7 @@ def _screenshot_body(file: str, exists: bool) -> dict:
 def _screenshot(args) -> int:
     t0 = time.monotonic()
     try:
-        _rc_call("CaptureViewportWithUI", {"Filename": args.file})
+        _rc_call("CaptureViewportWithUI", {"Filename": args.file}, args.project)
         deadline = time.monotonic() + 8.0
         while time.monotonic() < deadline and not os.path.exists(args.file):
             time.sleep(0.25)
@@ -373,6 +450,12 @@ def _screenshot(args) -> int:
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="uap")
     sub = p.add_subparsers(dest="cmd", required=True)
+
+    # Shared --project for RC verbs: the RC HTTP port is resolved per editor (by project), so
+    # two editors are each addressed on their own port instead of both hitting 30010.
+    proj = argparse.ArgumentParser(add_help=False)
+    proj.add_argument("--project", default="SchoolsOut",
+                      help="editor to target; its RC port is resolved per project (cached)")
 
     rep = sub.add_parser("report").add_subparsers(dest="rcmd", required=True)
     rs = rep.add_parser("start")
@@ -402,9 +485,9 @@ def build_parser() -> argparse.ArgumentParser:
     rf.add_argument("summary")
     rf.set_defaults(func=_report_finish)
 
-    st = sub.add_parser("status")
+    st = sub.add_parser("status", parents=[proj])
     st.set_defaults(func=_status)
-    rcp = sub.add_parser("rc")
+    rcp = sub.add_parser("rc", parents=[proj])
     rcp.add_argument("rc_func")
     rcp.add_argument("params", nargs="*",
                      help="key=value pairs (e.g. Command=stat fps KeyName=E bPressed=true) "
@@ -419,15 +502,15 @@ def build_parser() -> argparse.ArgumentParser:
     exf.add_argument("--project", default="SchoolsOut")
     exf.set_defaults(func=_exec_file)
     pie = sub.add_parser("pie").add_subparsers(dest="pie_cmd", required=True)
-    pie.add_parser("start").set_defaults(func=_pie)
-    pie.add_parser("stop").set_defaults(func=_pie)
-    pw = pie.add_parser("wait")
+    pie.add_parser("start", parents=[proj]).set_defaults(func=_pie)
+    pie.add_parser("stop", parents=[proj]).set_defaults(func=_pie)
+    pw = pie.add_parser("wait", parents=[proj])
     pw.add_argument("seconds", type=float, help="max seconds to wait for PIE to be live")
     pw.set_defaults(func=_pie)
 
-    ru = sub.add_parser("read-ui")
+    ru = sub.add_parser("read-ui", parents=[proj])
     ru.set_defaults(func=_read_ui)
-    sc = sub.add_parser("screenshot")
+    sc = sub.add_parser("screenshot", parents=[proj])
     sc.add_argument("file")
     sc.add_argument("--caption", default="")
     sc.set_defaults(func=_screenshot)

@@ -20,6 +20,13 @@ public:
     UFUNCTION(BlueprintCallable, Category="Agent|Status")
     FString ExecuteConsoleCommand(FString Command);
 
+    // The RemoteControl HTTP port this editor's RC server actually bound. With two editors
+    // open, the second auto-moves off the default 30010 to a free port; an agent CLI calls
+    // this (over Python remote-exec, which is addressed per-editor) to learn the right port
+    // to use for RemoteControl, instead of guessing 30010.
+    UFUNCTION(BlueprintCallable, Category="Agent|Status")
+    int32 GetRemoteControlPort() const;
+
     // Brings the editor's main window to the foreground. Works from inside the editor
     // process (no cross-process foreground lock), so an external agent can make the
     // editor frontmost before capturing screenshots or injecting clicks. Windows only.
