@@ -14,3 +14,19 @@ def test_launcher_template_has_token_and_home_fallback():
     assert "UAP_HOME" in text
     assert "unreal_agent_player.cli" in text
     assert "$LASTEXITCODE" in text
+
+
+def test_command_template_is_project_agnostic():
+    text = _read("agentplayertest.md")
+    low = text.lower()
+    # No project-specific leakage.
+    assert "schoolsout" not in low
+    assert "janitor" not in low
+    assert "E:/ImagineGames" not in text
+    # Core contract present.
+    assert "uap report start" in text
+    assert "uap report finish" in text
+    assert "uap status" in text
+    assert "$ARGUMENTS" in text
+    # The report is mandatory and must be cited.
+    assert "index.html" in text
