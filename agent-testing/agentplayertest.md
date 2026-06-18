@@ -65,17 +65,25 @@ State the concrete pass condition before running. A non-zero speed with a frozen
 2. **`uap report start "<question>"`** -- question verbatim, `--project <YourProject>`.
 3. **Scene**: `uap exec` to `load_level('/Game/...')` if the question implies a specific map;
    else use the open level and `uap report note "using level X"`.
-4. **Start PIE** via `uap exec`
-   (`unreal.get_editor_subsystem(unreal.PlayWorldEditorSubsystem).play_in_viewport()`); confirm
-   with a follow-up `uap exec` read. Grab a log cursor before driving the condition.
+4. **Start PIE** via `uap exec`. On UE 5.7 use `LevelEditorSubsystem` (the
+   `PlayWorldEditorSubsystem` shown in older docs does NOT exist on 5.7 and throws
+   `AttributeError`):
+   `uap exec "import unreal; unreal.get_editor_subsystem(unreal.LevelEditorSubsystem).editor_request_begin_play()"`.
+   Then **wait for the world to actually be playing AND a frame to render** -- poll
+   `is_in_play_in_editor()` and give it >5s before reading state or capturing a screenshot
+   (a screenshot taken before a game frame renders writes nothing -- see step 7). Grab a
+   log cursor before driving the condition.
 5. **Set up + drive** the exact condition: spawn/possess/teleport via `uap exec`; inject input
    via `uap rc InjectKey KeyName=E bPressed=true` (or `InjectXRButton` for VR); flip a flag with `uap exec`.
 6. **Read** via the channel chosen in Step 1. For motion proofs, `uap exec` to sample a
    bone/property, wait ~0.3s, sample again, compare. Then
    `uap report assert "<label>" pass|fail "<the values>"`.
 7. **Evidence**: `uap screenshot shot.png --caption "..."` for human-facing evidence; `uap read-ui`
-   for on-screen text. On a fail, gather log lines and put the hypothesis in the summary.
-8. **Stop PIE**: `uap exec "unreal.get_editor_subsystem(unreal.PlayWorldEditorSubsystem).request_stop_play_in_editor()"`.
+   for on-screen text. **`uap screenshot` requires a live, rendering game frame (PIE running)** --
+   called against an idle editor viewport it writes no file and reports `exists:false`; treat
+   that as a failure to capture, not a pass. On a fail, gather log lines and put the hypothesis
+   in the summary.
+8. **Stop PIE**: `uap exec "import unreal; unreal.get_editor_subsystem(unreal.LevelEditorSubsystem).editor_request_end_play()"`.
    Then `uap report finish pass|fail "<summary>"` -> prints the `index.html` path; renders + opens the report.
 9. **Report back**: verdict, the read-back numbers, and the report path. State failures plainly.
 
