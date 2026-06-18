@@ -231,14 +231,16 @@ def _rc_port_for(project: "str | None") -> int:
             return int(env)
         except ValueError:
             pass
-    if project:
-        cached = _read_port_cache(project)
-        if cached:
-            return cached
-        resolved = _exec_rc_port(project)
-        if resolved:
-            _write_port_cache(project, resolved)
-            return resolved
+    # Resolve the editor's advertised port (by project, or first responder if project is empty).
+    # Editors no longer use the default 30010 -- each binds a per-project port -- so we must ask.
+    key = project or "_default"
+    cached = _read_port_cache(key)
+    if cached:
+        return cached
+    resolved = _exec_rc_port(project or "")
+    if resolved:
+        _write_port_cache(key, resolved)
+        return resolved
     return 30010
 
 
@@ -447,6 +449,14 @@ def _screenshot(args) -> int:
     return 0 if body["ok"] else 1
 
 
+def _env_project() -> str:
+    """Default editor target. Comes from $UAP_PROJECT -- which the per-project uap.ps1 launcher
+    pins -- so a command run from a project's launcher targets THAT editor. Empty (no launcher,
+    no env) means 'first editor that answers', NOT a hardcoded project: a hardcoded default made
+    commands cross-target the wrong editor (e.g. starting PIE in the wrong project)."""
+    return os.environ.get("UAP_PROJECT", "")
+
+
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="uap")
     sub = p.add_subparsers(dest="cmd", required=True)
@@ -454,13 +464,13 @@ def build_parser() -> argparse.ArgumentParser:
     # Shared --project for RC verbs: the RC HTTP port is resolved per editor (by project), so
     # two editors are each addressed on their own port instead of both hitting 30010.
     proj = argparse.ArgumentParser(add_help=False)
-    proj.add_argument("--project", default="SchoolsOut",
-                      help="editor to target; its RC port is resolved per project (cached)")
+    proj.add_argument("--project", default=_env_project(),
+                      help="editor to target (default $UAP_PROJECT); RC port resolved per project")
 
     rep = sub.add_parser("report").add_subparsers(dest="rcmd", required=True)
     rs = rep.add_parser("start")
     rs.add_argument("task")
-    rs.add_argument("--project", default="SchoolsOutVR")
+    rs.add_argument("--project", default=_env_project())
     rs.add_argument("--require-screenshot", action="store_true",
                     help="finish pass auto-downgrades to fail unless a screenshot is attached")
     rs.set_defaults(func=_report_start)
@@ -473,8 +483,8 @@ def build_parser() -> argparse.ArgumentParser:
     rn.add_argument("text")
     rn.set_defaults(func=_report_note)
     rd = rep.add_parser("diag")
-    rd.add_argument("--project", default="SchoolsOut",
-                    help="editor project substring to source diagnostics from (via exec)")
+    rd.add_argument("--project", default=_env_project(),
+                    help="editor project to source diagnostics from (default $UAP_PROJECT, via exec)")
     rd.set_defaults(func=_report_diag)
     rsh = rep.add_parser("screenshot")
     rsh.add_argument("file")
@@ -495,11 +505,11 @@ def build_parser() -> argparse.ArgumentParser:
     rcp.set_defaults(func=_rc)
     ex = sub.add_parser("exec")
     ex.add_argument("code")
-    ex.add_argument("--project", default="SchoolsOut")
+    ex.add_argument("--project", default=_env_project())
     ex.set_defaults(func=_exec)
     exf = sub.add_parser("exec-file")
     exf.add_argument("path")
-    exf.add_argument("--project", default="SchoolsOut")
+    exf.add_argument("--project", default=_env_project())
     exf.set_defaults(func=_exec_file)
     pie = sub.add_parser("pie").add_subparsers(dest="pie_cmd", required=True)
     pie.add_parser("start", parents=[proj]).set_defaults(func=_pie)

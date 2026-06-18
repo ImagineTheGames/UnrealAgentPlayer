@@ -48,6 +48,26 @@ def test_rc_verbs_accept_project():
     assert c.func is _pie and c.project == "PBW"
 
 
-def test_rc_verbs_default_project():
-    a = build_parser().parse_args(["status"])
-    assert a.project == "SchoolsOut"
+def test_rc_verbs_default_project_from_env(monkeypatch):
+    # No UAP_PROJECT -> empty default (first responder), NOT a hardcoded SchoolsOut (which
+    # made commands cross-target the wrong editor).
+    monkeypatch.delenv("UAP_PROJECT", raising=False)
+    assert build_parser().parse_args(["status"]).project == ""
+    # UAP_PROJECT pins the default (the per-project launcher sets it).
+    monkeypatch.setenv("UAP_PROJECT", "ProjectBrokenWings")
+    assert build_parser().parse_args(["status"]).project == "ProjectBrokenWings"
+    assert build_parser().parse_args(["exec", "x"]).project == "ProjectBrokenWings"
+    assert build_parser().parse_args(["pie", "start"]).project == "ProjectBrokenWings"
+
+
+def test_rc_port_for_empty_project_resolves_first_responder(tmp_path, monkeypatch):
+    monkeypatch.setenv("UAP_REPORTS_DIR", str(tmp_path))
+    monkeypatch.delenv("UAP_RC_PORT", raising=False)
+    seen = {}
+
+    def fake_exec(project):
+        seen["project"] = project
+        return 30044
+    monkeypatch.setattr(cli, "_exec_rc_port", fake_exec)
+    assert cli._rc_port_for("") == 30044
+    assert seen["project"] == ""        # empty -> first-responder discovery, not 30010

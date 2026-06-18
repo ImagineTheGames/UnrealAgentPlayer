@@ -48,6 +48,9 @@ def test_installs_command_and_launcher_with_substituted_python(fake_project):
     launcher_text = launcher.read_text(encoding="utf-8")
     assert "C:/baked/python.exe" in launcher_text
     assert "__UAP_PYTHON__" not in launcher_text
+    # Project identity baked from the .uproject (fixture creates FakeGame.uproject).
+    assert "FakeGame" in launcher_text
+    assert "__UAP_PROJECT__" not in launcher_text
 
 
 def test_rerun_without_force_is_noop(fake_project):

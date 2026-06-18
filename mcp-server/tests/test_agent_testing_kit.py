@@ -14,6 +14,9 @@ def test_launcher_template_has_token_and_home_fallback():
     assert "UAP_HOME" in text
     assert "unreal_agent_player.cli" in text
     assert "$LASTEXITCODE" in text
+    # Pins the per-project target so the launcher never cross-targets another editor.
+    assert "__UAP_PROJECT__" in text
+    assert "UAP_PROJECT" in text
 
 
 def test_command_template_is_project_agnostic():

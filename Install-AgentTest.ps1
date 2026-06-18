@@ -44,15 +44,19 @@ if ((Test-Path $cmdDest) -and -not $Force) {
     Write-Host "[write] $cmdDest"
 }
 
-# 4. Launcher (token substitution).
+# 4. Launcher (token substitution). Bake this project's identity so the launcher pins
+#    UAP_PROJECT/UAP_UPROJECT -> commands target THIS editor, never another open one.
+$uproj = Get-ChildItem -Path $ProjectRoot -Filter *.uproject -File -ErrorAction SilentlyContinue | Select-Object -First 1
+$projName = if ($uproj) { $uproj.BaseName } else { Split-Path $ProjectRoot -Leaf }
+$uprojPath = if ($uproj) { $uproj.FullName } else { '' }
 $launchDest = Join-Path $ProjectRoot 'uap.ps1'
 if ((Test-Path $launchDest) -and -not $Force) {
     Write-Host "[skip] $launchDest exists (use -Force to overwrite)"
 } else {
     $tpl = Get-Content -Raw (Join-Path $kit 'uap.ps1.template')
-    $tpl = $tpl.Replace('__UAP_PYTHON__', $py)
+    $tpl = $tpl.Replace('__UAP_PYTHON__', $py).Replace('__UAP_PROJECT__', $projName).Replace('__UAP_UPROJECT__', $uprojPath)
     Write-Utf8NoBom $launchDest $tpl
-    Write-Host "[write] $launchDest (python = $py)"
+    Write-Host "[write] $launchDest (python = $py; project = $projName)"
 }
 
 # 5. AGENTS rule.

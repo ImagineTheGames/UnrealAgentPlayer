@@ -16,5 +16,10 @@ if (-not (Test-Path $py)) {
     exit 3
 }
 
+# Pin this project's editor as the default target so commands run from THIS launcher never
+# cross-target another open editor (e.g. `uap pie start` with no --project). Caller env wins.
+if (-not $env:UAP_PROJECT)  { $env:UAP_PROJECT  = "__UAP_PROJECT__" }
+if (-not $env:UAP_UPROJECT) { $env:UAP_UPROJECT = "__UAP_UPROJECT__" }
+
 & $py -m unreal_agent_player.cli @Args
 exit $LASTEXITCODE
