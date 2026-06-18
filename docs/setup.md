@@ -12,7 +12,10 @@
 mklink /J C:\Path\To\YourProject\Plugins\UnrealAgentPlayer D:\dev\unreal-agent-player\Plugin
 ```
 
-Or `p4 add` a copy if you need teammates to have it without the source repo.
+For teams (e.g. Perforce), prefer copying the `Plugin/` folder into
+`YourProject/Plugins/UnrealAgentPlayer` as real files and adding them to source control --
+that is what travels to other workstations. The `mklink /J` junction above is a local-dev
+convenience only.
 
 ## Install the MCP server
 
@@ -51,3 +54,15 @@ In Claude Code, after the editor is running:
 > Call the bridge_status tool.
 
 Expected: `ue_running: true`, `rc_reachable: true`, `remote_exec_reachable: true`, `plugin_version: 0.0.1`.
+
+## Agent test command (`/AgentPlayerTest`)
+
+To give an agent a one-command, report-backed way to verify runtime behavior, install the
+test kit into your project:
+
+```
+powershell -NoProfile -File Install-AgentTest.ps1 -ProjectRoot C:\Path\To\YourProject
+```
+
+It drops `.claude/commands/agentplayertest.md` and a `uap.ps1` launcher (venv python baked
+in) at the project root, and prints the AGENTS rule to paste. See `docs/agent-testing.md`.
