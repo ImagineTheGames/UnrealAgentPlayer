@@ -30,3 +30,15 @@ def test_command_template_is_project_agnostic():
     assert "$ARGUMENTS" in text
     # The report is mandatory and must be cited.
     assert "index.html" in text
+
+
+AGENTS_MARKER = "## Verifying runtime game behavior"
+
+
+def test_agents_snippet_has_marker_and_is_generic():
+    text = _read("AGENTS-snippet.md")
+    assert AGENTS_MARKER in text  # used by the installer for idempotent append
+    low = text.lower()
+    assert "janitor" not in low
+    assert "/agentplayertest" in low
+    assert "uap report finish" in text
