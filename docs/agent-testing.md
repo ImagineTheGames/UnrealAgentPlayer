@@ -26,11 +26,15 @@ bone delta, log line) settle a question -- never a screenshot alone.
 ## `uap` verbs
 
 - `uap status` -- preflight; `{ok, rc_reachable, plugin_version}`.
-- `uap report start "<task>" [--project X]` / `assert "<label>" pass|fail "<evidence>"` /
-  `note "<text>"` / `finish pass|fail "<summary>"`.
+- `uap report start "<task>" [--project X] [--require-screenshot]` -- `--require-screenshot`
+  makes `finish pass` auto-downgrade to fail unless a screenshot is attached.
+- `uap report assert "<label>" pass|fail "<evidence>"` / `note "<text>"` / `finish pass|fail "<summary>"`.
+- `uap pie start` / `uap pie wait <sec>` / `uap pie stop` -- start / await / stop Play-In-Editor
+  (wraps the version-correct engine call; agents never touch the raw subsystem).
 - `uap exec "<python>"` -- arbitrary `import unreal; ...` in the editor.
 - `uap rc <FunctionName> [key=value ...]` -- call a UAP_Preset UFUNCTION (use `uap exec` for nested args).
-- `uap read-ui` -- dump viewport UMG text. `uap screenshot <file> [--caption ...]` -- capture, auto-attached.
+- `uap read-ui` -- dump viewport UMG text. `uap screenshot <file> [--caption ...]` -- capture
+  (requires a live PIE frame; reports `ok:false` if no file lands), auto-attached.
 
 ## Writing a project-specific preset
 

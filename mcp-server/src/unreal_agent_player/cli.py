@@ -36,8 +36,10 @@ def _emit(obj: dict) -> None:
 # --- report verbs ---
 
 def _report_start(args) -> int:
-    s = sess.start_session(task=args.task, project=args.project)
-    _emit({"ok": True, "run_dir": str(s.run_dir)})
+    s = sess.start_session(task=args.task, project=args.project,
+                           requires_screenshot=args.require_screenshot)
+    _emit({"ok": True, "run_dir": str(s.run_dir),
+           "requires_screenshot": s.requires_screenshot})
     return 0
 
 
@@ -88,7 +90,8 @@ def _report_finish(args) -> int:
         webbrowser.open(html_path.as_uri())
     except Exception:
         pass
-    _emit({"ok": True, "html": str(html_path)})
+    _emit({"ok": True, "html": str(html_path), "verdict": s.status,
+           "downgraded": s.status != args.verdict})
     return 0
 
 
@@ -221,6 +224,34 @@ def _exec_file(args) -> int:
     return _exec(argparse.Namespace(code=code, project=args.project))
 
 
+def _pie(args) -> int:
+    """Start/stop PIE via the plugin's version-correct RC verbs (StartPIE/StopPIE/IsInPIE),
+    so agents never touch the raw, version-fragile engine subsystem."""
+    sub = args.pie_cmd
+    t0 = time.monotonic()
+    body: dict = {"ok": True}
+    try:
+        if sub == "start":
+            body["result"] = _rc_call("StartPIE", {})
+        elif sub == "stop":
+            body["result"] = _rc_call("StopPIE", {})
+        elif sub == "wait":
+            deadline = time.monotonic() + args.seconds
+            playing = bool(_rc_call("IsInPIE", {}))
+            while not playing and time.monotonic() < deadline:
+                time.sleep(0.5)
+                playing = bool(_rc_call("IsInPIE", {}))
+            body["playing"] = playing
+            body["ok"] = playing
+            if not playing:
+                body["error"] = f"PIE not running after {args.seconds}s"
+    except AgentError as exc:
+        body = {"ok": False, "error": str(exc)}
+    _capture(f"pie:{sub}", {}, body, int((time.monotonic() - t0) * 1000))
+    _emit(body)
+    return 0 if body["ok"] else 1
+
+
 def _read_ui(args) -> int:
     t0 = time.monotonic()
     body: dict = {"ok": True}
@@ -233,21 +264,34 @@ def _read_ui(args) -> int:
     return 0 if body["ok"] else 1
 
 
+def _screenshot_body(file: str, exists: bool) -> dict:
+    """Build the screenshot result. A missing file after the poll window is a hard FAIL
+    with a concrete reason -- not a silent ok:true/exists:false (which reads like a
+    transient and let false positives through)."""
+    if exists:
+        return {"ok": True, "exists": True, "path": file}
+    return {
+        "ok": False, "exists": False, "path": file,
+        "error": ("screenshot not written: CaptureViewportWithUI renders on the next game "
+                  "frame, but an idle editor viewport never renders one. Requires active PIE "
+                  "(uap pie start) / a renderable frame."),
+    }
+
+
 def _screenshot(args) -> int:
     t0 = time.monotonic()
-    body: dict = {"ok": True, "caption": args.caption}
     try:
         _rc_call("CaptureViewportWithUI", {"Filename": args.file})
         deadline = time.monotonic() + 8.0
         while time.monotonic() < deadline and not os.path.exists(args.file):
             time.sleep(0.25)
-        body["path"] = args.file
-        body["exists"] = os.path.exists(args.file)
+        body = _screenshot_body(args.file, os.path.exists(args.file))
+        body["caption"] = args.caption
     except AgentError as exc:
         body = {"ok": False, "error": str(exc)}
     _capture("screenshot", {"file": args.file}, body, int((time.monotonic() - t0) * 1000))
     _emit(body)
-    return 0 if (body["ok"] and body.get("exists", False)) else 1
+    return 0 if body["ok"] else 1
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -258,6 +302,8 @@ def build_parser() -> argparse.ArgumentParser:
     rs = rep.add_parser("start")
     rs.add_argument("task")
     rs.add_argument("--project", default="SchoolsOutVR")
+    rs.add_argument("--require-screenshot", action="store_true",
+                    help="finish pass auto-downgrades to fail unless a screenshot is attached")
     rs.set_defaults(func=_report_start)
     ra = rep.add_parser("assert")
     ra.add_argument("label")
@@ -292,6 +338,13 @@ def build_parser() -> argparse.ArgumentParser:
     exf.add_argument("path")
     exf.add_argument("--project", default="SchoolsOut")
     exf.set_defaults(func=_exec_file)
+    pie = sub.add_parser("pie").add_subparsers(dest="pie_cmd", required=True)
+    pie.add_parser("start").set_defaults(func=_pie)
+    pie.add_parser("stop").set_defaults(func=_pie)
+    pw = pie.add_parser("wait")
+    pw.add_argument("seconds", type=float, help="max seconds to wait for PIE to be live")
+    pw.set_defaults(func=_pie)
+
     ru = sub.add_parser("read-ui")
     ru.set_defaults(func=_read_ui)
     sc = sub.add_parser("screenshot")

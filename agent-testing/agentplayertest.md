@@ -34,6 +34,8 @@ Verbs used in this flow:
 - `uap report finish pass|fail "<summary>"` -- render + open `index.html`; prints the path.
 - `uap exec "<python>"` -- run `import unreal; ...` in the live editor.
 - `uap rc <FunctionName> [key=value ...]` -- call a UAP_Preset UFUNCTION (use `uap exec` for complex/nested args).
+- `uap pie start` / `uap pie wait <sec>` / `uap pie stop` -- start / await / stop Play-In-Editor
+  (version-correct; wraps the engine call so you never touch the raw subsystem).
 - `uap read-ui` -- dump viewport UMG text as JSON.
 - `uap screenshot <file> [--caption "..."]` -- capture game+UMG; auto-attached to the active report.
 
@@ -62,17 +64,16 @@ State the concrete pass condition before running. A non-zero speed with a frozen
 1. **Preflight**: `uap status` -> require `rc_reachable:true`. Editor down? Launch the editor
    yourself (your project's launch script), wait for RC, retry. Do not fall back to raw RC
    without a report; the report is the point.
-2. **`uap report start "<question>"`** -- question verbatim, `--project <YourProject>`.
+2. **`uap report start "<question>"`** -- question verbatim, `--project <YourProject>`. If the
+   verdict needs visual proof, add `--require-screenshot` -- then `report finish pass`
+   auto-downgrades to fail unless a screenshot is actually attached (no silent false positives).
 3. **Scene**: `uap exec` to `load_level('/Game/...')` if the question implies a specific map;
    else use the open level and `uap report note "using level X"`.
-4. **Start PIE** via `uap exec`. On UE 5.7 use `LevelEditorSubsystem` (the
-   `PlayWorldEditorSubsystem` shown in older docs does NOT exist on 5.7 and throws
-   `AttributeError`):
-   `uap exec "import unreal; unreal.get_editor_subsystem(unreal.LevelEditorSubsystem).editor_request_begin_play()"`.
-   Then **wait for the world to actually be playing AND a frame to render** -- poll
-   `is_in_play_in_editor()` and give it >5s before reading state or capturing a screenshot
-   (a screenshot taken before a game frame renders writes nothing -- see step 7). Grab a
-   log cursor before driving the condition.
+4. **Start PIE**: `uap pie start`, then `uap pie wait 12` -- blocks until the game world is
+   live (up to 12s) and fails if it never comes up. (These wrap the version-correct engine
+   call; do NOT use the old `PlayWorldEditorSubsystem`, which does not exist on UE 5.7.) Give
+   it a beat for a frame to render before capturing a screenshot (see step 7). Grab a log
+   cursor before driving the condition.
 5. **Set up + drive** the exact condition: spawn/possess/teleport via `uap exec`; inject input
    via `uap rc InjectKey KeyName=E bPressed=true` (or `InjectXRButton` for VR); flip a flag with `uap exec`.
 6. **Read** via the channel chosen in Step 1. For motion proofs, `uap exec` to sample a
@@ -83,8 +84,10 @@ State the concrete pass condition before running. A non-zero speed with a frozen
    called against an idle editor viewport it writes no file and reports `exists:false`; treat
    that as a failure to capture, not a pass. On a fail, gather log lines and put the hypothesis
    in the summary.
-8. **Stop PIE**: `uap exec "import unreal; unreal.get_editor_subsystem(unreal.LevelEditorSubsystem).editor_request_end_play()"`.
-   Then `uap report finish pass|fail "<summary>"` -> prints the `index.html` path; renders + opens the report.
+8. **Stop PIE**: `uap pie stop`.
+   Then `uap report finish pass|fail "<summary>"` -> prints the `index.html` path; renders +
+   opens the report. (With `--require-screenshot`, a `pass` with no attached screenshot comes
+   back as `verdict: fail, downgraded: true` -- that is the gate doing its job.)
 9. **Report back**: verdict, the read-back numbers, and the report path. State failures plainly.
 
 ## A verification is not done until the report exists

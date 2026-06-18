@@ -33,38 +33,37 @@ les.editor_play_simulate()   # simulate mode
 Verified live on 5.7: all four exist (`True`). Fixed in `agent-testing/agentplayertest.md`.
 The real fix is #2 (don't make agents touch the raw subsystem at all).
 
-## 2. No agent-facing PIE start/stop in the plugin -- OPEN
+## 2. No agent-facing PIE start/stop in the plugin -- FIXED
 
-The plugin only OBSERVES PIE over RC (`GetPIEPhase`, `GetPIEElapsedSeconds`); there is no
-`StartPIE`/`StopPIE` RC function. So the agent is forced to use the version-fragile raw
-engine API for the single most error-prone step -- exactly where the docs were wrong (#1).
+Was: the plugin only OBSERVED PIE over RC (`GetPIEPhase`, `GetPIEElapsedSeconds`); no
+`StartPIE`/`StopPIE`, so the agent had to use the version-fragile raw engine API for the
+single most error-prone step -- exactly where the docs were wrong (#1).
 
-Proposed: add `uap pie start` / `uap pie stop` / `uap pie wait <seconds>` verbs backed by
-new RC functions that wrap the version-correct engine call (`editor_request_begin_play` /
-`editor_request_end_play`, polling `is_in_play_in_editor`). Agents then never touch the raw
-subsystem, and the version detail lives in one C++ place.
+Fixed: added `StartPIE` / `StopPIE` / `IsInPIE` UFUNCTIONs on `UUAPAgentSubsystem`, wrapping
+`ULevelEditorSubsystem::EditorRequestBeginPlay` / `EditorRequestEndPlay` / `IsInPlayInEditor`
+(the version detail now lives in one C++ place). Exposed automatically via the preset, and
+surfaced as `uap pie start` / `uap pie wait <seconds>` / `uap pie stop`. Verified live on UE
+5.7: `is_in_pie False -> start_pie True -> is_in_pie True -> stop_pie True`.
 
-## 3. A test can PASS with zero screenshot (false positive) -- OPEN
+## 3. A test can PASS with zero screenshot (false positive) -- FIXED
 
-The flow says screenshots are required as evidence and "a verification is not done until the
-report exists," but nothing enforces a screenshot was actually captured. `uap report finish
-pass` succeeds with no screenshot attached -- a false positive.
+Was: nothing enforced that a screenshot was captured, so `uap report finish pass` succeeded
+with no screenshot attached -- a false positive.
 
-Proposed: `report finish pass` should refuse (or auto-downgrade to `fail`) when the run
-required visual proof and no screenshot is attached. Needs a way to mark a report/assertion
-as "requires visual proof" so the gate only fires when relevant.
+Fixed: `uap report start --require-screenshot` sets a per-report flag (persisted, survives the
+cross-process start/finish split). `report finish pass` then auto-downgrades to `fail` and adds
+an AUTO-FAIL note when no real screenshot is attached; `finish` emits `verdict` + `downgraded`
+so the agent sees it. The gate only fires when the run opted into requiring visual proof.
 
-## 4. `uap screenshot` silently "succeeds" with no file -- OPEN
+## 4. `uap screenshot` silently "succeeds" with no file -- FIXED
 
-`CaptureViewportWithUI` / `uap screenshot` called without a rendered game frame (no PIE, or
-an idle editor viewport) returns `{ok:true, exists:false}` and writes nothing, with no reason.
-It reads exactly like a transient. `CaptureViewportWithUI` writes "on the next rendered
-frame" -- fine -- but an idle Editor viewport never renders that frame, so it hangs as a no-op.
+Was: `uap screenshot` called without a rendered game frame returned `{ok:true, exists:false}`
+and wrote nothing, with no reason -- it read exactly like a transient.
 
-Proposed: return `ok:false` with a clear reason ("requires active PIE / a renderable frame"),
-and have the CLI poll for the file with a timeout and hard-fail if it never lands. (The CLI
-already polls ~8s and reports `exists`; the body should report `ok:false` when the file never
-appears, and the RC layer should explain why.)
+Fixed: after the ~8s poll, a missing file is now a hard `ok:false` with a concrete reason
+("screenshot not written: CaptureViewportWithUI renders on the next game frame, but an idle
+editor viewport never renders one. Requires active PIE (uap pie start) / a renderable frame.")
+and a non-zero exit, so it can no longer be mistaken for a transient or a pass.
 
 ## 5. Screenshot examples imply they work anytime -- FIXED (docs)
 
@@ -72,7 +71,7 @@ appears, and the RC layer should explain why.)
 requires a composited game frame (PIE running). Stated explicitly in
 `agent-testing/agentplayertest.md` step 7.
 
-## Priority
+## Status
 
-1 (done) and 5 (done) are docs. 2, 3, 4 are code changes that remove the remaining
-false-positive / fragile-API footguns; 2 is the highest-value (it also retires the cause of 1).
+All five resolved. 1 and 5 were doc fixes; 2, 3, 4 were code changes that retire the
+fragile-API and false-positive footguns (2 also removes the cause of 1).

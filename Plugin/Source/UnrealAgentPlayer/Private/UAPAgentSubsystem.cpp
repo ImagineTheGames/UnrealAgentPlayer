@@ -4,6 +4,7 @@
 #include "UnrealAgentPlayerRuntimeModule.h"
 #include "AgentRemoteControlBootstrap.h"
 #include "Editor.h"
+#include "LevelEditorSubsystem.h"
 #include "HAL/PlatformTime.h"
 #include "Engine/Engine.h"
 #include "Engine/World.h"
@@ -178,6 +179,32 @@ double UUAPAgentSubsystem::GetPIEElapsedSeconds() const
 {
     if (PIEStartTimeSeconds <= 0.0) { return 0.0; }
     return FPlatformTime::Seconds() - PIEStartTimeSeconds;
+}
+
+bool UUAPAgentSubsystem::StartPIE()
+{
+    if (!GEditor) { return false; }
+    ULevelEditorSubsystem* LES = GEditor->GetEditorSubsystem<ULevelEditorSubsystem>();
+    if (!LES) { return false; }
+    if (LES->IsInPlayInEditor()) { return true; }
+    LES->EditorRequestBeginPlay();   // PIE starts asynchronously; caller polls IsInPIE().
+    return true;
+}
+
+bool UUAPAgentSubsystem::StopPIE()
+{
+    if (!GEditor) { return false; }
+    ULevelEditorSubsystem* LES = GEditor->GetEditorSubsystem<ULevelEditorSubsystem>();
+    if (!LES) { return false; }
+    LES->EditorRequestEndPlay();
+    return true;
+}
+
+bool UUAPAgentSubsystem::IsInPIE() const
+{
+    if (!GEditor) { return false; }
+    ULevelEditorSubsystem* LES = GEditor->GetEditorSubsystem<ULevelEditorSubsystem>();
+    return LES ? LES->IsInPlayInEditor() : false;
 }
 
 int64 UUAPAgentSubsystem::GetLogCursor() const

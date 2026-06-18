@@ -32,6 +32,23 @@ public:
     UFUNCTION(BlueprintCallable, Category="Agent|PIE")
     double GetPIEElapsedSeconds() const;
 
+    // Starts Play-In-Editor. Wraps ULevelEditorSubsystem::EditorRequestBeginPlay so agents
+    // never touch the version-fragile raw engine API (the old PlayWorldEditorSubsystem path
+    // does not exist on UE 5.7). Returns false if no editor world is available. PIE comes up
+    // asynchronously -- poll IsInPIE() before reading game state or capturing a frame.
+    UFUNCTION(BlueprintCallable, Category="Agent|PIE")
+    bool StartPIE();
+
+    // Stops Play-In-Editor. Wraps ULevelEditorSubsystem::EditorRequestEndPlay. Returns false
+    // if the editor subsystem is unavailable.
+    UFUNCTION(BlueprintCallable, Category="Agent|PIE")
+    bool StopPIE();
+
+    // True while a PIE/game world is live. Wraps ULevelEditorSubsystem::IsInPlayInEditor;
+    // use it to wait for StartPIE() to take effect.
+    UFUNCTION(BlueprintCallable, Category="Agent|PIE")
+    bool IsInPIE() const;
+
     UFUNCTION(BlueprintCallable, Category="Agent|Log")
     int64 GetLogCursor() const;
 
