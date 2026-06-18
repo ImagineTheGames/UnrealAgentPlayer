@@ -8,6 +8,21 @@ def test_report_diag_routes_with_project():
     assert args.project == "Foo"
 
 
+def test_parse_perf_extracts_frame_timing_and_fps():
+    from unreal_agent_player.cli import _parse_perf
+    p = _parse_perf("Frame: 11.20 ms\nGame: 5.10 ms\nDraw: 3.40 ms\nGPU: 8.90 ms", "FPS: 60.0")
+    assert p["frame_ms"] == 11.2
+    assert p["game_ms"] == 5.1
+    assert p["draw_ms"] == 3.4
+    assert p["gpu_ms"] == 8.9
+    assert p["fps"] == 60.0
+
+
+def test_parse_perf_handles_empty():
+    from unreal_agent_player.cli import _parse_perf
+    assert _parse_perf("", "") == {}
+
+
 # --- #2: `uap pie` verbs route correctly (no editor needed for arg wiring) ---
 
 def test_pie_wait_parses_seconds_and_routes_to_pie():

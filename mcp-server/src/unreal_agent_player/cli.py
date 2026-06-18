@@ -73,10 +73,31 @@ def _report_screenshot(args) -> int:
     return 0 if rel is not None else 1
 
 
+def _parse_perf(unit_text: str, fps_text: str) -> dict:
+    """Parse the plugin's GetStatGroupText output into a perf dict for the report.
+    unit_text is like 'Frame: 11.20 ms\\nGame: 5.10 ms\\nDraw: 3.40 ms\\nGPU: 8.90 ms';
+    fps_text is like 'FPS: 60.0'."""
+    perf: dict = {}
+    for line in (unit_text or "").splitlines():
+        if ":" in line:
+            k, v = line.split(":", 1)
+            try:
+                perf[k.strip().lower() + "_ms"] = round(float(v.replace("ms", "").strip()), 2)
+            except ValueError:
+                pass
+    if fps_text and ":" in fps_text:
+        try:
+            perf["fps"] = round(float(fps_text.split(":", 1)[1].strip()), 1)
+        except ValueError:
+            pass
+    return perf
+
+
 def _report_diag(args) -> int:
-    """Capture editor diagnostics into the active report's env block. Sourced via `exec`
-    (targets the editor by project name) so it is accurate even when another editor squats
-    the RC port -- unlike `status`, which only ever reaches whatever holds :30010."""
+    """Capture editor diagnostics (env + perf/frame timing) into the active report. Sourced
+    via `exec` (targets the editor by project name) so it is accurate even when another editor
+    squats the RC port -- unlike `status`, which only ever reaches whatever holds :30010. Call
+    it while PIE is live to record the game's frame rate, not the idle editor's."""
     s = _require_active()
     if s is None:
         return 2
@@ -88,7 +109,9 @@ def _report_diag(args) -> int:
         "print('UAPDIAG:' + json.dumps({"
         "'plugin_version': ss.get_plugin_version(),"
         "'world': (w.get_name() if w else None),"
-        "'is_in_pie': ss.is_in_pie()}))\n"
+        "'is_in_pie': ss.is_in_pie(),"
+        "'unit': ss.get_stat_group_text('unit'),"
+        "'fps': ss.get_stat_group_text('fps')}))\n"
     )
     body: dict = {"ok": True}
     try:
@@ -102,9 +125,19 @@ def _report_diag(args) -> int:
         if diag is None:
             body = {"ok": False, "error": "no diagnostics returned from editor"}
         else:
-            diag["project"] = args.project
-            s.set_env(diag)
-            body["env"] = diag
+            env = {
+                "plugin_version": diag.get("plugin_version"),
+                "world": diag.get("world"),
+                "is_in_pie": diag.get("is_in_pie"),
+                "project": args.project,
+                "bridge": {"remote_exec_reachable": True},
+            }
+            perf = _parse_perf(diag.get("unit", ""), diag.get("fps", ""))
+            s.set_env(env)
+            if perf:
+                s.set_perf(perf)
+            body["env"] = env
+            body["perf"] = perf
     except AgentError as exc:
         body = {"ok": False, "error": str(exc)}
     _capture("report:diag", {"project": args.project}, body, 0)

@@ -71,19 +71,23 @@ and a non-zero exit, so it can no longer be mistaken for a transient or a pass.
 requires a composited game frame (PIE running). Stated explicitly in
 `agent-testing/agentplayertest.md` step 7.
 
-## 6. CLI reports carried no diagnostics (env block empty) -- FIXED
+## 6. CLI reports carried no diagnostics or perf (env/perf empty) -- FIXED
 
-Was: the `uap` CLI reporting path never populated the report's env/diagnostics block. `_capture`
-only wrote timeline entries + screenshots; `set_env` was only ever called by the legacy MCP-tool
-path (`record_call`'s `bridge_status` branch), which the CLI does not use. So every CLI-driven
-report finished with `env: {}` -- no plugin version, level, or PIE state. (And `uap status` would
-not have helped: in a multi-editor setup it queries whatever holds :30010, often the wrong editor.)
+Was: the `uap` CLI reporting path never populated the report's env/diagnostics block OR the perf
+(frame-rate) block. `_capture` only wrote timeline entries + screenshots; `set_env`/`set_perf` were
+only ever called by the legacy MCP-tool path (`record_call`'s `bridge_status`/`perf_stat` branches),
+which the CLI does not use. So every CLI-driven report finished with `env: {}` and `perf: None` --
+no plugin version, level, PIE state, or frame timing, even though the render template has both
+Environment and Perf sections. (And `uap status` would not have helped: in a multi-editor setup it
+queries whatever holds :30010, often the wrong editor.)
 
 Fixed: added `uap report diag --project <X>`, which sources diagnostics via `exec` (targets the
 editor by project name, so it reads the RIGHT editor regardless of RC-port contention) and writes
-`{plugin_version, world, is_in_pie, project}` into the report env. `report finish` now also emits a
-`warning` when env is empty, nudging agents to run it. Verified live: report env populated with
-`{plugin_version: 0.0.1, world: L_DevTest, is_in_pie: false, project: SchoolsOut}`.
+both the env (`{plugin_version, world, is_in_pie, project, bridge}`) and perf (parsed from the
+plugin's `GetStatGroupText`: `{frame_ms, game_ms, draw_ms, gpu_ms, fps}`). Call it while PIE is live
+to record the game's frame rate. `report finish` warns when env is empty. Verified live: env +
+perf populated (e.g. `frame_ms 333.33, draw_ms 5.57, gpu_ms 11.81, fps 3.0` -- the low fps was the
+editor's background-CPU throttle, captured truthfully).
 
 ## Status
 

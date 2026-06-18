@@ -29,8 +29,10 @@ bone delta, log line) settle a question -- never a screenshot alone.
 - `uap report start "<task>" [--project X] [--require-screenshot]` -- `--require-screenshot`
   makes `finish pass` auto-downgrade to fail unless a screenshot is attached.
 - `uap report assert "<label>" pass|fail "<evidence>"` / `note "<text>"` / `finish pass|fail "<summary>"`.
-- `uap report diag --project <X>` -- capture editor diagnostics (plugin version, level, PIE state)
-  into the report env via `exec` (reads the right editor even if another squats the RC port).
+- `uap report diag --project <X>` -- capture editor diagnostics (env: plugin version, level, PIE
+  state) AND perf (frame_ms / draw_ms / gpu_ms / fps, from the plugin's GetStatGroupText) into the
+  report via `exec` (reads the right editor even if another squats the RC port). Run it while PIE
+  is live for the game's frame rate.
 - `uap pie start` / `uap pie wait <sec>` / `uap pie stop` -- start / await / stop Play-In-Editor
   (wraps the version-correct engine call; agents never touch the raw subsystem).
 - `uap exec "<python>"` -- arbitrary `import unreal; ...` in the editor.

@@ -68,9 +68,10 @@ State the concrete pass condition before running. A non-zero speed with a frozen
    verdict needs visual proof, add `--require-screenshot` -- then `report finish pass`
    auto-downgrades to fail unless a screenshot is actually attached (no silent false positives).
 3. **Diagnostics**: `uap report diag --project <YourProject>` -- captures the editor's plugin
-   version, open level, and PIE state into the report's env block (sourced via `exec`, so it
-   reads the RIGHT editor even when another squats the RC port). Do this once after start; the
-   report nags at finish if env is empty.
+   version, open level, PIE state (env) AND frame timing / fps (perf) into the report (sourced
+   via `exec`, so it reads the RIGHT editor even when another squats the RC port). Run it once
+   after start, and again WHILE PIE is live (step 5) to record the game's frame rate rather than
+   the idle editor's. The report nags at finish if env is empty.
 4. **Scene**: `uap exec` to `load_level('/Game/...')` if the question implies a specific map;
    else use the open level and `uap report note "using level X"`.
 5. **Start PIE**: `uap pie start`, then `uap pie wait 12` -- blocks until the game world is
