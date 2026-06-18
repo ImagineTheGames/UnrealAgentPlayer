@@ -42,3 +42,10 @@ def test_agents_snippet_has_marker_and_is_generic():
     assert "janitor" not in low
     assert "/agentplayertest" in low
     assert "uap report finish" in text
+
+
+def test_docs_no_stale_slate_input_claim():
+    for rel in ("README.md", "docs/capabilities.md"):
+        text = (REPO / rel).read_text(encoding="utf-8")
+        assert "ProcessKeyDownEvent" not in text, rel
+        assert "in-process via Slate" not in text, rel

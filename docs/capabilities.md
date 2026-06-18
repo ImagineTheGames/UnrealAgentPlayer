@@ -38,7 +38,12 @@ Use this first — it tells the agent whether the editor is up and which channel
 
 ## Input injection
 
-All input is injected **in-process via Slate** into the focused PIE viewport. It does not require the editor to be the OS-foreground window, and key/button down-events stay "held" until a matching up-event (so movement keys produce continuous motion).
+Key/button input is injected **in-process** through the game viewport client
+(`UGameViewportClient::InputKey`), the same path the engine uses for a real keypress. It
+does not require the editor to be the OS-foreground window (an earlier Slate keyboard-focus
+path did, and silently dropped keys when backgrounded). Down-events stay "held" until a
+matching up-event, so movement keys produce continuous motion. (Mouse/analog paths still use
+Slate; key/button is the viewport-client path.)
 
 | Tool | Inputs | Notes |
 | --- | --- | --- |

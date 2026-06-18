@@ -49,7 +49,12 @@ The agent perceives and acts inside the editor the way a tester would, so "does 
 - **Remote Control HTTP** (`127.0.0.1:30010`) — structured calls to the subsystem's `UFUNCTION`s. Deterministic, typed, per-port (so two editors are addressed independently).
 - **Python Remote Execution** (UDP multicast `239.0.0.1:6766`) — arbitrary `import unreal; ...` scripting for anything not exposed as a `UFUNCTION` (load a level, read a pawn transform, start PIE).
 
-Input injection is **in-process via Slate** — `FSlateApplication::ProcessKeyDownEvent` after focusing the PIE viewport — so it does **not** depend on the editor being the OS-foreground window, and two editors in separate processes can each be driven independently. See [docs/architecture.md](docs/architecture.md).
+Key/button injection routes straight through the game viewport client
+(`UGameViewportClient::InputKey`) -- the same call the engine makes on a real keypress --
+so it does **not** depend on Slate keyboard focus or the editor being the OS-foreground
+window. This is in-process, so two editors in separate processes can each be driven
+independently. (An earlier Slate-focus path silently dropped keys when the editor was
+backgrounded or PIE ran inside the level viewport; see `docs/architecture.md`.)
 
 ---
 
