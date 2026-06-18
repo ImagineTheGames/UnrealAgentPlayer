@@ -17,6 +17,34 @@ function Write-Utf8NoBom([string]$Path, [string]$Content) {
     [System.IO.File]::WriteAllText($Path, $Content, $enc)
 }
 
+# Resolve a project's engine editor exe from its .uproject EngineAssociation, so a launcher
+# targets the project's OWN engine (a custom fork vs stock UE differ). Returns '' if unresolved.
+function Resolve-EditorExe([string]$UprojPath) {
+    if (-not $UprojPath -or -not (Test-Path $UprojPath)) { return '' }
+    try { $assoc = (Get-Content -Raw $UprojPath | ConvertFrom-Json).EngineAssociation } catch { return '' }
+    if (-not $assoc) { return '' }
+    $root = ''
+    if ($assoc -match '^\{[0-9A-Fa-f-]{36}\}$') {
+        # source/custom build registered by GUID under "Epic Games\Unreal Engine\Builds"
+        foreach ($b in @('HKCU:\Software\Epic Games\Unreal Engine\Builds', 'HKLM:\SOFTWARE\Epic Games\Unreal Engine\Builds')) {
+            try { $v = (Get-ItemProperty -Path $b -ErrorAction Stop).$assoc; if ($v) { $root = $v; break } } catch {}
+        }
+    } elseif ($assoc -match '^[0-9]+\.[0-9]+$') {
+        # installed engine by version (e.g. "5.7") under "EpicGames\Unreal Engine\<ver>"
+        foreach ($b in @('HKLM:\SOFTWARE\EpicGames\Unreal Engine', 'HKLM:\SOFTWARE\WOW6432Node\EpicGames\Unreal Engine')) {
+            try { $v = (Get-ItemProperty -Path (Join-Path $b $assoc) -ErrorAction Stop).InstalledDirectory; if ($v) { $root = $v; break } } catch {}
+        }
+    } elseif (Test-Path $assoc) {
+        $root = $assoc                                  # explicit absolute path
+    } else {
+        $cand = Join-Path (Split-Path $UprojPath -Parent) $assoc
+        if (Test-Path $cand) { $root = (Resolve-Path $cand).Path }   # relative to the project
+    }
+    if (-not $root) { return '' }
+    $exe = Join-Path $root 'Engine\Binaries\Win64\UnrealEditor.exe'
+    if (Test-Path $exe) { return $exe } else { return '' }
+}
+
 # 1. Validate project root.
 if (-not (Test-Path $ProjectRoot)) { Write-Error "ProjectRoot not found: $ProjectRoot"; exit 2 }
 if (-not (Get-ChildItem -Path $ProjectRoot -Filter *.uproject -File -ErrorAction SilentlyContinue)) {
@@ -49,14 +77,16 @@ if ((Test-Path $cmdDest) -and -not $Force) {
 $uproj = Get-ChildItem -Path $ProjectRoot -Filter *.uproject -File -ErrorAction SilentlyContinue | Select-Object -First 1
 $projName = if ($uproj) { $uproj.BaseName } else { Split-Path $ProjectRoot -Leaf }
 $uprojPath = if ($uproj) { $uproj.FullName } else { '' }
+$editorExe = Resolve-EditorExe $uprojPath
 $launchDest = Join-Path $ProjectRoot 'uap.ps1'
 if ((Test-Path $launchDest) -and -not $Force) {
     Write-Host "[skip] $launchDest exists (use -Force to overwrite)"
 } else {
     $tpl = Get-Content -Raw (Join-Path $kit 'uap.ps1.template')
-    $tpl = $tpl.Replace('__UAP_PYTHON__', $py).Replace('__UAP_PROJECT__', $projName).Replace('__UAP_UPROJECT__', $uprojPath)
+    $tpl = $tpl.Replace('__UAP_PYTHON__', $py).Replace('__UAP_PROJECT__', $projName).Replace('__UAP_UPROJECT__', $uprojPath).Replace('__UAP_EDITOR_EXE__', $editorExe)
     Write-Utf8NoBom $launchDest $tpl
-    Write-Host "[write] $launchDest (python = $py; project = $projName)"
+    $engNote = if ($editorExe) { "engine = $editorExe" } else { "engine = (unresolved)" }
+    Write-Host "[write] $launchDest (python = $py; project = $projName; $engNote)"
 }
 
 # 5. AGENTS rule.
