@@ -71,7 +71,21 @@ and a non-zero exit, so it can no longer be mistaken for a transient or a pass.
 requires a composited game frame (PIE running). Stated explicitly in
 `agent-testing/agentplayertest.md` step 7.
 
+## 6. CLI reports carried no diagnostics (env block empty) -- FIXED
+
+Was: the `uap` CLI reporting path never populated the report's env/diagnostics block. `_capture`
+only wrote timeline entries + screenshots; `set_env` was only ever called by the legacy MCP-tool
+path (`record_call`'s `bridge_status` branch), which the CLI does not use. So every CLI-driven
+report finished with `env: {}` -- no plugin version, level, or PIE state. (And `uap status` would
+not have helped: in a multi-editor setup it queries whatever holds :30010, often the wrong editor.)
+
+Fixed: added `uap report diag --project <X>`, which sources diagnostics via `exec` (targets the
+editor by project name, so it reads the RIGHT editor regardless of RC-port contention) and writes
+`{plugin_version, world, is_in_pie, project}` into the report env. `report finish` now also emits a
+`warning` when env is empty, nudging agents to run it. Verified live: report env populated with
+`{plugin_version: 0.0.1, world: L_DevTest, is_in_pie: false, project: SchoolsOut}`.
+
 ## Status
 
-All five resolved. 1 and 5 were doc fixes; 2, 3, 4 were code changes that retire the
+All six resolved. 1 and 5 were doc fixes; 2, 3, 4 were code changes that retire the
 fragile-API and false-positive footguns (2 also removes the cause of 1).

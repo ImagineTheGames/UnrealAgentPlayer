@@ -67,28 +67,32 @@ State the concrete pass condition before running. A non-zero speed with a frozen
 2. **`uap report start "<question>"`** -- question verbatim, `--project <YourProject>`. If the
    verdict needs visual proof, add `--require-screenshot` -- then `report finish pass`
    auto-downgrades to fail unless a screenshot is actually attached (no silent false positives).
-3. **Scene**: `uap exec` to `load_level('/Game/...')` if the question implies a specific map;
+3. **Diagnostics**: `uap report diag --project <YourProject>` -- captures the editor's plugin
+   version, open level, and PIE state into the report's env block (sourced via `exec`, so it
+   reads the RIGHT editor even when another squats the RC port). Do this once after start; the
+   report nags at finish if env is empty.
+4. **Scene**: `uap exec` to `load_level('/Game/...')` if the question implies a specific map;
    else use the open level and `uap report note "using level X"`.
-4. **Start PIE**: `uap pie start`, then `uap pie wait 12` -- blocks until the game world is
+5. **Start PIE**: `uap pie start`, then `uap pie wait 12` -- blocks until the game world is
    live (up to 12s) and fails if it never comes up. (These wrap the version-correct engine
    call; do NOT use the old `PlayWorldEditorSubsystem`, which does not exist on UE 5.7.) Give
-   it a beat for a frame to render before capturing a screenshot (see step 7). Grab a log
+   it a beat for a frame to render before capturing a screenshot (see step 8). Grab a log
    cursor before driving the condition.
-5. **Set up + drive** the exact condition: spawn/possess/teleport via `uap exec`; inject input
+6. **Set up + drive** the exact condition: spawn/possess/teleport via `uap exec`; inject input
    via `uap rc InjectKey KeyName=E bPressed=true` (or `InjectXRButton` for VR); flip a flag with `uap exec`.
-6. **Read** via the channel chosen in Step 1. For motion proofs, `uap exec` to sample a
+7. **Read** via the channel chosen in Step 1. For motion proofs, `uap exec` to sample a
    bone/property, wait ~0.3s, sample again, compare. Then
    `uap report assert "<label>" pass|fail "<the values>"`.
-7. **Evidence**: `uap screenshot shot.png --caption "..."` for human-facing evidence; `uap read-ui`
+8. **Evidence**: `uap screenshot shot.png --caption "..."` for human-facing evidence; `uap read-ui`
    for on-screen text. **`uap screenshot` requires a live, rendering game frame (PIE running)** --
    called against an idle editor viewport it writes no file and reports `exists:false`; treat
    that as a failure to capture, not a pass. On a fail, gather log lines and put the hypothesis
    in the summary.
-8. **Stop PIE**: `uap pie stop`.
+9. **Stop PIE**: `uap pie stop`.
    Then `uap report finish pass|fail "<summary>"` -> prints the `index.html` path; renders +
    opens the report. (With `--require-screenshot`, a `pass` with no attached screenshot comes
    back as `verdict: fail, downgraded: true` -- that is the gate doing its job.)
-9. **Report back**: verdict, the read-back numbers, and the report path. State failures plainly.
+10. **Report back**: verdict, the read-back numbers, and the report path. State failures plainly.
 
 ## A verification is not done until the report exists
 

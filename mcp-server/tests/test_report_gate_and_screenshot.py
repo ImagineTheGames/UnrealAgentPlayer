@@ -1,5 +1,11 @@
-from unreal_agent_player.cli import _pie, _screenshot_body, build_parser
+from unreal_agent_player.cli import _pie, _report_diag, _screenshot_body, build_parser
 from unreal_agent_player.reporting.session import ReportSession
+
+
+def test_report_diag_routes_with_project():
+    args = build_parser().parse_args(["report", "diag", "--project", "Foo"])
+    assert args.func is _report_diag
+    assert args.project == "Foo"
 
 
 # --- #2: `uap pie` verbs route correctly (no editor needed for arg wiring) ---

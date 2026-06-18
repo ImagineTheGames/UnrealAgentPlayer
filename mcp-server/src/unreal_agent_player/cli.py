@@ -73,6 +73,45 @@ def _report_screenshot(args) -> int:
     return 0 if rel is not None else 1
 
 
+def _report_diag(args) -> int:
+    """Capture editor diagnostics into the active report's env block. Sourced via `exec`
+    (targets the editor by project name) so it is accurate even when another editor squats
+    the RC port -- unlike `status`, which only ever reaches whatever holds :30010."""
+    s = _require_active()
+    if s is None:
+        return 2
+    code = (
+        "import unreal, json\n"
+        "ss = unreal.get_editor_subsystem(unreal.UAPAgentSubsystem)\n"
+        "ws = unreal.get_editor_subsystem(unreal.UnrealEditorSubsystem)\n"
+        "w = ws.get_game_world() or ws.get_editor_world()\n"
+        "print('UAPDIAG:' + json.dumps({"
+        "'plugin_version': ss.get_plugin_version(),"
+        "'world': (w.get_name() if w else None),"
+        "'is_in_pie': ss.is_in_pie()}))\n"
+    )
+    body: dict = {"ok": True}
+    try:
+        client = PythonRemoteExecClient(node_project_substr=args.project)
+        res = client.exec_python(code)
+        diag = None
+        for o in (res.get("output") or []):
+            line = o.get("output", "")
+            if "UAPDIAG:" in line:
+                diag = json.loads(line.split("UAPDIAG:", 1)[1].strip())
+        if diag is None:
+            body = {"ok": False, "error": "no diagnostics returned from editor"}
+        else:
+            diag["project"] = args.project
+            s.set_env(diag)
+            body["env"] = diag
+    except AgentError as exc:
+        body = {"ok": False, "error": str(exc)}
+    _capture("report:diag", {"project": args.project}, body, 0)
+    _emit(body)
+    return 0 if body["ok"] else 1
+
+
 def _report_finish(args) -> int:
     s = _require_active()
     if s is None:
@@ -90,8 +129,12 @@ def _report_finish(args) -> int:
         webbrowser.open(html_path.as_uri())
     except Exception:
         pass
-    _emit({"ok": True, "html": str(html_path), "verdict": s.status,
-           "downgraded": s.status != args.verdict})
+    out = {"ok": True, "html": str(html_path), "verdict": s.status,
+           "downgraded": s.status != args.verdict}
+    if not s.env:
+        out["warning"] = ("no diagnostics in report (env empty) -- run `uap report diag` "
+                          "after `report start` to capture editor version/level/PIE state")
+    _emit(out)
     return 0
 
 
@@ -313,6 +356,10 @@ def build_parser() -> argparse.ArgumentParser:
     rn = rep.add_parser("note")
     rn.add_argument("text")
     rn.set_defaults(func=_report_note)
+    rd = rep.add_parser("diag")
+    rd.add_argument("--project", default="SchoolsOut",
+                    help="editor project substring to source diagnostics from (via exec)")
+    rd.set_defaults(func=_report_diag)
     rsh = rep.add_parser("screenshot")
     rsh.add_argument("file")
     rsh.add_argument("--caption", default="")
