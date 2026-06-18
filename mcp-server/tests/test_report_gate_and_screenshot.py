@@ -39,6 +39,20 @@ def test_pie_start_and_stop_route_to_pie():
         assert args.pie_cmd == verb
 
 
+def test_help_catalog_has_recipes(capsys):
+    from unreal_agent_player.cli import _help
+    assert build_parser().parse_args(["help"]).func is _help
+    assert build_parser().parse_args(["tools"]).func is _help
+    assert _help(None) == 0
+    out = capsys.readouterr().out
+    # The catalog must teach the click chain (read-ui coords -> inject mouse) -- the implicit
+    # chain that agents had to reverse-engineer.
+    assert "read-ui" in out
+    assert "InjectMouseMove" in out
+    assert "report finish" in out
+    assert "docs/agent-testing.md" in out
+
+
 # --- #3: report finish must not pass without required visual proof ---
 
 def test_gate_downgrades_pass_when_required_and_no_screenshot(tmp_path):

@@ -449,6 +449,55 @@ def _screenshot(args) -> int:
     return 0 if body["ok"] else 1
 
 
+_HELP_CATALOG = r"""uap -- drive the Unreal editor for agent testing. Commands target the
+editor named by --project (default $UAP_PROJECT, pinned by this project's uap.ps1 launcher).
+
+PREFLIGHT
+  uap status                      liveness + plugin version + resolved RC port
+  uap report diag                 capture editor/level/PIE + frame perf into the report
+
+REPORT (a verification is NOT done until `report finish` emits the HTML report; cite its path)
+  uap report start "<question>" [--require-screenshot]
+  uap report assert "<label>" pass|fail "<evidence>"
+  uap report note "<text>"
+  uap report finish pass|fail "<summary>"
+
+PLAY-IN-EDITOR
+  uap pie start                   start PIE (version-correct; do NOT use PlayWorldEditorSubsystem)
+  uap pie wait <seconds>          block until the game world is live
+  uap pie stop
+
+DRIVE + OBSERVE
+  uap rc <Func> [key=value ...]   call a plugin UFUNCTION (input injection lives here)
+  uap exec "<python>"             run `import unreal; ...` in the editor (escape hatch)
+  uap read-ui                     dump on-screen UMG: [{text, x, y}, ...] + focused
+  uap screenshot <file>           capture composited game+UMG frame (needs live PIE)
+
+RECIPES (compose the primitives -- there is no single click/tab verb yet)
+  Click an on-screen button by label:
+    uap read-ui                                   # find the element's x,y
+    uap rc InjectMouseMove X=<x> Y=<y> bAbsolute=true
+    uap rc InjectMouseButton Button=Left bPressed=true
+    uap rc InjectMouseButton Button=Left bPressed=false
+  Press a key (routes through the real input path):
+    uap rc InjectKey KeyName=E bPressed=true ; uap rc InjectKey KeyName=E bPressed=false
+  VR controller button:
+    uap rc InjectXRButton Hand=Right ButtonKeyName=OculusTouch_Right_Trigger_Click bPressed=true
+  Select a CommonUI tab / nav focus (no verb yet -- drive via exec):
+    uap exec "import unreal; ..."   # call the tab list's SelectTabByID on the live widget
+  Read game-truth (preferred over screenshots): uap rc CallTestHelper Name=... JsonArgs={}
+    list helpers: uap rc ListTestHelpers
+
+MORE: docs/agent-testing.md (usage), docs/capabilities.md (every tool), docs/known-issues.md.
+Per-verb flags: uap <verb> --help
+"""
+
+
+def _help(args) -> int:
+    print(_HELP_CATALOG)
+    return 0
+
+
 def _env_project() -> str:
     """Default editor target. Comes from $UAP_PROJECT -- which the per-project uap.ps1 launcher
     pins -- so a command run from a project's launcher targets THAT editor. Empty (no launcher,
@@ -466,6 +515,9 @@ def build_parser() -> argparse.ArgumentParser:
     proj = argparse.ArgumentParser(add_help=False)
     proj.add_argument("--project", default=_env_project(),
                       help="editor to target (default $UAP_PROJECT); RC port resolved per project")
+
+    sub.add_parser("help", help="catalog of verbs + copy-paste recipes").set_defaults(func=_help)
+    sub.add_parser("tools", help="alias of help").set_defaults(func=_help)
 
     rep = sub.add_parser("report").add_subparsers(dest="rcmd", required=True)
     rs = rep.add_parser("start")

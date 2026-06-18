@@ -24,7 +24,37 @@ powershell -NoProfile -File uap.ps1 <verb> [args...]
 
 (`uap.ps1` is dropped at the project root by `Install-AgentTest.ps1`.) No MCP tools
 required. The CLI owns the HTML report. It works in any agent session as long as the
-editor is up.
+editor is up. **Run `uap help` for the full verb catalog + copy-paste recipes** -- don't
+reverse-engineer tools by dumping `dir()` on the subsystem.
+
+## Quick recipes (copy-paste)
+
+There is no single `click`/`tab` verb yet -- compose the primitives:
+
+```
+# Click an on-screen UMG button by its label:
+uap read-ui                                         # find the button's x,y in the dump
+uap rc InjectMouseMove X=<x> Y=<y> bAbsolute=true
+uap rc InjectMouseButton Button=Left bPressed=true
+uap rc InjectMouseButton Button=Left bPressed=false
+
+# Press a key (real input path, works backgrounded):
+uap rc InjectKey KeyName=E bPressed=true
+uap rc InjectKey KeyName=E bPressed=false
+
+# VR controller button:
+uap rc InjectXRButton Hand=Right ButtonKeyName=OculusTouch_Right_Trigger_Click bPressed=true
+
+# Read game-truth (preferred over screenshots):
+uap rc ListTestHelpers
+uap rc CallTestHelper Name=<HelperName> JsonArgs={}
+
+# Select a CommonUI tab / move focus (no verb yet -- drive the live widget via exec):
+uap exec "import unreal; ...CommonTabListWidgetBase.SelectTabByID(...)"
+```
+
+Deeper docs (in the UnrealAgentPlayer repo): `docs/agent-testing.md` (usage),
+`docs/capabilities.md` (every tool + the input model), `docs/known-issues.md`.
 
 Verbs used in this flow:
 - `uap status` -- preflight; returns JSON `{ok, rc_reachable, plugin_version}`.
