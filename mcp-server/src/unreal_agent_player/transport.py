@@ -233,19 +233,30 @@ class PythonRemoteExecClient:
             ) from exc
         dest = (self.MULTICAST_GROUP, self.MULTICAST_PORT)
         try:
-            nodes = self._discover_nodes(mcast, dest)
+            # When a project filter is set, the target editor's PONG can be slow/dropped on a
+            # given round. Re-discover a few times rather than failing -- and NEVER fall back to
+            # a non-matching editor (see _select_node).
+            attempts = 3 if self._node_project_substr else 1
+            nodes: list[str] = []
+            target: str | None = None
+            for _ in range(attempts):
+                nodes = self._discover_nodes(mcast, dest)
+                if not nodes:
+                    continue
+                target = self._select_node(mcast, dest, nodes)
+                if target is not None:
+                    break
             if not nodes:
                 raise AgentError(
                     ErrorCode.UE_REMOTE_EXEC_OFF,
                     "No Unreal node answered Python Remote Execution ping.",
                     retry_hint="Project Settings > Python > Enable Remote Execution, then restart the editor",
                 )
-            target = self._select_node(mcast, dest, nodes)
             if target is None:
                 raise AgentError(
                     ErrorCode.UE_REMOTE_EXEC_OFF,
                     f"{len(nodes)} editor(s) answered but none matched project "
-                    f"'{self._node_project_substr}'.",
+                    f"'{self._node_project_substr}'. Is that editor running?",
                 )
             result = self._run_on_node(mcast, dest, target, code, unattended, exec_mode)
             if result is None:
@@ -258,33 +269,49 @@ class PythonRemoteExecClient:
     # --- internals ---
 
     def _discover_nodes(self, mcast: socket.socket, dest: tuple[str, int]) -> list[str]:
+        # With a project filter set we must catch ALL responders (so _select_node can pick the
+        # right project), but we don't want to burn the full timeout every call. After the first
+        # PONG, wait a short settle window for other editors, then stop. With no filter, the
+        # first responder is enough.
         deadline = time.monotonic() + self._discovery_timeout
+        settle = 0.8
         next_ping = 0.0
         seen: list[str] = []
-        mcast.settimeout(0.4)
+        first_at: float | None = None
+        mcast.settimeout(0.3)
         while time.monotonic() < deadline:
             now = time.monotonic()
             if now >= next_ping:
                 mcast.sendto(self._encode(self.T_PING), dest)
-                next_ping = now + 1.0
+                next_ping = now + 0.5
             try:
                 raw, _ = mcast.recvfrom(8192)
             except socket.timeout:
+                if seen and first_at is not None and (time.monotonic() - first_at) >= settle:
+                    break
                 continue
             msg = self._decode(raw)
             if msg and msg.get("type") == self.T_PONG and msg.get("source"):
                 src = str(msg["source"])
                 if src not in seen:
                     seen.append(src)
-                    # With no project filter, one responder is enough.
+                    if first_at is None:
+                        first_at = time.monotonic()
                     if not self._node_project_substr:
-                        break
+                        break  # no filter: first responder is enough
+            if (self._node_project_substr and seen and first_at is not None
+                    and (time.monotonic() - first_at) >= settle):
+                break
         return seen
 
     def _select_node(self, mcast: socket.socket, dest: tuple[str, int],
                      nodes: list[str]) -> str | None:
-        if not self._node_project_substr or len(nodes) == 1:
+        if not self._node_project_substr:
             return nodes[0]
+        # A project filter is set: NEVER fall back to a non-matching editor -- not even when
+        # it is the only one that answered this discovery round. (Doing so cross-targeted the
+        # wrong editor when the intended one's UDP PONG was simply slow/dropped, e.g. starting
+        # PIE in the wrong project.) Verify each node's project and return ONLY a real match.
         for n in nodes:
             res = self._run_on_node(
                 mcast, dest, n,
