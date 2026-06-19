@@ -523,6 +523,16 @@ def _screenshot(args) -> int:
 _HELP_CATALOG = r"""uap -- drive the Unreal editor for agent testing. Commands target the
 editor named by --project (default $UAP_PROJECT, pinned by this project's uap.ps1 launcher).
 
+COMMON MISTAKES (don't)
+  * Screenshots: use `uap screenshot <abs.png>` (composites 3D + UMG + CommonUI + Slate).
+    HighResShot and most MCP screenshot tools capture the 3D SCENE ONLY (no UI). Missing UI
+    in a shot = wrong tool, not "UI can't be captured."
+  * Targeting: run via this project's uap.ps1 (it pins UAP_PROJECT). Calling the venv python
+    directly with no --project cross-targets another open editor (e.g. PIE in the wrong project).
+  * read-ui x/y are screen pixels for screen-space UMG/CommonUI; for a WORLD-SPACE VR menu
+    (WidgetComponent) they're render-target coords -> a screen click misses (needs the laser).
+  * Not done until `uap report finish` emits the HTML report. Read concrete state, not pixels.
+
 PREFLIGHT
   uap status                      liveness + plugin version + resolved RC port
   uap report diag                 capture editor/level/PIE + frame perf into the report

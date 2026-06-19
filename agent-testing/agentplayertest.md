@@ -14,6 +14,25 @@ read-back value as evidence. A vague visual question ("legs moving?") becomes a
 concrete state read ("locomotion state == Move AND a foot bone advances between
 two samples") -- never "I looked at a screenshot and it seems fine."
 
+## STOP -- common mistakes (read this first)
+
+These are the errors agents make every time. Don't.
+
+1. **Screenshots: use `uap screenshot <abs.png>`. NOT `HighResShot`, NOT the MCP
+   `screenshot_viewport`.** `uap screenshot` reads the composited backbuffer (3D **+** UMG +
+   CommonUI + custom Slate) -- HighResShot and most MCP shots capture the **3D scene only, no
+   UI**. If your menu/HUD/globe is missing from a shot, you used the wrong tool, not "UI can't
+   be captured." (Embedded PIE includes editor chrome around the game view -- the UI is still there.)
+2. **Run via this project's `uap.ps1`** (it pins `UAP_PROJECT`). If you call the venv python
+   directly without `--project`/`UAP_PROJECT`, you'll cross-target **another open editor** (e.g.
+   start PIE in the wrong project).
+3. **`read-ui` x/y are screen pixels for screen-space UMG/CommonUI** (where `uap click` works) --
+   but for a **world-space VR menu** (a `WidgetComponent`) they're render-target coords; a screen
+   `uap click` won't hit them (that menu needs the VR laser).
+4. **A check isn't done until `uap report finish` emits the HTML report** -- cite the path.
+   Never conclude from a screenshot alone; read concrete state (helper / property / bone delta / log).
+5. **Discover verbs with `uap help`** -- do not reverse-engineer by dumping `dir()` on the subsystem.
+
 ## The bridge is the `uap` CLI
 
 Invoke from your project root as:
