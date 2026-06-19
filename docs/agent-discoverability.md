@@ -27,16 +27,20 @@ reading them. UAP is meant to be the *easy* path; the discovery surface was too 
 - **`agentplayertest.md` now opens with a "Quick recipes" block** + a pointer to `uap help` and
   to `docs/agent-testing.md` / `capabilities.md` / `known-issues.md`. Agents stop spelunking.
 - **`uap click "<label>"`** -- one-call UMG button click (read-ui -> match text -> inject mouse).
-  CLI-only (composes existing verbs). Live-verify pending; clicks the element's reported
-  position (top-left) until read-ui exposes a center coord (see D).
+  CLI-only. Clicks the element's reported position (top-left) until read-ui exposes a center
+  coord (see D).
+- **`uap tab "<TabId>"`** -- C++ `SelectTab` -> `CommonTabListWidgetBase::SelectTabByID` on the
+  live game tab list. Plugin UFUNCTION + CLI verb; CommonUI dep added (.uplugin + Build.cs).
+- **`uap nav up|down|left|right|accept|back`** -- C++ `NavigateUI` drives Slate key navigation
+  (the path menus use, not game input). Plugin UFUNCTION + CLI verb.
+
+  Verification status for the three: compiled on Meta-fork + stock UE, routing unit-tested, and
+  plumbing-verified live (callable, correct no-menu behavior, nav drives Slate). Their effect on
+  a *rendered* menu is unverified -- a fresh PIE in either project shows no screen-space menu
+  (PBW boots to gameplay; SchoolsOut's menu is world-space VR). Confirm on a live screen-space
+  menu (e.g. PBW's mission menu once the game flow opens it).
 
 ## Planned (needs live-editor verification; do when editors are free)
-
-- **A. Remaining UI verbs** (need plugin C++ + a rebuild):
-  - `uap tab "<TabId>"` -- CommonUI `CommonTabListWidgetBase::SelectTabByID` (menus are
-    tab-driven; highest-value single addition).
-  - `uap nav up|down|left|right|accept|back` -- CommonUI focus navigation.
-  - These need new plugin UFUNCTIONs (UMG hit-test + CommonUI tab/nav) + CLI verbs + a rebuild.
 - **D. Richer `read-ui` + `uap ui-tree`** -- per-element width/height (so click targets center),
   a stable id/widget-name, and a hierarchy dump (names/classes/visibility) so agents target by
   widget name without Python.
