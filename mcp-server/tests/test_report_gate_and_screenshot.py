@@ -64,6 +64,18 @@ def test_click_routes_with_label_and_project():
     assert a.project == "PBW"
 
 
+def test_tab_and_nav_route():
+    from unreal_agent_player.cli import _nav, _tab
+    t = build_parser().parse_args(["tab", "VRTraining", "--project", "PBW"])
+    assert t.func is _tab and t.tab_id == "VRTraining" and t.project == "PBW"
+    n = build_parser().parse_args(["nav", "down"])
+    assert n.func is _nav and n.direction == "down"
+    # invalid direction is rejected
+    import pytest as _pt
+    with _pt.raises(SystemExit):
+        build_parser().parse_args(["nav", "sideways"])
+
+
 def test_help_catalog_has_recipes(capsys):
     from unreal_agent_player.cli import _help
     assert build_parser().parse_args(["help"]).func is _help

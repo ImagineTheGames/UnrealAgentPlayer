@@ -102,6 +102,17 @@ public:
     UFUNCTION(BlueprintCallable, Category="Agent|UI")
     FString DumpViewportUI();
 
+    // Selects a CommonUI tab by its TabNameID on the live game's tab list (menus are
+    // tab-driven). Returns false if no game-world CommonTabListWidgetBase is found or the
+    // id doesn't exist. The #1 menu-navigation primitive an agent needs.
+    UFUNCTION(BlueprintCallable, Category="Agent|UI")
+    bool SelectTab(FString TabId);
+
+    // Drives UI focus navigation through Slate (the path menus actually use -- distinct from
+    // game input). Direction: up|down|left|right|accept|back. Returns whether Slate handled it.
+    UFUNCTION(BlueprintCallable, Category="Agent|UI")
+    bool NavigateUI(FString Direction);
+
     // Requests a screenshot of the composited game backbuffer INCLUDING the UMG/Slate
     // overlay (unlike HighResShot, which captures only the 3D scene). The engine writes
     // the PNG to Filename on the next rendered frame; poll for the file. Filename should

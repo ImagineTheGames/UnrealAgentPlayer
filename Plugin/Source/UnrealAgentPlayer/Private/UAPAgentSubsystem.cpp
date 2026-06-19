@@ -23,6 +23,7 @@
 #include "RenderTimer.h"
 #include "AgentMotionController.h"
 #include "AgentUIReader.h"
+#include "CommonTabListWidgetBase.h"
 #include "UnrealClient.h"
 #include "HAL/IConsoleManager.h"
 #include "Framework/Application/SlateApplication.h"
@@ -318,6 +319,56 @@ bool UUAPAgentSubsystem::ClearXRControllerOverride(EAgentXRHand Hand)
 FString UUAPAgentSubsystem::DumpViewportUI()
 {
     return FAgentUIReader::DumpViewportUI();
+}
+
+bool UUAPAgentSubsystem::SelectTab(FString TabId)
+{
+    const FName TabName(*TabId);
+    for (TObjectIterator<UCommonTabListWidgetBase> It; It; ++It)
+    {
+        UCommonTabListWidgetBase* TabList = *It;
+        if (!IsValid(TabList))
+        {
+            continue;
+        }
+        // Only the live game's tab list (constructed + in a game world), not editor/CDO copies.
+        const UWorld* W = TabList->GetWorld();
+        if (!W || !W->IsGameWorld() || !TabList->IsConstructed())
+        {
+            continue;
+        }
+        if (TabList->GetTabButtonBaseByID(TabName) != nullptr)
+        {
+            return TabList->SelectTabByID(TabName);
+        }
+    }
+    return false;
+}
+
+bool UUAPAgentSubsystem::NavigateUI(FString Direction)
+{
+    if (!FSlateApplication::IsInitialized())
+    {
+        return false;
+    }
+    const FString D = Direction.ToLower();
+    FKey Key;
+    if (D == TEXT("up"))                                 { Key = EKeys::Up; }
+    else if (D == TEXT("down"))                          { Key = EKeys::Down; }
+    else if (D == TEXT("left"))                          { Key = EKeys::Left; }
+    else if (D == TEXT("right"))                         { Key = EKeys::Right; }
+    else if (D == TEXT("accept") || D == TEXT("select")) { Key = EKeys::Enter; }
+    else if (D == TEXT("back") || D == TEXT("cancel"))   { Key = EKeys::Escape; }
+    else { return false; }
+
+    // Drive Slate's focus navigation (the path menus use), NOT the game-input viewport path:
+    // ProcessKeyDownEvent lets Slate translate arrow/Enter/Escape into UI navigation/activation.
+    FSlateApplication& App = FSlateApplication::Get();
+    FKeyEvent KeyDown(Key, App.GetModifierKeys(), App.GetUserIndexForKeyboard(), /*bIsRepeat*/ false, 0, 0);
+    const bool bHandled = App.ProcessKeyDownEvent(KeyDown);
+    FKeyEvent KeyUp(Key, App.GetModifierKeys(), App.GetUserIndexForKeyboard(), false, 0, 0);
+    App.ProcessKeyUpEvent(KeyUp);
+    return bHandled;
 }
 
 bool UUAPAgentSubsystem::CaptureViewportWithUI(FString Filename)

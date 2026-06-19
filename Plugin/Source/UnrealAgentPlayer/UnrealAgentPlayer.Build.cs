@@ -37,6 +37,7 @@ public class UnrealAgentPlayer : ModuleRules
             "HeadMountedDisplay",
             "BlueprintGraph",
             "PropertyEditor",
+            "CommonUI",
         });
     }
 }

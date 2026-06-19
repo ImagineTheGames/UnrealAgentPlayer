@@ -446,6 +446,38 @@ def _click(args) -> int:
     return 0 if body["ok"] else 1
 
 
+def _tab(args) -> int:
+    """Select a CommonUI tab by its TabNameID -- menus are tab-driven, this is the #1
+    navigation primitive."""
+    t0 = time.monotonic()
+    body: dict = {"ok": True, "tab": args.tab_id}
+    try:
+        ok = bool(_rc_call("SelectTab", {"TabId": args.tab_id}, args.project))
+        body["ok"] = ok
+        if not ok:
+            body["error"] = (f"no tab '{args.tab_id}' on a live CommonUI tab list "
+                             "(is PIE running and the menu open?)")
+    except AgentError as exc:
+        body = {"ok": False, "error": str(exc)}
+    _capture("tab", {"tab": args.tab_id}, body, int((time.monotonic() - t0) * 1000))
+    _emit(body)
+    return 0 if body["ok"] else 1
+
+
+def _nav(args) -> int:
+    """Move UI focus / activate through Slate (up|down|left|right|accept|back) -- the path
+    menus actually use, distinct from game input."""
+    t0 = time.monotonic()
+    body: dict = {"ok": True, "direction": args.direction}
+    try:
+        body["handled"] = bool(_rc_call("NavigateUI", {"Direction": args.direction}, args.project))
+    except AgentError as exc:
+        body = {"ok": False, "error": str(exc)}
+    _capture("nav", {"direction": args.direction}, body, int((time.monotonic() - t0) * 1000))
+    _emit(body)
+    return 0 if body["ok"] else 1
+
+
 def _read_ui(args) -> int:
     t0 = time.monotonic()
     body: dict = {"ok": True}
@@ -511,6 +543,8 @@ DRIVE + OBSERVE
   uap exec "<python>"             run `import unreal; ...` in the editor (escape hatch)
   uap read-ui                     dump on-screen UMG: [{text, x, y}, ...] + focused
   uap click "<label>"             click an on-screen UMG element by its visible text
+  uap tab "<TabId>"               select a CommonUI tab by id (menus are tab-driven)
+  uap nav up|down|left|right|accept|back   move UI focus / activate (Slate nav path)
   uap screenshot <file>           capture composited game+UMG frame (needs live PIE)
 
 RECIPES
@@ -525,8 +559,9 @@ RECIPES
     uap rc InjectKey KeyName=E bPressed=true ; uap rc InjectKey KeyName=E bPressed=false
   VR controller button:
     uap rc InjectXRButton Hand=Right ButtonKeyName=OculusTouch_Right_Trigger_Click bPressed=true
-  Select a CommonUI tab / nav focus (no verb yet -- drive via exec):
-    uap exec "import unreal; ..."   # call the tab list's SelectTabByID on the live widget
+  Select a CommonUI tab / move focus:
+    uap tab "VRTraining"            # select tab by id
+    uap nav down ; uap nav accept   # focus nav + activate
   Read game-truth (preferred over screenshots): uap rc CallTestHelper Name=... JsonArgs={}
     list helpers: uap rc ListTestHelpers
 
@@ -617,6 +652,12 @@ def build_parser() -> argparse.ArgumentParser:
     cl = sub.add_parser("click", parents=[proj], help="click an on-screen UMG element by its text")
     cl.add_argument("label", help="visible text of the element to click")
     cl.set_defaults(func=_click)
+    tb = sub.add_parser("tab", parents=[proj], help="select a CommonUI tab by its id")
+    tb.add_argument("tab_id")
+    tb.set_defaults(func=_tab)
+    nv = sub.add_parser("nav", parents=[proj], help="UI focus nav (up|down|left|right|accept|back)")
+    nv.add_argument("direction", choices=["up", "down", "left", "right", "accept", "back"])
+    nv.set_defaults(func=_nav)
     sc = sub.add_parser("screenshot", parents=[proj])
     sc.add_argument("file")
     sc.add_argument("--caption", default="")
