@@ -46,12 +46,15 @@ class ReportSession:
         self.notes.append({"text": text, "section": section})
         self._persist()
 
-    def add_screenshot(self, src_path: str, caption: str = "") -> Optional[str]:
+    def add_screenshot(self, src_path: str, caption: str = "",
+                       provenance: Optional[str] = None) -> Optional[str]:
+        # provenance = the project of the editor the shot was captured FROM (stamped by
+        # `uap screenshot`). Used to reject a pass whose only proof is a shot of another editor.
         idx = len(self.screenshots)
         src = Path(src_path)
         if not src.exists():
             self.screenshots.append({
-                "file": None, "caption": caption,
+                "file": None, "caption": caption, "provenance": provenance,
                 "t": self._hms(datetime.now()), "missing": True,
             })
             self._persist()
@@ -59,7 +62,7 @@ class ReportSession:
         rel = f"screenshots/{idx:03d}.png"
         shutil.copyfile(src, self.run_dir / rel)
         self.screenshots.append({
-            "file": rel, "caption": caption,
+            "file": rel, "caption": caption, "provenance": provenance,
             "t": self._hms(datetime.now()), "missing": False,
         })
         self._persist()
@@ -103,20 +106,41 @@ class ReportSession:
     def _has_real_screenshot(self) -> bool:
         return any((not s.get("missing")) and s.get("file") for s in self.screenshots)
 
+    def _screenshot_proof_ok(self) -> tuple[bool, str]:
+        """A passing report needs a real screenshot captured FROM the editor under test --
+        not a shot of another editor, and not a manual attach with unknown origin. `uap
+        screenshot` stamps each shot's provenance (its editor's project); we require one
+        whose provenance matches this report's project."""
+        real = [s for s in self.screenshots if (not s.get("missing")) and s.get("file")]
+        if not real:
+            return False, "no screenshot attached"
+        rp = (self.project or "").lower()
+        if not rp:
+            return True, ""  # report has no project to verify against; accept a real shot
+        for s in real:
+            prov = (s.get("provenance") or "").lower()
+            if prov and (prov in rp or rp in prov):
+                return True, ""
+        provs = [s.get("provenance") for s in real]
+        return False, (f"screenshot(s) are not verified from the editor under test "
+                       f"(report project={self.project!r}, shot provenance={provs}). Capture "
+                       f"with `uap screenshot <abs.png>` via THIS project's uap.ps1 -- a shot of "
+                       f"another editor (or a manual attach) is not proof.")
+
     def finish(self, status: str, summary: str) -> None:
-        # A "pass" with no attached screenshot is a false positive. Screenshot proof is
-        # REQUIRED by default -- auto-downgrade to fail so the report cannot lie. (Opt out
-        # only for a genuinely headless/no-visual check via `report start --no-require-screenshot`.)
-        if status == "pass" and self.requires_screenshot and not self._has_real_screenshot():
-            status = "fail"
-            self.notes.append({
-                "text": "AUTO-FAIL: a passing report must attach a screenshot (use "
-                        "`uap screenshot <abs.png>` then `uap report screenshot ...`, or the "
-                        "top-level `uap screenshot`). Opt out only with "
-                        "`report start --no-require-screenshot`.",
-                "section": None,
-            })
-            summary = (summary + " [auto-failed: no screenshot attached]").strip()
+        # A "pass" without a screenshot FROM THE EDITOR UNDER TEST is a false positive (agents
+        # have passed on a shot of another editor / an unverified image). Require verified proof
+        # by default -- auto-downgrade to fail. (Opt out: `report start --no-require-screenshot`.)
+        if status == "pass" and self.requires_screenshot:
+            ok, reason = self._screenshot_proof_ok()
+            if not ok:
+                status = "fail"
+                self.notes.append({
+                    "text": f"AUTO-FAIL: {reason} (Opt out only with "
+                            "`report start --no-require-screenshot`.)",
+                    "section": None,
+                })
+                summary = (summary + f" [auto-failed: {reason}]").strip()
         self.status = status
         self.summary = summary
         self.finished = datetime.now()

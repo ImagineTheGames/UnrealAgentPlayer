@@ -31,9 +31,13 @@ These are the errors agents make every time. Don't.
    `uap click` won't hit them (that menu needs the VR laser).
 4. **A check isn't done until `uap report finish` emits the HTML report** -- cite the path.
    Read concrete state (helper / property / bone delta / log), not pixels alone.
-5. **A PASS requires an attached screenshot** -- `report finish pass` with none **auto-downgrades
-   to FAIL**. Capture one (`uap screenshot <abs.png>`, auto-attached). Opt out only for a truly
-   headless check with `report start --no-require-screenshot`.
+5. **A PASS requires a screenshot FROM THE EDITOR UNDER TEST** -- capture with `uap screenshot
+   <abs.png>` via **this project's `uap.ps1`** (it stamps which editor the shot came from). A
+   shot of **another editor** (wrong project) **auto-fails** the report; so does a manual attach
+   of unknown origin. And a screenshot proves nothing unless you **read what it shows**
+   (`uap read-ui` / a state read) and assert on it -- never attach pixels you didn't verify.
+   (`report finish pass` with no verified shot auto-downgrades to FAIL. Opt out only for a
+   genuinely headless check: `report start --no-require-screenshot`.)
 6. **Discover verbs with `uap help`** -- do not reverse-engineer by dumping `dir()` on the subsystem.
 
 ## The bridge is the `uap` CLI

@@ -121,6 +121,45 @@ def test_gate_keeps_pass_when_required_and_screenshot_present(tmp_path):
     assert s.status == "pass"
 
 
+def _png(p):
+    p.write_bytes(b"\x89PNG\r\n")
+    return str(p)
+
+
+def test_pass_allowed_when_screenshot_from_editor_under_test(tmp_path):
+    s = ReportSession(task="t", run_dir=tmp_path, quote="q", project="ProjectBrokenWings",
+                      requires_screenshot=True)
+    s.add_screenshot(_png(tmp_path / "x.png"), "cap", provenance="ProjectBrokenWings")
+    s.finish("pass", "done")
+    assert s.status == "pass"
+
+
+def test_pass_fails_when_screenshot_is_of_another_editor(tmp_path):
+    s = ReportSession(task="t", run_dir=tmp_path, quote="q", project="ProjectBrokenWings",
+                      requires_screenshot=True)
+    s.add_screenshot(_png(tmp_path / "x.png"), "cap", provenance="SchoolsOut")  # wrong editor
+    s.finish("pass", "done")
+    assert s.status == "fail"
+
+
+def test_pass_fails_when_screenshot_has_no_provenance(tmp_path):
+    # real shot but unknown origin (manual attach) + the report has a project -> not proof.
+    s = ReportSession(task="t", run_dir=tmp_path, quote="q", project="ProjectBrokenWings",
+                      requires_screenshot=True)
+    s.add_screenshot(_png(tmp_path / "x.png"), "cap")  # provenance=None
+    s.finish("pass", "done")
+    assert s.status == "fail"
+
+
+def test_provenance_matches_with_project_suffix(tmp_path):
+    # report project 'SchoolsOutVR' vs shot provenance 'SchoolsOut' -> substring match OK.
+    s = ReportSession(task="t", run_dir=tmp_path, quote="q", project="SchoolsOutVR",
+                      requires_screenshot=True)
+    s.add_screenshot(_png(tmp_path / "x.png"), "cap", provenance="SchoolsOut")
+    s.finish("pass", "done")
+    assert s.status == "pass"
+
+
 def test_gate_no_downgrade_when_not_required(tmp_path):
     s = ReportSession(task="t", run_dir=tmp_path, quote="q", requires_screenshot=False)
     s.finish("pass", "done")

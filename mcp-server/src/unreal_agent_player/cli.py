@@ -221,6 +221,23 @@ def _exec_rc_port(project: str) -> int:
     return 0
 
 
+def _exec_project_name(project: "str | None") -> "str | None":
+    """The project name of the editor matching `project` (via exec). Used to stamp a
+    screenshot's provenance so a pass can't be proven with a shot of another editor."""
+    code = ("import unreal\n"
+            "print('UAPPROJ:' + unreal.Paths.get_project_file_path()"
+            ".rsplit('/',1)[-1].rsplit('.',1)[0])\n")
+    try:
+        res = PythonRemoteExecClient(node_project_substr=(project or "")).exec_python(code)
+    except AgentError:
+        return None
+    for o in (res.get("output") or []):
+        line = o.get("output", "")
+        if "UAPPROJ:" in line:
+            return line.split("UAPPROJ:", 1)[1].strip()
+    return None
+
+
 def _rc_port_for(project: "str | None") -> int:
     """Resolve the RC HTTP port. UAP_RC_PORT env overrides everything; else resolve the
     editor's advertised port by project (cached), so two editors are each addressed on their
@@ -276,8 +293,9 @@ def _capture(tool: str, args: dict, body: dict, ms: int) -> None:
     try:
         ok = bool(body.get("ok", True)) and "error" not in body
         s.add_tool_call(tool, args, ok=ok, ms=ms, error=body.get("error"))
-        if tool == "screenshot" and body.get("path"):
-            s.add_screenshot(body["path"], body.get("caption", ""))
+        if tool == "screenshot" and body.get("path") and body.get("exists"):
+            s.add_screenshot(body["path"], body.get("caption", ""),
+                             provenance=body.get("provenance"))
     except Exception:
         pass
 
@@ -513,6 +531,10 @@ def _screenshot(args) -> int:
             time.sleep(0.25)
         body = _screenshot_body(args.file, os.path.exists(args.file))
         body["caption"] = args.caption
+        if body.get("exists"):
+            # Stamp which editor this shot came from, so report finish can reject a pass whose
+            # proof is a screenshot of a DIFFERENT editor.
+            body["provenance"] = _exec_project_name(args.project)
     except AgentError as exc:
         body = {"ok": False, "error": str(exc)}
     _capture("screenshot", {"file": args.file}, body, int((time.monotonic() - t0) * 1000))
@@ -532,9 +554,10 @@ COMMON MISTAKES (don't)
   * read-ui x/y are screen pixels for screen-space UMG/CommonUI; for a WORLD-SPACE VR menu
     (WidgetComponent) they're render-target coords -> a screen click misses (needs the laser).
   * Not done until `uap report finish` emits the HTML report. Read concrete state, not pixels.
-  * A PASS requires an attached screenshot by default -- `finish pass` with none auto-downgrades
-    to FAIL. Attach one (`uap screenshot <abs.png>`). Opt out only for headless checks with
-    `report start --no-require-screenshot`.
+  * A PASS requires a screenshot FROM THE EDITOR UNDER TEST -- `uap screenshot <abs.png>` via this
+    project's uap.ps1 (it stamps the source editor). A shot of ANOTHER editor, or a manual attach
+    of unknown origin, auto-FAILS the pass. And pixels aren't proof unless you read what they show
+    (`uap read-ui`/state) and assert on it. Opt out (headless only): report start --no-require-screenshot.
 
 PREFLIGHT
   uap status                      liveness + plugin version + resolved RC port
