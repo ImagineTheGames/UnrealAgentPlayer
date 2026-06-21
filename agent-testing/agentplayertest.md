@@ -30,8 +30,11 @@ These are the errors agents make every time. Don't.
    but for a **world-space VR menu** (a `WidgetComponent`) they're render-target coords; a screen
    `uap click` won't hit them (that menu needs the VR laser).
 4. **A check isn't done until `uap report finish` emits the HTML report** -- cite the path.
-   Never conclude from a screenshot alone; read concrete state (helper / property / bone delta / log).
-5. **Discover verbs with `uap help`** -- do not reverse-engineer by dumping `dir()` on the subsystem.
+   Read concrete state (helper / property / bone delta / log), not pixels alone.
+5. **A PASS requires an attached screenshot** -- `report finish pass` with none **auto-downgrades
+   to FAIL**. Capture one (`uap screenshot <abs.png>`, auto-attached). Opt out only for a truly
+   headless check with `report start --no-require-screenshot`.
+6. **Discover verbs with `uap help`** -- do not reverse-engineer by dumping `dir()` on the subsystem.
 
 ## The bridge is the `uap` CLI
 
@@ -116,9 +119,10 @@ State the concrete pass condition before running. A non-zero speed with a frozen
 1. **Preflight**: `uap status` -> require `rc_reachable:true`. Editor down? Launch the editor
    yourself (your project's launch script), wait for RC, retry. Do not fall back to raw RC
    without a report; the report is the point.
-2. **`uap report start "<question>"`** -- question verbatim, `--project <YourProject>`. If the
-   verdict needs visual proof, add `--require-screenshot` -- then `report finish pass`
-   auto-downgrades to fail unless a screenshot is actually attached (no silent false positives).
+2. **`uap report start "<question>"`** -- question verbatim, `--project <YourProject>`. A passing
+   report **requires a screenshot by default** -- `report finish pass` auto-downgrades to fail
+   unless one is attached (no silent false positives). Add `--no-require-screenshot` only for a
+   genuinely headless/no-visual check.
 3. **Diagnostics**: `uap report diag --project <YourProject>` -- captures the editor's plugin
    version, open level, PIE state (env) AND frame timing / fps (perf) into the report (sourced
    via `exec`, so it reads the RIGHT editor even when another squats the RC port). Run it once
@@ -143,8 +147,8 @@ State the concrete pass condition before running. A non-zero speed with a frozen
    in the summary.
 9. **Stop PIE**: `uap pie stop`.
    Then `uap report finish pass|fail "<summary>"` -> prints the `index.html` path; renders +
-   opens the report. (With `--require-screenshot`, a `pass` with no attached screenshot comes
-   back as `verdict: fail, downgraded: true` -- that is the gate doing its job.)
+   opens the report. A `pass` with no attached screenshot comes back as
+   `verdict: fail, downgraded: true` -- that is the gate doing its job; attach a screenshot first.
 10. **Report back**: verdict, the read-back numbers, and the report path. State failures plainly.
 
 ## A verification is not done until the report exists

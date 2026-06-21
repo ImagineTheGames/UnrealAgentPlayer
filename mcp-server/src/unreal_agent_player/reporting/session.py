@@ -11,7 +11,7 @@ from typing import Any, Optional
 
 class ReportSession:
     def __init__(self, *, task: str, run_dir: Path, quote: str,
-                 project: Optional[str] = None, requires_screenshot: bool = False):
+                 project: Optional[str] = None, requires_screenshot: bool = True):
         self.task = task
         self.project = project
         self.quote = quote
@@ -104,16 +104,19 @@ class ReportSession:
         return any((not s.get("missing")) and s.get("file") for s in self.screenshots)
 
     def finish(self, status: str, summary: str) -> None:
-        # A "pass" that required visual proof but never attached a screenshot is a false
-        # positive -- auto-downgrade to fail so the report cannot lie.
+        # A "pass" with no attached screenshot is a false positive. Screenshot proof is
+        # REQUIRED by default -- auto-downgrade to fail so the report cannot lie. (Opt out
+        # only for a genuinely headless/no-visual check via `report start --no-require-screenshot`.)
         if status == "pass" and self.requires_screenshot and not self._has_real_screenshot():
             status = "fail"
             self.notes.append({
-                "text": "AUTO-FAIL: report required visual proof "
-                        "(--require-screenshot) but no screenshot was attached.",
+                "text": "AUTO-FAIL: a passing report must attach a screenshot (use "
+                        "`uap screenshot <abs.png>` then `uap report screenshot ...`, or the "
+                        "top-level `uap screenshot`). Opt out only with "
+                        "`report start --no-require-screenshot`.",
                 "section": None,
             })
-            summary = (summary + " [auto-failed: required screenshot missing]").strip()
+            summary = (summary + " [auto-failed: no screenshot attached]").strip()
         self.status = status
         self.summary = summary
         self.finished = datetime.now()
@@ -154,7 +157,7 @@ class ReportSession:
         self.task = data.get("task", "")
         self.project = data.get("project")
         self.quote = data.get("quote", "")
-        self.requires_screenshot = data.get("requires_screenshot", False)
+        self.requires_screenshot = data.get("requires_screenshot", True)
         self.status = data.get("status", "running")
         self.started = datetime.fromisoformat(data["started"]) if data.get("started") else datetime.now()
         self.finished = datetime.fromisoformat(data["finished"]) if data.get("finished") else None
@@ -212,7 +215,7 @@ def clear_active_run() -> None:
 
 
 def start_session(*, task: str, project: Optional[str] = None,
-                  requires_screenshot: bool = False) -> ReportSession:
+                  requires_screenshot: bool = True) -> ReportSession:
     global _active
     from unreal_agent_player.reporting.quotes import pick_quote
     if _active is not None and _active.status == "running":

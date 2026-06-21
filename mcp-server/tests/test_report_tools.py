@@ -36,7 +36,7 @@ async def test_assert_without_session_errors():
 
 @pytest.mark.asyncio
 async def test_finish_writes_html_and_clears():
-    await report_start(rc=None, py_exec=None, task="T")
+    await report_start(rc=None, py_exec=None, task="T", requires_screenshot=False)
     await report_assert(rc=None, py_exec=None, label="moved", passed=True, evidence="710u")
     r = await report_finish(rc=None, py_exec=None, verdict="pass", summary="done")
     assert r["ok"] is True

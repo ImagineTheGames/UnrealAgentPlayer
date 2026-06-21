@@ -14,9 +14,12 @@ def _no_session() -> dict[str, Any]:
 
 
 async def report_start(*, rc: Any = None, py_exec: Any = None,
-                       task: str, project: Optional[str] = None) -> dict[str, Any]:
-    s = sess.start_session(task=task, project=project)
-    return ok_response({"run_dir": str(s.run_dir)})
+                       task: str, project: Optional[str] = None,
+                       requires_screenshot: bool = True) -> dict[str, Any]:
+    # Screenshot proof is required for a passing report by default; pass
+    # requires_screenshot=False only for a genuinely headless/no-visual check.
+    s = sess.start_session(task=task, project=project, requires_screenshot=requires_screenshot)
+    return ok_response({"run_dir": str(s.run_dir), "requires_screenshot": s.requires_screenshot})
 
 
 async def report_assert(*, rc: Any = None, py_exec: Any = None,

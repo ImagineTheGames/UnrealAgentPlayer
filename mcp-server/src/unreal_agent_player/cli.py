@@ -532,16 +532,20 @@ COMMON MISTAKES (don't)
   * read-ui x/y are screen pixels for screen-space UMG/CommonUI; for a WORLD-SPACE VR menu
     (WidgetComponent) they're render-target coords -> a screen click misses (needs the laser).
   * Not done until `uap report finish` emits the HTML report. Read concrete state, not pixels.
+  * A PASS requires an attached screenshot by default -- `finish pass` with none auto-downgrades
+    to FAIL. Attach one (`uap screenshot <abs.png>`). Opt out only for headless checks with
+    `report start --no-require-screenshot`.
 
 PREFLIGHT
   uap status                      liveness + plugin version + resolved RC port
   uap report diag                 capture editor/level/PIE + frame perf into the report
 
 REPORT (a verification is NOT done until `report finish` emits the HTML report; cite its path)
-  uap report start "<question>" [--require-screenshot]
+  uap report start "<question>" [--no-require-screenshot]   # screenshot REQUIRED for pass by default
   uap report assert "<label>" pass|fail "<evidence>"
   uap report note "<text>"
-  uap report finish pass|fail "<summary>"
+  uap report finish pass|fail "<summary>"   # pass with NO screenshot auto-downgrades to FAIL
+  -> attach proof: `uap screenshot <abs.png>` (auto-attaches), or `uap report screenshot <file>`
 
 PLAY-IN-EDITOR
   uap pie start                   start PIE (version-correct; do NOT use PlayWorldEditorSubsystem)
@@ -610,8 +614,13 @@ def build_parser() -> argparse.ArgumentParser:
     rs = rep.add_parser("start")
     rs.add_argument("task")
     rs.add_argument("--project", default=_env_project())
-    rs.add_argument("--require-screenshot", action="store_true",
-                    help="finish pass auto-downgrades to fail unless a screenshot is attached")
+    # Screenshot proof is REQUIRED by default: `finish pass` auto-downgrades to fail unless a
+    # screenshot is attached. --require-screenshot is the (now redundant) explicit-on;
+    # --no-require-screenshot opts out for a genuinely headless/no-visual check.
+    rs.add_argument("--require-screenshot", dest="require_screenshot", action="store_true",
+                    default=True, help="(default) require a screenshot for a passing report")
+    rs.add_argument("--no-require-screenshot", dest="require_screenshot", action="store_false",
+                    help="rare: allow a pass with no screenshot (justify in the summary)")
     rs.set_defaults(func=_report_start)
     ra = rep.add_parser("assert")
     ra.add_argument("label")

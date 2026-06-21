@@ -5,8 +5,10 @@ from unreal_agent_player.reporting.session import ReportSession
 
 
 def _new(tmp_path: Path) -> ReportSession:
+    # requires_screenshot=False so these session-mechanics tests aren't gated by the default
+    # screenshot-required-for-pass rule (the gate has its own tests in test_report_gate_*).
     return ReportSession(task="Tier-1 proof", project="SchoolsOut",
-                         run_dir=tmp_path / "run", quote="q")
+                         run_dir=tmp_path / "run", quote="q", requires_screenshot=False)
 
 
 def test_session_persists_data_json_on_creation(tmp_path):

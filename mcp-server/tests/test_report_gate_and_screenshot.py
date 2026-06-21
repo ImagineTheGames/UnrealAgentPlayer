@@ -92,6 +92,21 @@ def test_help_catalog_has_recipes(capsys):
 
 # --- #3: report finish must not pass without required visual proof ---
 
+def test_screenshot_required_by_default(tmp_path):
+    # No requires_screenshot arg -> default True -> a pass with no screenshot auto-fails.
+    s = ReportSession(task="t", run_dir=tmp_path, quote="q")
+    assert s.requires_screenshot is True
+    s.finish("pass", "done")
+    assert s.status == "fail"
+
+
+def test_report_start_default_requires_screenshot_with_optout():
+    from unreal_agent_player.cli import build_parser
+    assert build_parser().parse_args(["report", "start", "q"]).require_screenshot is True
+    a = build_parser().parse_args(["report", "start", "q", "--no-require-screenshot"])
+    assert a.require_screenshot is False
+
+
 def test_gate_downgrades_pass_when_required_and_no_screenshot(tmp_path):
     s = ReportSession(task="t", run_dir=tmp_path, quote="q", requires_screenshot=True)
     s.finish("pass", "done")

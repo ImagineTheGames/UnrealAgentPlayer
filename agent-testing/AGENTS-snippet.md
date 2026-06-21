@@ -7,6 +7,9 @@ and renders an HTML report.
 
 - A verification is NOT complete until `uap report finish` emits a report at
   `~/.uap-reports/<ts>/index.html`. Cite the path.
+- A passing report REQUIRES an attached screenshot by default -- `report finish pass` with none
+  auto-downgrades to FAIL. Capture with `uap screenshot <abs.png>`. (Opt out for a genuinely
+  headless check with `report start --no-require-screenshot`.)
 - Never conclude a behavior "works" from a screenshot alone. Read concrete state -- a
   project test helper (`uap rc CallTestHelper`), an actor/anim property, an anim-bone
   delta across two samples, or a log line. A non-zero speed with a frozen bone is a FAIL.
