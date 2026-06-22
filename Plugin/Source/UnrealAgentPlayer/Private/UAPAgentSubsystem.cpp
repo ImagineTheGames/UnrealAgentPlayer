@@ -5,6 +5,7 @@
 #include "AgentRemoteControlBootstrap.h"
 #include "Editor.h"
 #include "LevelEditorSubsystem.h"
+#include "PlayInEditorDataTypes.h"
 #include "HAL/PlatformTime.h"
 #include "Engine/Engine.h"
 #include "Engine/World.h"
@@ -28,6 +29,9 @@
 #include "HAL/IConsoleManager.h"
 #include "Framework/Application/SlateApplication.h"
 #include "Widgets/SWindow.h"
+#include "Widgets/SViewport.h"
+#include "Engine/GameViewportClient.h"
+#include "ImageUtils.h"
 #include "GenericPlatform/GenericWindow.h"
 #if PLATFORM_WINDOWS
 #include "Windows/AllowWindowsPlatformTypes.h"
@@ -191,9 +195,20 @@ bool UUAPAgentSubsystem::StartPIE()
 {
     if (!GEditor) { return false; }
     ULevelEditorSubsystem* LES = GEditor->GetEditorSubsystem<ULevelEditorSubsystem>();
-    if (!LES) { return false; }
-    if (LES->IsInPlayInEditor()) { return true; }
-    LES->EditorRequestBeginPlay();   // PIE starts asynchronously; caller polls IsInPIE().
+    if (LES && LES->IsInPlayInEditor()) { return true; }
+
+    // Launch PIE in its OWN floating window. We deliberately leave DestinationSlateViewport
+    // UNSET: that makes the editor spawn a standalone top-level PIE window instead of playing
+    // embedded inside a level-viewport tab. A top-level window can't be hidden behind an
+    // asset-editor tab, so screenshot capture of the game viewport stays reliable even when
+    // an agent opens a Blueprint/asset editor mid-test. (Embedded PIE shares the main editor
+    // window; opening a WBP there occludes the viewport tab -> the capture would grab the
+    // Blueprint editor instead of the game. That was the fumble we are eliminating.)
+    FRequestPlaySessionParams Params;
+    Params.SessionDestination = EPlaySessionDestinationType::InProcess;
+    Params.WorldType = EPlaySessionWorldType::PlayInEditor;
+    // (DestinationSlateViewport intentionally not set -> new PIE window.)
+    GEditor->RequestPlaySession(Params);   // queued; the editor tick starts it. Caller polls IsInPIE().
     return true;
 }
 
@@ -384,13 +399,49 @@ bool UUAPAgentSubsystem::CaptureViewportWithUI(FString Filename)
         CVar->Set(0, ECVF_SetByCode);
     }
 
-    // bShowUI=true reads back the composited backbuffer (3D scene + UMG/Slate), unlike
-    // HighResShot (scene only). The filename overload reliably processes the request
-    // in-editor and writes the PNG on the next rendered frame; the caller polls for it.
-    // NOTE: in embedded PIE the backbuffer is the whole editor window, so the shot
-    // includes editor chrome around the game viewport. Cropping to just the viewport is
-    // a known follow-up (best done in the MCP layer to avoid engine screenshot-timing
-    // fragility).
+    // Preferred path: target the PIE game viewport's Slate widget directly and draw ITS
+    // window -- NOT whatever window/tab happens to be in the foreground. This makes the
+    // capture immune to an agent opening a Blueprint/asset editor mid-test (which would
+    // otherwise steal the active surface and get captured instead of the game), and it
+    // crops to just the game view (no editor chrome). TakeScreenshot composites 3D + UMG
+    // + Slate (like bShowUI) and fills the bitmap synchronously, so the PNG exists on
+    // return -- no next-frame polling race.
+    TSharedPtr<SViewport> ViewportWidget;
+    if (GEngine)
+    {
+        for (const FWorldContext& Ctx : GEngine->GetWorldContexts())
+        {
+            if (Ctx.WorldType == EWorldType::PIE && Ctx.GameViewport)
+            {
+                ViewportWidget = Ctx.GameViewport->GetGameViewportWidget();
+                if (ViewportWidget.IsValid()) { break; }
+            }
+        }
+    }
+
+    if (ViewportWidget.IsValid() && FSlateApplication::IsInitialized())
+    {
+        TArray<FColor> Bitmap;
+        FIntVector Size(0, 0, 0);
+        if (FSlateApplication::Get().TakeScreenshot(ViewportWidget.ToSharedRef(), Bitmap, Size)
+            && Size.X > 0 && Size.Y > 0 && Bitmap.Num() >= Size.X * Size.Y)
+        {
+            // Slate readback leaves alpha at the framebuffer value (often 0); force opaque
+            // so the saved PNG is not fully transparent.
+            for (FColor& Px : Bitmap) { Px.A = 255; }
+
+            const FImageView Img(Bitmap.GetData(), Size.X, Size.Y);
+            if (FImageUtils::SaveImageByExtension(*Filename, Img))
+            {
+                return true;
+            }
+        }
+        // Fall through to the legacy path on any failure above.
+    }
+
+    // Fallback (no live PIE game viewport -- e.g. an idle editor showing only the level
+    // view): the foreground-window composited backbuffer. bShowUI=true keeps UMG/Slate,
+    // unlike HighResShot. The PNG lands on the next rendered frame; the caller polls for it.
     FScreenshotRequest::RequestScreenshot(Filename, /*bShowUI=*/true, /*bAddUniqueSuffix=*/false);
     return true;
 }
