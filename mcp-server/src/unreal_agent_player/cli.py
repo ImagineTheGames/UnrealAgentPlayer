@@ -558,6 +558,11 @@ COMMON MISTAKES (don't)
     project's uap.ps1 (it stamps the source editor). A shot of ANOTHER editor, or a manual attach
     of unknown origin, auto-FAILS the pass. And pixels aren't proof unless you read what they show
     (`uap read-ui`/state) and assert on it. Opt out (headless only): report start --no-require-screenshot.
+  * `uap exec` runs IN-PROCESS: a bad call can HARD-CRASH the editor (taking RC + your run down).
+    Known landmine: the engine's `DataTableFunctionLibrary.ExportDataTableToJSONString` check()-
+    crashes on some row-struct shapes (JsonWriter assert "Stack.Top() == EJson::Object"). To read a
+    DataTable, iterate rows -- `get_editor_property('row_names')` / row handles + per-row reads --
+    NEVER ExportDataTableToJSONString. Treat any whole-asset "...ToJSONString" exporter as unsafe.
 
 PREFLIGHT
   uap status                      liveness + plugin version + resolved RC port

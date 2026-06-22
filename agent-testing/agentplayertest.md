@@ -22,7 +22,9 @@ These are the errors agents make every time. Don't.
    `screenshot_viewport`.** `uap screenshot` reads the composited backbuffer (3D **+** UMG +
    CommonUI + custom Slate) -- HighResShot and most MCP shots capture the **3D scene only, no
    UI**. If your menu/HUD/globe is missing from a shot, you used the wrong tool, not "UI can't
-   be captured." (Embedded PIE includes editor chrome around the game view -- the UI is still there.)
+   be captured." (`uap pie start` plays in a dedicated PIE window and the capture targets the game
+   viewport widget, so the shot is cropped to the game -- no editor chrome -- and stays correct even
+   if you open a Blueprint/asset editor mid-test.)
 2. **Run via this project's `uap.ps1`** (it pins `UAP_PROJECT`). If you call the venv python
    directly without `--project`/`UAP_PROJECT`, you'll cross-target **another open editor** (e.g.
    start PIE in the wrong project).
@@ -39,6 +41,13 @@ These are the errors agents make every time. Don't.
    (`report finish pass` with no verified shot auto-downgrades to FAIL. Opt out only for a
    genuinely headless check: `report start --no-require-screenshot`.)
 6. **Discover verbs with `uap help`** -- do not reverse-engineer by dumping `dir()` on the subsystem.
+7. **`uap exec` runs IN-PROCESS -- a bad call HARD-CRASHES the editor** (kills RC + your run, not
+   just your command). Known landmine: the engine's
+   `DataTableFunctionLibrary.ExportDataTableToJSONString` `check()`-crashes on some row-struct
+   shapes (`JsonWriter` assert `Stack.Top() == EJson::Object`). **To read a DataTable, iterate
+   rows** (`get_editor_property('row_names')` / row handles + per-row property reads) -- **never**
+   `ExportDataTableToJSONString`. Treat any whole-asset `...ToJSONString` exporter as unsafe, and
+   prefer `blueprint-mcp` / asset-author tools for inspecting assets rather than runtime `exec`.
 
 ## The bridge is the `uap` CLI
 

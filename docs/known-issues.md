@@ -129,7 +129,35 @@ since different projects use different engines (custom fork vs stock UE) -- so t
 `game_launch` path spawns the right editor too. Verified: SchoolsOut -> IG_MetaEngine, PBW -> UE_5.7;
 RC SchoolsOut launcher -> 30079, PBW launcher -> 30035, each with no `--project`. Caller-set env wins.
 
+## 9. `uap screenshot` captured the wrong surface when an asset editor was open -- FIXED
+
+Was: `CaptureViewportWithUI` used `FScreenshotRequest`, which grabs whatever window/tab is in the
+FOREGROUND. Agents routinely open a Blueprint/WBP via `blueprint-mcp` mid-test; that tab comes to
+the front, and the screenshot captured the Blueprint editor (node graph) instead of the game --
+then "passed" on it. Embedded PIE made it worse: the game plays inside a level-viewport tab that an
+asset-editor tab can fully occlude.
+
+Fixed (two parts): (a) `CaptureViewportWithUI` now targets the PIE game viewport `SWidget` via
+`FSlateApplication::TakeScreenshot` -- it draws THAT widget's own window (not the foreground one),
+crops to the game view (no editor chrome), and writes the PNG synchronously. (b) `StartPIE` launches
+PIE in its OWN floating window (`FRequestPlaySessionParams` with `DestinationSlateViewport` unset),
+which can't be tab-occluded. Verified live in both editors: with a Blueprint editor open in front,
+the shot shows the game (SchoolsOut classroom + VR hands; PBW hangar), not the node graph.
+
+## 10. `uap exec` can hard-crash the editor (e.g. ExportDataTableToJSONString) -- GUIDANCE
+
+`uap exec` runs Python IN-PROCESS, so a bad call crashes the whole editor (taking RC + the run with
+it), not just the command. Observed in the wild: a Python call to the engine's
+`DataTableFunctionLibrary.ExportDataTableToJSONString` `check()`-crashed in the JSON writer
+(`Assertion failed: Stack.Top() == EJson::Object`, `JsonWriter.h:272`) -- the engine's DataTable
+JSON exporter trips on certain row-struct shapes. This is an engine bug, not a plugin one, but the
+plugin's exec path is how an agent hits it.
+
+Guidance (docs + `uap help`): to read a DataTable, iterate rows (`row_names` + per-row reads),
+never `ExportDataTableToJSONString`; treat any whole-asset `...ToJSONString` exporter as unsafe; and
+prefer asset-author tooling (`blueprint-mcp`) over runtime `exec` for inspecting assets.
+
 ## Status
 
-All eight resolved. 1 and 5 were doc fixes; 2, 3, 4 were code changes that retire the
-fragile-API and false-positive footguns (2 also removes the cause of 1).
+Items 1-9 resolved (1 and 5 doc fixes; 2, 3, 4, 7, 8, 9 code changes; 6 reporting). Item 10 is
+guidance only -- the crash is an engine-side DataTable-exporter bug surfaced through `exec`.
