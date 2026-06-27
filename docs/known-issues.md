@@ -113,6 +113,42 @@ Note: editors no longer keep 30010 -- each uses its per-project port (e.g. Schoo
 External RC tooling hardcoded to 30010 should read the per-project port (via `uap status --project`).
 Verified live on SchoolsOut (port 30079, RC reachable via `uap status --project SchoolsOut`).
 
+UPDATE (#11 supersedes the rebind half of this): the runtime *rebind* above had a flaw -- see #11.
+
+## 11. Runtime RC rebind left a leftover listener -> ports tangled between editors -- FIXED
+
+Was: the deterministic rebind from #7 happens AFTER WebRemoteControl has already auto-bound a
+port at startup. The rebind goes through `URemoteControlSettings::OnSettingChanged`, and the
+engine's HTTP server (`FHttpServerModule`) caches a listener per port and **never releases the
+original** -- so every editor ended up serving on TWO ports: its per-project port (30079/30035)
+PLUS a leftover default-range one (30010/30020). The leftover floated to whichever editor booted
+first, so a bare `:30010` (or a stale cache) cross-targeted the wrong editor. Proven via netstat:
+one editor listening on 30010 + 30020 + 30079 at once.
+
+Fixed (config pin, no rebind):
+- Each project pins its RC HTTP port in `Config/DefaultRemoteControl.ini` under the **UE5.7**
+  section `[/Script/RemoteControlCommon.RemoteControlSettings]` (the pre-5.7
+  `[/Script/RemoteControl.RemoteControlSettings]` section is IGNORED -- the class moved modules;
+  a stale ini using it silently does nothing, which is why an earlier 30011 pin never applied):
+
+      [/Script/RemoteControlCommon.RemoteControlSettings]
+      RemoteControlHttpServerPort=30079    ; SchoolsOut (PBW uses 30035)
+
+  WebRemoteControl now binds the pinned port at startup -- never the default 30010, so there is
+  no startup-port listener to leak.
+- `EnsureRCPortBound` now RESPECTS an already-bound configured non-default port (returns without
+  rebinding), so the leak-on-rebind never triggers. The deterministic auto-assign remains only as
+  a fallback for projects WITHOUT a pin (still on the default 30010).
+
+Result: exactly ONE RC HTTP port per editor, boot-order irrelevant. Verified live: SchoolsOut
+binds only 30079 (no 30010), `uap status` -> `rc_port: 30079`. (The separate RC *WebSocket* port,
+default 30020, is unrelated -- the `uap` CLI uses HTTP only; pin
+`RemoteControlWebSocketServerPort` per project too if you want netstat fully de-duped.)
+
+ADOPTING THE PLUGIN IN A NEW PROJECT: add the `Config/DefaultRemoteControl.ini` pin above with a
+port unique to that project (the old `30011 + crc32(name)%80` value is a fine choice; or any free
+3001x-3008x port). Without a pin the editor falls back to the leaky default-port path.
+
 ## 8. CLI default target cross-targeted the wrong editor -- FIXED
 
 Was: the `uap` CLI hardcoded `--project` defaults to "SchoolsOut" (and `tools/game.py` defaulted
@@ -159,5 +195,6 @@ prefer asset-author tooling (`blueprint-mcp`) over runtime `exec` for inspecting
 
 ## Status
 
-Items 1-9 resolved (1 and 5 doc fixes; 2, 3, 4, 7, 8, 9 code changes; 6 reporting). Item 10 is
-guidance only -- the crash is an engine-side DataTable-exporter bug surfaced through `exec`.
+Items 1-9, 11 resolved (1 and 5 doc fixes; 2, 3, 4, 7, 8, 9 code changes; 6 reporting; 11 config
+pin + code change, superseding the rebind half of 7). Item 10 is guidance only -- the crash is an
+engine-side DataTable-exporter bug surfaced through `exec`.

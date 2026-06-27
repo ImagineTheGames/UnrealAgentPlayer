@@ -84,6 +84,29 @@ void FUnrealAgentPlayerRuntimeModule::ShutdownModule()
 void FUnrealAgentPlayerRuntimeModule::EnsureRCPortBound()
 {
     RCPortTickerHandle.Reset();
+
+    // If a non-default RC port is already configured (pinned per-project in
+    // Config/DefaultRemoteControl.ini under [/Script/RemoteControlCommon.RemoteControlSettings])
+    // AND WebRemoteControl already bound it, leave it ALONE -- do not rebind.
+    //
+    // Why: a rebind goes through OnSettingChanged, and the engine's HTTP server starts the new
+    // listener WITHOUT releasing the old one (it caches listeners per port). So ANY rebind leaves
+    // the editor serving on TWO ports; the leftover one floats between editors by boot order and
+    // cross-targets agent commands. Pinning the port in config makes WebRemoteControl bind the
+    // right port at startup (never the default 30010), and respecting that bind here keeps exactly
+    // ONE port per editor -- the actual fix for the multi-bind tangle. We only auto-assign below
+    // when still on the default port (i.e. no per-project pin).
+    if (const URemoteControlSettings* RCSettings = GetDefault<URemoteControlSettings>())
+    {
+        const int32 Configured = (int32)RCSettings->RemoteControlHttpServerPort;
+        if (Configured != 30010 && ProbeFreePort(Configured, Configured) != Configured)
+        {
+            UE_LOG(LogUAPRuntime, Log,
+                TEXT("RC HTTP port %d already bound from config; leaving it (no rebind)."), Configured);
+            return;
+        }
+    }
+
     // We cannot trust IWebRemoteControlModule::IsHttpServerRunning() -- it returns true even
     // when the socket bind failed because another editor holds the port. So instead of trying
     // to DETECT a conflict, we AVOID one: pick a deterministic base port per project (different
