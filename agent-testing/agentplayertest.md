@@ -158,10 +158,12 @@ State the concrete pass condition before running. A non-zero speed with a frozen
    called against an idle editor viewport it writes no file and reports `exists:false`; treat
    that as a failure to capture, not a pass. On a fail, gather log lines and put the hypothesis
    in the summary.
-9. **Stop PIE**: `uap pie stop`.
-   Then `uap report finish pass|fail "<summary>"` -> prints the `index.html` path; renders +
-   opens the report. A `pass` with no attached screenshot comes back as
+9. **Finish**: `uap report finish pass|fail "<summary>"` -> prints the `index.html` path; renders +
+   opens the report. It **auto-stops PIE** for you (a finished test never leaves the editor stuck
+   in Play-In-Editor; response includes `pie_stopped`; pass `--keep-pie` only if you deliberately
+   want to keep inspecting the running game). A `pass` with no attached screenshot comes back as
    `verdict: fail, downgraded: true` -- that is the gate doing its job; attach a screenshot first.
+   (You can still `uap pie stop` earlier if you want the editor idle before finishing.)
 10. **Report back**: verdict, the read-back numbers, and the report path. State failures plainly.
 
 ## A verification is not done until the report exists

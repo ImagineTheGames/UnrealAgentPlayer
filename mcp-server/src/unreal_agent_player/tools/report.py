@@ -58,6 +58,21 @@ async def report_finish(*, rc: Any = None, py_exec: Any = None,
         return error_response(ErrorCode.SCHEMA_VALIDATION,
                               f"verdict must be 'pass' or 'fail', got {verdict!r}",
                               recoverable=False)
+
+    # Clean up the editor: a finished test must not leave PIE running forever. Stop PIE if it
+    # is still live (best-effort; a failure here must never block rendering the report).
+    pie_stopped = False
+    if rc is not None and py_exec is not None:
+        try:
+            from unreal_agent_player.tools import pie as _pie
+            st = await _pie.pie_status(rc=rc, py_exec=py_exec)
+            if st.get("phase") not in (None, "NotPlaying"):
+                await _pie.pie_stop(rc=rc, py_exec=py_exec)
+                s.add_note("PIE auto-stopped on report finish.")
+                pie_stopped = True
+        except Exception:
+            pass  # editor gone / RC unreachable -- still render the report
+
     s.finish(verdict, summary)
     html_path = s.run_dir / "index.html"
     try:
@@ -68,4 +83,5 @@ async def report_finish(*, rc: Any = None, py_exec: Any = None,
         return ok_response({"run_dir": str(s.run_dir), "html": None,
                             "warning": f"render/open failed: {exc}"})
     sess.clear_active()
-    return ok_response({"run_dir": str(s.run_dir), "html": str(html_path), "opened": opened})
+    return ok_response({"run_dir": str(s.run_dir), "html": str(html_path), "opened": opened,
+                        "pie_stopped": pie_stopped})

@@ -151,6 +151,26 @@ def _report_finish(args) -> int:
     s = _require_active()
     if s is None:
         return 2
+
+    # Clean up the editor: a finished test must not leave PIE running forever. Stop PIE if
+    # it is still live (idempotent, best-effort -- a failure here must never block rendering
+    # the report). Targets the report's own project so we stop the right editor. Opt out with
+    # --keep-pie for the rare case you want to keep inspecting the running game after finish.
+    pie_stopped = False
+    if not getattr(args, "keep_pie", False):
+        proj = getattr(s, "project", None) or None
+        try:
+            if bool(_rc_call("IsInPIE", {}, proj)):
+                _rc_call("StopPIE", {}, proj)
+                pie_stopped = True
+        except Exception:
+            pass  # editor gone / RC unreachable -- nothing to stop, still render the report
+        if pie_stopped:
+            try:
+                s.add_note("PIE auto-stopped on report finish.")
+            except Exception:
+                pass
+
     s.finish(args.verdict, args.summary)
     html_path = s.run_dir / "index.html"
     try:
@@ -166,7 +186,7 @@ def _report_finish(args) -> int:
         except Exception:
             pass
     out = {"ok": True, "html": str(html_path), "verdict": s.status,
-           "downgraded": s.status != args.verdict}
+           "downgraded": s.status != args.verdict, "pie_stopped": pie_stopped}
     if not s.env:
         out["warning"] = ("no diagnostics in report (env empty) -- run `uap report diag` "
                           "after `report start` to capture editor version/level/PIE state")
@@ -572,7 +592,7 @@ REPORT (a verification is NOT done until `report finish` emits the HTML report; 
   uap report start "<question>" [--no-require-screenshot]   # screenshot REQUIRED for pass by default
   uap report assert "<label>" pass|fail "<evidence>"
   uap report note "<text>"
-  uap report finish pass|fail "<summary>"   # pass with NO screenshot auto-downgrades to FAIL
+  uap report finish pass|fail "<summary>"   # pass w/o screenshot -> FAIL; also auto-stops PIE (--keep-pie to skip)
   -> attach proof: `uap screenshot <abs.png>` (auto-attaches), or `uap report screenshot <file>`
 
 PLAY-IN-EDITOR
@@ -669,6 +689,9 @@ def build_parser() -> argparse.ArgumentParser:
     rf = rep.add_parser("finish")
     rf.add_argument("verdict", choices=["pass", "fail"])
     rf.add_argument("summary")
+    rf.add_argument("--keep-pie", action="store_true",
+                    help="do not auto-stop PIE on finish (default: stop it so a finished test "
+                         "never leaves the editor stuck in Play-In-Editor)")
     rf.set_defaults(func=_report_finish)
 
     st = sub.add_parser("status", parents=[proj])
