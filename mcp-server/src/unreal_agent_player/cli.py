@@ -14,6 +14,7 @@ from unreal_agent_player.reporting import session as sess
 from unreal_agent_player.reporting.render import render
 from unreal_agent_player.transport import RemoteControlClient, PythonRemoteExecClient
 from unreal_agent_player.errors import AgentError
+from unreal_agent_player import coordination as _coord
 
 
 def _load_active() -> "sess.ReportSession | None":
@@ -578,6 +579,14 @@ COMMON MISTAKES (don't)
     project's uap.ps1 (it stamps the source editor). A shot of ANOTHER editor, or a manual attach
     of unknown origin, auto-FAILS the pass. And pixels aren't proof unless you read what they show
     (`uap read-ui`/state) and assert on it. Opt out (headless only): report start --no-require-screenshot.
+  * NEVER tight-loop `uap exec` / RC while PIE is still initializing or transitioning -- Python
+    remote-exec runs on the GAME THREAD and re-enters the engine task graph, HARD-CRASHING the editor
+    (`RecursionGuard`, TaskGraph.cpp). Wait for PIE via the OS window (title has the project + "Preview")
+    + a short settle delay, THEN exec/inject. Do NOT poll get_game_world() in a loop during startup.
+  * Multiple agents share ONE editor. Rebuild ONLY via Restart-Editor.ps1 (it takes the exclusive
+    lease); never kill/msbuild the editor by hand. `uap` editor ops auto-WAIT through another agent's
+    rebuild (they block then resume -- a slow call is not an error). Hold PIE/level across calls with
+    `uap lease acquire exclusive --reason pie --agent <tok>` ... `uap lease release --agent <tok>`.
   * `uap exec` runs IN-PROCESS: a bad call can HARD-CRASH the editor (taking RC + your run down).
     Known landmine: the engine's `DataTableFunctionLibrary.ExportDataTableToJSONString` check()-
     crashes on some row-struct shapes (JsonWriter assert "Stack.Top() == EJson::Object"). To read a
@@ -599,6 +608,13 @@ PLAY-IN-EDITOR
   uap pie start                   start PIE (version-correct; do NOT use PlayWorldEditorSubsystem)
   uap pie wait <seconds>          block until the game world is live
   uap pie stop
+
+MULTI-AGENT COORDINATION (several agents sharing one editor; see docs/agent-coordination.md)
+  Rebuild ONLY via Restart-Editor.ps1 -- it self-locks; never bounce the editor by hand.
+  Editor-touching verbs auto-wait through another agent's rebuild (block then resume, not fail).
+  uap lease status                          who holds the editor + why
+  uap lease acquire exclusive --reason pie --agent <tok> [--wait 900]   # hold PIE/level across calls
+  uap lease release --agent <tok>           # ...then release (pass the SAME token every call)
 
 DRIVE + OBSERVE
   uap rc <Func> [key=value ...]   call a plugin UFUNCTION (input injection lives here)
@@ -635,6 +651,28 @@ Per-verb flags: uap <verb> --help
 def _help(args) -> int:
     print(_HELP_CATALOG)
     return 0
+
+
+# Editor-touching verbs auto-wait while another agent is rebuilding this editor (see main()).
+_REBUILD_GUARDED = {"status", "rc", "exec", "exec-file", "pie",
+                    "read-ui", "click", "tab", "nav", "screenshot"}
+
+
+def _lease(args) -> int:
+    """Multi-agent coordination lease for a shared editor. See docs/agent-coordination.md."""
+    proj = getattr(args, "project", "") or _env_project()
+    cmd = args.lease_cmd
+    if cmd == "acquire":
+        res = _coord.acquire(proj, args.mode, reason=args.reason, agent=args.agent,
+                             pid=args.pid, wait=args.wait, ttl=args.ttl)
+    elif cmd == "release":
+        res = _coord.release(proj, agent=args.agent)
+    elif cmd == "heartbeat":
+        res = _coord.heartbeat(proj, agent=args.agent)
+    else:  # status
+        res = _coord.status(proj)
+    _emit(res)
+    return 0 if res.get("ok", True) else 1
 
 
 def _env_project() -> str:
@@ -732,11 +770,50 @@ def build_parser() -> argparse.ArgumentParser:
     sc.add_argument("file")
     sc.add_argument("--caption", default="")
     sc.set_defaults(func=_screenshot)
+
+    # Multi-agent coordination: a per-editor lease so agents take turns instead of stepping on
+    # each other. See docs/agent-coordination.md. Editor-touching verbs auto-wait through a
+    # rebuild (main()); these verbs are for explicit exclusive holds (PIE/level) + inspection.
+    lz = sub.add_parser("lease", help="editor coordination lease (multi-agent turn-taking)")
+    lzs = lz.add_subparsers(dest="lease_cmd", required=True)
+    la = lzs.add_parser("acquire", parents=[proj],
+                        help="block until an exclusive|shared lease is free, then take it")
+    la.add_argument("mode", choices=["exclusive", "shared"])
+    la.add_argument("--reason", default="",
+                    help="rebuild|pie|level|... (rebuild* makes other agents' ops auto-wait)")
+    la.add_argument("--agent", default=None,
+                    help="stable token; REQUIRED for a hold spanning multiple calls (no reliable "
+                         "auto-id in this harness). A whole-command hold can omit it.")
+    # Default 0 (TTL-only): a standalone `lease acquire` process exits immediately, so anchoring
+    # liveness to it would evict the lease the instant the command returns. Pass --pid <PID> of a
+    # long-lived process (e.g. a rebuild script's $PID) to have PID-death reclaim it sooner.
+    la.add_argument("--pid", type=int, default=0,
+                    help="liveness-anchor PID (default 0 = TTL-only, correct for a cross-call hold; "
+                         "pass a long-lived process's PID to also reclaim on its death)")
+    la.add_argument("--wait", type=float, default=_coord.DEFAULT_WAIT_CAP,
+                    help="max seconds to block before returning busy (default 900)")
+    la.add_argument("--ttl", type=int, default=None)
+    la.set_defaults(func=_lease)
+    lr = lzs.add_parser("release", parents=[proj])
+    lr.add_argument("--agent", default=None)
+    lr.set_defaults(func=_lease)
+    lh = lzs.add_parser("heartbeat", parents=[proj])
+    lh.add_argument("--agent", default=None)
+    lh.set_defaults(func=_lease)
+    lzs.add_parser("status", parents=[proj]).set_defaults(func=_lease)
     return p
 
 
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
+    # Coordination: if another agent is rebuilding this editor (it's down), wait it out instead of
+    # hard-failing, then proceed against the relaunched editor. Fail-open; only editor-touching
+    # verbs are guarded (lease/report verbs manage or don't need the editor).
+    if getattr(args, "cmd", None) in _REBUILD_GUARDED:
+        try:
+            _coord.wait_while_rebuild(getattr(args, "project", "") or _env_project())
+        except Exception:
+            pass
     return args.func(args)
 
 

@@ -193,8 +193,44 @@ Guidance (docs + `uap help`): to read a DataTable, iterate rows (`row_names` + p
 never `ExportDataTableToJSONString`; treat any whole-asset `...ToJSONString` exporter as unsafe; and
 prefer asset-author tooling (`blueprint-mcp`) over runtime `exec` for inspecting assets.
 
+## 12. Tight-looping `uap exec` during PIE startup hard-crashes the editor -- GUIDANCE
+
+Observed in the wild (burned 3+ editor restarts before it was pinned): polling `uap exec` (Python
+remote-exec) in a tight loop -- e.g. the "poll `get_game_world()` until ready" recipe -- WHILE PIE
+is still initializing crashes the editor with:
+
+    Assertion failed: ++Queue(QueueIndex).RecursionGuard == 1  [TaskGraph.cpp:689]
+
+Root cause: Python remote-exec runs ON THE GAME THREAD. Calling it repeatedly while PIE is mid-init
+re-enters an engine task graph that is already running -> the recursion guard trips -> hard crash.
+(This is the same assert earlier mis-attributed to an "EOS teardown race"; the real trigger is
+game-thread re-entrancy during a PIE transition.)
+
+Guidance: do NOT exec-poll during PIE startup/teardown. Wait for PIE by watching for the OS window
+whose title contains the project name + "Preview", add a short settle delay, THEN start exec /
+injecting input. A window-based wait never touches the game thread. `uap pie wait` should likewise
+prefer a window-based signal over game-thread polling (follow-up). Reflected in `uap help`, the
+/AgentPlayerTest common-mistakes block, and each project's AGENTS.md/CLAUDE.md.
+
+## 13. Multiple agents on one editor stepped on each other / hard-failed -- FIXED
+
+Was: several agents share ONE editor per project (one level, one PIE, and a rebuild takes it down).
+An agent using `uap` while another rebuilt would hard-fail and stop, needing a human to say "editor
+is free now"; two agents both wanting PIE / a rebuild collided.
+
+Fixed: a per-project lease (`coordination.py`, file at `<reports>/.leases/<project>.json`, atomic via
+an O_EXCL lockfile). Model: shared reads + one exclusive writer; acquire blocks (polls) until free,
+evicting holders whose PID is dead OR whose heartbeat is stale (crash-safe). `Restart-Editor.ps1`
+takes `exclusive(rebuild)` anchored to its own PID (reclaimed on exit) before touching the editor, so
+a DIRECT script call coordinates too. Every editor-touching `uap` verb auto-waits through a rebuild
+(identity-free `wait_while_rebuild`, fail-open). Holding PIE/level across calls is explicit
+(`uap lease acquire exclusive --reason pie --agent <tok>` ... `release`), because this harness has NO
+stable per-agent id (verified: `$PPID` is a shared `1`, shell PID changes every call) -- so a
+standalone `lease acquire` is TTL-only (`--pid 0`) and needs a consistent `--agent` token. Rule lives
+in each project's AGENTS.md/CLAUDE.md. Full design: `docs/agent-coordination.md`.
+
 ## Status
 
-Items 1-9, 11 resolved (1 and 5 doc fixes; 2, 3, 4, 7, 8, 9 code changes; 6 reporting; 11 config
-pin + code change, superseding the rebind half of 7). Item 10 is guidance only -- the crash is an
-engine-side DataTable-exporter bug surfaced through `exec`.
+Items 1-9, 11, 13 resolved (1 and 5 doc fixes; 2, 3, 4, 7, 8, 9 code changes; 6 reporting; 11 config
+pin; 13 coordination lease). Items 10 and 12 are guidance -- both are engine-side crashes surfaced
+through `exec` (a DataTable exporter bug; game-thread re-entrancy during PIE transitions).
