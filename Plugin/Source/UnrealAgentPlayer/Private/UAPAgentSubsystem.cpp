@@ -7,6 +7,7 @@
 #include "LevelEditorSubsystem.h"
 #include "PlayInEditorDataTypes.h"
 #include "HAL/PlatformTime.h"
+#include "DynamicRHI.h"
 #include "Engine/Engine.h"
 #include "Engine/World.h"
 #include "GameFramework/PlayerController.h"
@@ -536,9 +537,11 @@ FString UUAPAgentSubsystem::GetStatGroupText(FString GroupName)
 {
     if (!GEngine) { return TEXT(""); }
 
-    // GRenderThreadTime / GGPUFrameTime are platform cycle counts updated each frame.
+    // GRenderThreadTime and RHIGetGPUFrameCycles() are platform cycle counts updated each frame.
+    // GGPUFrameTime was deprecated in UE 5.6 and removed in 5.8; RHIGetGPUFrameCycles() replaces it
+    // and exists from 5.6 on, so this one call is correct on 5.6, 5.7, the Meta 5.7 fork, and 5.8.
     const double RenderMs = FPlatformTime::ToMilliseconds(GRenderThreadTime);
-    const double GpuMs    = FPlatformTime::ToMilliseconds(GGPUFrameTime);
+    const double GpuMs    = FPlatformTime::ToMilliseconds(RHIGetGPUFrameCycles());
 
     if (GroupName == TEXT("unit"))
     {

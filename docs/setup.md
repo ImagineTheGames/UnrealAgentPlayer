@@ -2,7 +2,7 @@
 
 ## Prerequisites
 
-- Windows 10/11, UE 5.6, 5.7, or Meta 5.7 fork
+- Windows 10/11, UE 5.6, 5.7, 5.8, or Meta 5.7 fork
 - Python 3.11+
 - MCP client (Claude Code CLI, Claude Desktop, Cursor)
 

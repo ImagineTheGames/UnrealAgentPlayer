@@ -1,7 +1,8 @@
-# Known issues (UE 5.7, plugin v0.0.1)
+# Known issues (UE 5.7 / 5.8, plugin v0.0.1)
 
-Field findings from driving agent tests on UE 5.7. Each entry has a concrete repro and a
+Field findings from driving agent tests on UE 5.7 and 5.8. Each entry has a concrete repro and a
 status. "Fixed" means corrected in this repo; "Open" means it still needs a code change.
+Entries written against 5.7 were re-verified on 5.8 unless noted.
 
 ## What works well
 
@@ -229,8 +230,27 @@ stable per-agent id (verified: `$PPID` is a shared `1`, shell PID changes every 
 standalone `lease acquire` is TTL-only (`--pid 0`) and needs a consistent `--agent` token. Rule lives
 in each project's AGENTS.md/CLAUDE.md. Full design: `docs/agent-coordination.md`.
 
+## 14. `GGPUFrameTime` removed in UE 5.8 -> plugin failed to compile -- FIXED
+
+`UUAPAgentSubsystem::GetStatGroupText` read the RHI global `GGPUFrameTime` for the GPU timing it
+reports through `uap report diag`. That global was deprecated in 5.6 (`UE_DEPRECATED(5.6, "Direct
+use of GGPUFrameTime is deprecated. Call the global scope RHIGetGPUFrameCycles() function
+instead.")`) and **removed outright in 5.8** -- it is gone from `Runtime/RHI/Public/RHIGlobals.h`.
+On 5.8 the module does not build.
+
+Fixed: call `RHIGetGPUFrameCycles()` (declared in `Runtime/RHI/Public/DynamicRHI.h`, so the file
+now includes `DynamicRHI.h`). Verified present on stock 5.7, stock 5.8, and the Meta 5.7.3 fork,
+and it is the documented replacement from 5.6 on -- so the single call is correct on every engine
+this plugin supports. No `#if ENGINE_MINOR_VERSION` guard is needed, and on 5.7 it additionally
+silences the deprecation warning.
+
+Also dropped the unused `RemoteControlWebInterface` plugin dependency from `UnrealAgentPlayer.uplugin`.
+The HTTP server the plugin actually needs is the `WebRemoteControl` *module*, which ships inside the
+**RemoteControl** plugin (confirmed on 5.7, 5.8, and the Meta fork); `RemoteControlWebInterface` is a
+separate plugin providing the browser UI, which this plugin never uses.
+
 ## Status
 
-Items 1-9, 11, 13 resolved (1 and 5 doc fixes; 2, 3, 4, 7, 8, 9 code changes; 6 reporting; 11 config
-pin; 13 coordination lease). Items 10 and 12 are guidance -- both are engine-side crashes surfaced
-through `exec` (a DataTable exporter bug; game-thread re-entrancy during PIE transitions).
+Items 1-9, 11, 13, 14 resolved (1 and 5 doc fixes; 2, 3, 4, 7, 8, 9, 14 code changes; 6 reporting;
+11 config pin; 13 coordination lease). Items 10 and 12 are guidance -- both are engine-side crashes
+surfaced through `exec` (a DataTable exporter bug; game-thread re-entrancy during PIE transitions).

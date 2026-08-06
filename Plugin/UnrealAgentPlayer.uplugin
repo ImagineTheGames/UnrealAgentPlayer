@@ -30,9 +30,8 @@
     }
   ],
   "Plugins": [
-    { "Name": "RemoteControl",             "Enabled": true },
-    { "Name": "RemoteControlWebInterface", "Enabled": true },
-    { "Name": "PythonScriptPlugin",        "Enabled": true },
-    { "Name": "CommonUI",                  "Enabled": true }
+    { "Name": "RemoteControl",      "Enabled": true },
+    { "Name": "PythonScriptPlugin", "Enabled": true },
+    { "Name": "CommonUI",           "Enabled": true }
   ]
 }

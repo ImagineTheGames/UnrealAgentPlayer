@@ -7,7 +7,7 @@ UnrealAgentPlayer is a thin C++ editor plugin plus an external Python [MCP](http
 - **Plugin** (`Plugin/`): a `UEditorSubsystem` that exposes a handful of `UFUNCTION`s to UE's built-in Remote Control, plus log capture, input injection, a fake motion-controller modular feature, and Blueprint test-helper discovery.
 - **MCP server** (`mcp-server/`): a stdio MCP server that talks to the editor over Remote Control HTTP and Python Remote Execution, and presents ~30 agent-facing tools across 12 families. The Python layer grows new tools without recompiling the engine.
 
-Supports UE 5.6, 5.7, and the Meta 5.7 fork. **Windows editor only** (see [Platform support](#platform-support)).
+Supports UE 5.6, 5.7, 5.8, and the Meta 5.7 fork. **Windows editor only** (see [Platform support](#platform-support)).
 
 > **Status:** Functional and runtime-proven on real projects (see [Proven](#whats-proven-vs-known-gaps)). Versioned `0.0.1`; API may still change.
 
