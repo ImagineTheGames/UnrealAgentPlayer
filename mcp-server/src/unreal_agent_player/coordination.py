@@ -26,8 +26,15 @@ POLL_SECONDS = 2.0
 DEFAULT_WAIT_CAP = 900          # 15 min -- covers a full rebuild
 _FILELOCK_TIMEOUT = 10.0
 _FILELOCK_STALE = 30.0
-# Generous TTLs so the common case never needs manual heartbeating; PID-liveness reclaims sooner.
-_TTL_BY_REASON = {"rebuild": 1200, "pie": 1200, "level": 1200, "read": 120}
+# TTL is "how long after the holder's LAST uap call before the lease is reclaimed" -- every
+# editor op by the holder heartbeats it (see cli.main), so an actively-working agent keeps its
+# hold indefinitely without manual heartbeating.
+#
+# pie/level are deliberately shorter than rebuild. Now that the exclusive lease actually blocks
+# other agents, an abandoned hold is far more damaging than it was when the lease was advisory:
+# at 1200 it wedged every other agent for 20 minutes. rebuild stays long because a rebuild
+# legitimately runs many minutes with no uap calls at all (the editor is down).
+_TTL_BY_REASON = {"rebuild": 1200, "pie": 600, "level": 600, "read": 120}
 _DEFAULT_TTL = 600
 
 

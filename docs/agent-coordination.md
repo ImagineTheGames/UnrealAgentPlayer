@@ -84,16 +84,29 @@ stable per-agent id (see above). So v1 splits into automatic and opt-in:
   `nav`/`screenshot`) calls `wait_while_rebuild` first: if a rebuild is in progress it BLOCKS until
   the editor is back, then proceeds. Identity-free (keys on the lease's `reason`, not who holds it).
   Fail-open, so a coordination bug can never brick `uap`.
+- Those same verbs (minus `status`) then call `wait_if_blocked`: if ANOTHER agent holds the
+  exclusive lease -- for any reason, not just `rebuild` -- the op waits for it, and on timeout
+  returns `{"ok":false,"busy":true,"blocked_by":...}` with exit 1 instead of running. `status` is
+  exempt on purpose: it is the health probe you reach for while diagnosing a stuck editor.
+
+  > This is what makes the lease a lock rather than a sticky note. Until 2026-08, `wait_if_blocked`
+  > existed but had **no callers**, so only `reason=rebuild*` blocked anything -- `--reason pie`
+  > recorded a holder that nothing consulted, and other agents swapped levels and started PIE
+  > straight through a held lease.
 
 **Explicit (opt-in, needs a consistent `--agent` token):**
 - `uap lease acquire exclusive --reason pie|level:<path> --agent <tok> --wait 900` ... `uap lease
   release --agent <tok>` -- for holding PIE / a specific level across several calls so another agent
   serializes behind you. `uap lease status` shows contention; `uap lease heartbeat --agent <tok>`
   extends a long hold.
+- **Carry that same token on your editor ops** (`--agent <tok>`, or export `UAP_AGENT_ID=<tok>`),
+  or your own exclusive lease will block you. There is no reliable auto-identity in this harness,
+  so an unidentified call is indistinguishable from a stranger's.
 
-Generous TTLs (rebuild/pie/level 20 min, reads 2 min) + PID-death eviction mean the common case
-needs no manual heartbeating. A future version can auto-lease PIE if the harness ever exposes a
-stable agent id.
+TTL is "time since the holder's last `uap` call": every editor op by the holder heartbeats its own
+lease, so an actively-working agent never needs manual heartbeating, while an abandoned hold ages
+out (pie/level 10 min, rebuild 20 min, reads 2 min) and PID-death evicts sooner where anchored.
+`uap lease status` names the holder; `uap lease release --agent <tok>` breaks an abandoned one.
 
 ## Non-goals
 

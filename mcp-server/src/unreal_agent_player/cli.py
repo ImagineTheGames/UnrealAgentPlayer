@@ -657,6 +657,11 @@ def _help(args) -> int:
 _REBUILD_GUARDED = {"status", "rc", "exec", "exec-file", "pie",
                     "read-ui", "click", "tab", "nav", "screenshot"}
 
+# ...and additionally wait out ANY other agent's exclusive lease (pie / level / rebuild).
+# `status` is deliberately exempt: it is the health probe you reach for WHILE diagnosing a
+# stuck editor, so it must always answer instead of blocking behind the thing you are probing.
+_LEASE_GUARDED = _REBUILD_GUARDED - {"status"}
+
 
 def _lease(args) -> int:
     """Multi-agent coordination lease for a shared editor. See docs/agent-coordination.md."""
@@ -692,6 +697,10 @@ def build_parser() -> argparse.ArgumentParser:
     proj = argparse.ArgumentParser(add_help=False)
     proj.add_argument("--project", default=_env_project(),
                       help="editor to target (default $UAP_PROJECT); RC port resolved per project")
+    proj.add_argument("--agent", default=None,
+                      help="your lease token (default $UAP_AGENT_ID). If ANOTHER agent holds the "
+                           "exclusive lease this op waits for it; passing your own token is what "
+                           "stops your own lease from blocking you.")
 
     sub.add_parser("help", help="catalog of verbs + copy-paste recipes").set_defaults(func=_help)
     sub.add_parser("tools", help="alias of help").set_defaults(func=_help)
@@ -740,13 +749,11 @@ def build_parser() -> argparse.ArgumentParser:
                      help="key=value pairs (e.g. Command=stat fps KeyName=E bPressed=true) "
                           "or a single JSON object")
     rcp.set_defaults(func=_rc)
-    ex = sub.add_parser("exec")
+    ex = sub.add_parser("exec", parents=[proj])
     ex.add_argument("code")
-    ex.add_argument("--project", default=_env_project())
     ex.set_defaults(func=_exec)
-    exf = sub.add_parser("exec-file")
+    exf = sub.add_parser("exec-file", parents=[proj])
     exf.add_argument("path")
-    exf.add_argument("--project", default=_env_project())
     exf.set_defaults(func=_exec_file)
     pie = sub.add_parser("pie").add_subparsers(dest="pie_cmd", required=True)
     pie.add_parser("start", parents=[proj]).set_defaults(func=_pie)
@@ -781,9 +788,9 @@ def build_parser() -> argparse.ArgumentParser:
     la.add_argument("mode", choices=["exclusive", "shared"])
     la.add_argument("--reason", default="",
                     help="rebuild|pie|level|... (rebuild* makes other agents' ops auto-wait)")
-    la.add_argument("--agent", default=None,
-                    help="stable token; REQUIRED for a hold spanning multiple calls (no reliable "
-                         "auto-id in this harness). A whole-command hold can omit it.")
+    # --agent comes from the shared `proj` parent (also honours $UAP_AGENT_ID). It is REQUIRED for
+    # a hold spanning multiple calls -- this harness has no reliable auto-id -- and it is the same
+    # token your later editor ops must carry, or your own lease will block you.
     # Default 0 (TTL-only): a standalone `lease acquire` process exits immediately, so anchoring
     # liveness to it would evict the lease the instant the command returns. Pass --pid <PID> of a
     # long-lived process (e.g. a rebuild script's $PID) to have PID-death reclaim it sooner.
@@ -794,24 +801,62 @@ def build_parser() -> argparse.ArgumentParser:
                     help="max seconds to block before returning busy (default 900)")
     la.add_argument("--ttl", type=int, default=None)
     la.set_defaults(func=_lease)
-    lr = lzs.add_parser("release", parents=[proj])
-    lr.add_argument("--agent", default=None)
-    lr.set_defaults(func=_lease)
-    lh = lzs.add_parser("heartbeat", parents=[proj])
-    lh.add_argument("--agent", default=None)
-    lh.set_defaults(func=_lease)
+    lzs.add_parser("release", parents=[proj]).set_defaults(func=_lease)
+    lzs.add_parser("heartbeat", parents=[proj]).set_defaults(func=_lease)
     lzs.add_parser("status", parents=[proj]).set_defaults(func=_lease)
     return p
 
 
+def _lease_wait_cap() -> float:
+    """Seconds an editor op will wait out another agent's exclusive lease.
+
+    $UAP_LEASE_WAIT overrides (0 = do not wait, fail fast with `busy`). Bounded, because a
+    forgotten lease must degrade into a clear error rather than a hang.
+    """
+    raw = os.environ.get("UAP_LEASE_WAIT")
+    if raw is None or raw.strip() == "":
+        return _coord.DEFAULT_WAIT_CAP
+    try:
+        return max(0.0, float(raw))
+    except ValueError:
+        return _coord.DEFAULT_WAIT_CAP
+
+
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
+    cmd = getattr(args, "cmd", None)
+    project = getattr(args, "project", "") or _env_project()
     # Coordination: if another agent is rebuilding this editor (it's down), wait it out instead of
     # hard-failing, then proceed against the relaunched editor. Fail-open; only editor-touching
     # verbs are guarded (lease/report verbs manage or don't need the editor).
-    if getattr(args, "cmd", None) in _REBUILD_GUARDED:
+    if cmd in _REBUILD_GUARDED:
         try:
-            _coord.wait_while_rebuild(getattr(args, "project", "") or _env_project())
+            _coord.wait_while_rebuild(project)
+        except Exception:
+            pass
+    # ...and wait out any OTHER agent's exclusive lease. Without this the lease was advisory
+    # only: `lease acquire exclusive --reason pie` recorded a holder that nothing consulted, so
+    # other agents drove the editor straight through it (swapping levels and starting PIE under
+    # the holder's feet). `wait_if_blocked` existed for exactly this and had no callers.
+    if cmd in _LEASE_GUARDED:
+        agent = getattr(args, "agent", None) or _coord.default_agent_id()
+        try:
+            res = _coord.wait_if_blocked(project, agent=agent, wait=_lease_wait_cap())
+        except Exception:
+            res = {"ok": True, "blocked": False}
+        if not res.get("ok", True) and res.get("blocked"):
+            holder = res.get("holder") or {}
+            _emit({"ok": False, "busy": True, "blocked_by": holder.get("agent"),
+                    "reason": holder.get("reason"), "cmd": cmd, "agent": agent,
+                    "hint": "another agent holds the exclusive editor lease; wait, or pass "
+                            "--agent/$UAP_AGENT_ID if that lease is yours "
+                            "(`uap lease status` to inspect, `uap lease release --agent <token>` "
+                            "if it is abandoned)"})
+            return 1
+        # Using the editor IS liveness: refresh our own lease so an actively-working holder never
+        # has it reclaimed mid-hold, and an abandoned one still ages out on TTL.
+        try:
+            _coord.heartbeat(project, agent=agent)
         except Exception:
             pass
     return args.func(args)
