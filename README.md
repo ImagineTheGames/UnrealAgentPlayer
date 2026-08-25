@@ -97,18 +97,25 @@ Full reference with parameters and return shapes: **[docs/capabilities.md](docs/
 ## Quickstart
 
 ```bat
-:: 1. Install the plugin into your UE project (junction the Plugin/ folder)
-mklink /J C:\Path\To\YourProject\Plugins\UnrealAgentPlayer C:\path\to\unreal-agent-player\Plugin
-
-:: 2. Install the MCP server
-cd unreal-agent-player\mcp-server
+:: 1. Clone this repo and build its venv (once per machine)
+git clone https://github.com/ImagineTheGames/UnrealAgentPlayer.git
+cd UnrealAgentPlayer\mcp-server
 python -m venv .venv
-.venv\Scripts\activate
-pip install -e ".[dev]"
-:: add the [windows] extra for editor-menu UIAutomation: pip install -e ".[dev,windows]"
+.venv\Scripts\pip install -e ".[dev]"
+:: add the [windows] extra for editor-menu UIAutomation: ".[dev,windows]"
+
+:: 2. Install the plugin into your UE project (junction the Plugin/ folder)
+mklink /J C:\Path\To\YourProject\Plugins\UnrealAgentPlayer C:\path\to\UnrealAgentPlayer\Plugin
 ```
 
-Then enable **Remote Control API**, **Python Editor Script Plugin**, and **Unreal Agent Player** in your project, turn on **Enable Remote Execution** (Project Settings → Python), and register the MCP server with your client. **Do not set the Remote Control port by hand** — each editor picks its own and `uap status` reports it. Full steps: **[docs/setup.md](docs/setup.md)** and **[docs/claude-client-config.md](docs/claude-client-config.md)**.
+Then enable **Remote Control API**, **Python Editor Script Plugin**, and **Unreal Agent Player** in your project, and turn on **Enable Remote Execution** (Project Settings → Python).
+
+Two things that stop people cold, both covered in [docs/setup.md](docs/setup.md):
+
+- **UE 5.8+ only:** tick **Allow Any Remote Function Call** (Project Settings → Plugins → Remote Control → Security). It defaults to off in 5.8 and blocks every call with `Executing function '...' is not allowed by remote control settings`. The setting does not exist on 5.6/5.7.
+- **Do not set the Remote Control port by hand.** Each editor picks its own; `uap status` reports it as `rc_port`.
+
+Full steps: **[docs/setup.md](docs/setup.md)** and **[docs/claude-client-config.md](docs/claude-client-config.md)**.
 
 ### On a team
 
@@ -120,11 +127,19 @@ one-time clone + venv above (and sets `UAP_HOME` if they cloned it somewhere unu
 If those files are missing from source control, every agent following your `AGENTS.md` fails
 at its first step, and the error does not say why.
 
-Verify:
+Verify, from your project root with the editor running:
 
-> Call the `bridge_status` tool.
+```powershell
+powershell -NoProfile -File uap.ps1 status
+```
 
-Expected: `ue_running: true`, `rc_reachable: true`, `remote_exec_reachable: true`, `plugin_version: 0.0.1`.
+Expected: `{"ok": true, "rc_reachable": true, "plugin_version": "0.0.1", "rc_port": <n>}`.
+`rc_port` differs per project; any number is fine as long as `rc_reachable` is true.
+
+With the MCP server registered, ask your client to call `bridge_status` instead and expect
+`ue_running: true`, `rc_reachable: true`, `remote_exec_reachable: true`.
+
+Stuck? [docs/setup.md](docs/setup.md#if-it-does-not-work) has a symptom → cause → fix table.
 
 ---
 
