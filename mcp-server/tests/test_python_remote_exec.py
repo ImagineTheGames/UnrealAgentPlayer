@@ -35,10 +35,17 @@ def test_decode_rejects_garbage():
 
 
 def test_exec_python_no_editor_raises():
+    # Asserts the no-editor path, so it only means anything when no editor is listening.
+    # Discovery is multicast on the whole machine: a developer with an editor open (the
+    # normal state for anyone working on this) gets a real pong, the call succeeds, and
+    # this fails through no fault of the code -- which then blocks the pre-push hook.
     client = PythonRemoteExecClient(discovery_timeout=0.3)
-    with pytest.raises(AgentError) as excinfo:
+    try:
         client.exec_python("print('x')")
-    assert excinfo.value.code == ErrorCode.UE_REMOTE_EXEC_OFF
+    except AgentError as err:
+        assert err.code == ErrorCode.UE_REMOTE_EXEC_OFF
+    else:
+        pytest.skip("an Unreal editor is listening on this machine; no-editor path not exercisable")
 
 
 def _fake_editor(node_id: str, ready: threading.Event, stop: threading.Event):

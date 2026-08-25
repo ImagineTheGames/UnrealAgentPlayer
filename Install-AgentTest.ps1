@@ -74,13 +74,18 @@ if (-not (Get-ChildItem -Path $ProjectRoot -Filter *.uproject -File -ErrorAction
     Write-Warning "No .uproject under $ProjectRoot -- continuing anyway."
 }
 
-# 2. Check the venv exists on THIS machine. The generated launcher does not bake this path
-#    -- it finds the repo at run time -- but installing against a missing venv is still a
-#    mistake worth catching now rather than at first use.
-$py = if ($Python) { $Python } else { Join-Path $VenvBase '.venv/Scripts/python.exe' }
-if (-not (Test-Path $py)) {
-    Write-Error "venv python not found at '$py'. Build it: cd mcp-server; python -m venv .venv; .venv\Scripts\pip install -e '.[dev]'  (or pass -Python <path>)."
-    exit 4
+# 2. Sanity-check the venv on THIS machine. The generated launcher no longer bakes this
+#    path -- it locates the repo and its venv at run time -- so -Python / -VenvBase are now
+#    only an install-time warning, never a hard gate. An explicit -Python stays trusted
+#    verbatim (callers pass paths for machines other than this one).
+if ($Python) {
+    $py = $Python
+} else {
+    $py = Join-Path $VenvBase '.venv/Scripts/python.exe'
+    if (-not (Test-Path $py)) {
+        Write-Error "venv python not found at '$py'. Build it: cd mcp-server; python -m venv .venv; .venv\Scripts\pip install -e '.[dev]'  (or pass -Python <path>)."
+        exit 4
+    }
 }
 
 # 3. Command file.

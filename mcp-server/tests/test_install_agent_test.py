@@ -1,4 +1,5 @@
 import pathlib
+import re
 import shutil
 import subprocess
 
@@ -38,7 +39,7 @@ def fake_project(tmp_path):
     return tmp_path
 
 
-def test_installs_command_and_launcher_with_substituted_python(fake_project):
+def test_installs_command_and_portable_launcher(fake_project):
     res = _run(fake_project, python="C:/baked/python.exe")
     assert res.returncode == 0, res.stderr
     cmd_file = fake_project / ".claude" / "commands" / "agentplayertest.md"
@@ -46,11 +47,29 @@ def test_installs_command_and_launcher_with_substituted_python(fake_project):
     assert cmd_file.is_file()
     assert launcher.is_file()
     launcher_text = launcher.read_text(encoding="utf-8")
-    assert "C:/baked/python.exe" in launcher_text
-    assert "__UAP_PYTHON__" not in launcher_text
     # Project identity baked from the .uproject (fixture creates FakeGame.uproject).
     assert "FakeGame" in launcher_text
     assert "__UAP_PROJECT__" not in launcher_text
+    assert "__UAP_HOME_RELATIVE__" not in launcher_text
+    # The launcher is committed to the project's source control, so it must not carry a
+    # path that only exists on the machine that ran the installer -- that is what broke
+    # every teammate before. The venv python in particular is now found at run time.
+    assert "C:/baked/python.exe" not in launcher_text
+    assert "__UAP_PYTHON__" not in launcher_text
+
+
+def test_launcher_has_no_machine_local_paths(fake_project):
+    res = _run(fake_project)
+    assert res.returncode == 0, res.stderr
+    lines = (fake_project / "uap.ps1").read_text(encoding="utf-8").splitlines()
+    offenders = [
+        ln for ln in lines
+        if re.search(r"(?<![A-Za-z])[A-Za-z]:\\", ln)
+        and "HKCU:" not in ln and "HKLM:" not in ln
+        # Documented examples in the header/error text, not paths the script uses.
+        and not re.search(r"D:\\(path|dev)|C:\\path", ln)
+    ]
+    assert not offenders, "machine-local paths in generated launcher:\n" + "\n".join(offenders)
 
 
 def test_rerun_without_force_is_noop(fake_project):

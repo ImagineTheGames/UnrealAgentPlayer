@@ -10,13 +10,31 @@ def _read(name):
 
 def test_launcher_template_has_token_and_home_fallback():
     text = _read("uap.ps1.template")
-    assert "__UAP_PYTHON__" in text
     assert "UAP_HOME" in text
     assert "unreal_agent_player.cli" in text
     assert "$LASTEXITCODE" in text
     # Pins the per-project target so the launcher never cross-targets another editor.
     assert "__UAP_PROJECT__" in text
     assert "UAP_PROJECT" in text
+    # The repo is located at run time (UAP_HOME -> relative path -> sibling), never baked
+    # as an absolute path, so the generated launcher can be committed to a team's depot.
+    assert "__UAP_HOME_RELATIVE__" in text
+    assert "__UAP_PYTHON__" not in text
+    assert "__UAP_UPROJECT__" not in text
+    assert "__UAP_EDITOR_EXE__" not in text
+
+
+def test_launcher_template_resolves_engine_like_the_engine_does():
+    text = _read("uap.ps1.template")
+    # Epic's own order: UE_ROOT -> launcher manifest -> HKCU Builds.
+    assert "UE_ROOT" in text
+    assert "LauncherInstalled.dat" in text
+    assert "Epic Games\\Unreal Engine\\Builds" in text
+    # The legacy key the engine never reads and newer launchers do not write. Resolving
+    # through it could not find a launcher install at all. It may still be NAMED in a
+    # comment explaining why it is skipped -- what matters is that no code reads it.
+    code = [ln for ln in text.splitlines() if not ln.lstrip().startswith("#")]
+    assert not [ln for ln in code if "InstalledDirectory" in ln]
 
 
 def test_command_template_is_project_agnostic():
