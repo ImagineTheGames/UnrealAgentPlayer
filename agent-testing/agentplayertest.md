@@ -144,8 +144,9 @@ State the concrete pass condition before running. A non-zero speed with a frozen
 4. **Scene**: `uap exec` to `load_level('/Game/...')` if the question implies a specific map;
    else use the open level and `uap report note "using level X"`.
 5. **Start PIE**: `uap pie start`, then `uap pie wait 12` -- blocks until the game world is
-   live (up to 12s) and fails if it never comes up. (These wrap the version-correct engine
-   call; do NOT use the old `PlayWorldEditorSubsystem`, which does not exist on UE 5.7.) Give
+   live (up to 12s) and fails if it never comes up. (These wrap whichever engine call is
+   correct for the version in use; do NOT reach for `PlayWorldEditorSubsystem`, which was
+   removed and does not exist on any engine this supports.) Give
    it a beat for a frame to render before capturing a screenshot (see step 8). Grab a log
    cursor before driving the condition.
 6. **Set up + drive** the exact condition: spawn/possess/teleport via `uap exec`; inject input

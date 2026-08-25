@@ -1,4 +1,5 @@
 import pathlib
+import re
 
 REPO = pathlib.Path(__file__).resolve().parents[2]
 KIT = REPO / "agent-testing"
@@ -51,6 +52,16 @@ def test_command_template_is_project_agnostic():
     assert "$ARGUMENTS" in text
     # The report is mandatory and must be cited.
     assert "index.html" in text
+
+
+def test_kit_pins_no_engine_version():
+    # The kit is installed into projects on 5.6, 5.7, 5.8 and the Meta 5.7 fork, so a version
+    # literal is wrong for someone by construction. It also breaks adopters that lint for one:
+    # ProjectBrokenWings' Tools/engine-version-check.sh scans .claude/ for exactly this and
+    # failed on the installed command file, which is why that project never took the kit.
+    for name in ("agentplayertest.md", "AGENTS-snippet.md", "uap.ps1.template"):
+        hits = re.findall(r"UE ?5\.\d+", _read(name))
+        assert not hits, f"{name} pins an engine version: {hits}"
 
 
 AGENTS_MARKER = "## Verifying runtime game behavior"
