@@ -46,7 +46,7 @@ The agent perceives and acts inside the editor the way a tester would, so "does 
                                                            ┘
 ```
 
-- **Remote Control HTTP** (`127.0.0.1:30010`) — structured calls to the subsystem's `UFUNCTION`s. Deterministic, typed, per-port (so two editors are addressed independently).
+- **Remote Control HTTP** (`127.0.0.1:<per-editor port>`) — structured calls to the subsystem's `UFUNCTION`s. Deterministic, typed, per-port (so two editors are addressed independently). Each editor gets its own port rather than the stock 30010; `uap status` reports it as `rc_port`. You should never need to set it by hand — see [Setup](docs/setup.md).
 - **Python Remote Execution** (UDP multicast `239.0.0.1:6766`) — arbitrary `import unreal; ...` scripting for anything not exposed as a `UFUNCTION` (load a level, read a pawn transform, start PIE).
 
 Key/button injection routes straight through the game viewport client
@@ -108,7 +108,17 @@ pip install -e ".[dev]"
 :: add the [windows] extra for editor-menu UIAutomation: pip install -e ".[dev,windows]"
 ```
 
-Then enable **Remote Control API**, **Python Editor Script Plugin**, and **Unreal Agent Player** in your project, turn on **Enable Remote Execution** (Project Settings → Python), and register the MCP server with your client. Full steps: **[docs/setup.md](docs/setup.md)** and **[docs/claude-client-config.md](docs/claude-client-config.md)**.
+Then enable **Remote Control API**, **Python Editor Script Plugin**, and **Unreal Agent Player** in your project, turn on **Enable Remote Execution** (Project Settings → Python), and register the MCP server with your client. **Do not set the Remote Control port by hand** — each editor picks its own and `uap status` reports it. Full steps: **[docs/setup.md](docs/setup.md)** and **[docs/claude-client-config.md](docs/claude-client-config.md)**.
+
+### On a team
+
+Copy `Plugin/` into your project as real files and commit it, and commit the `uap.ps1` +
+`.claude/commands/agentplayertest.md` that `Install-AgentTest.ps1` generates — they contain
+no machine-local paths, so they work for every teammate as-is. Each person then does the
+one-time clone + venv above (and sets `UAP_HOME` if they cloned it somewhere unusual).
+
+If those files are missing from source control, every agent following your `AGENTS.md` fails
+at its first step, and the error does not say why.
 
 Verify:
 
