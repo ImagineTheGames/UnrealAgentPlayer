@@ -5,6 +5,7 @@
 #include "UObject/Class.h"
 #include "UObject/UObjectIterator.h"
 #include "Dom/JsonObject.h"
+#include "Serialization/JsonReader.h"
 #include "Serialization/JsonSerializer.h"
 #include "Serialization/JsonWriter.h"
 
@@ -58,6 +59,46 @@ void FAgentHelperDiscovery::RescanAll(TArray<FAgentHelperDescriptor>& OutList)
             OutList.Add(D);
         }
     }
+}
+
+static TSharedPtr<FJsonValue> ParseJsonValue(const FString& Text)
+{
+    // ArgSchemaJson/ReturnSchemaJson are already JSON documents; re-embed them as real JSON
+    // rather than as escaped strings, so an agent can read the schema without double-decoding.
+    if (Text.IsEmpty() || Text == TEXT("null")) { return MakeShared<FJsonValueNull>(); }
+    TSharedPtr<FJsonObject> Obj;
+    TSharedRef<TJsonReader<>> R = TJsonReaderFactory<>::Create(Text);
+    if (FJsonSerializer::Deserialize(R, Obj) && Obj.IsValid())
+    {
+        return MakeShared<FJsonValueObject>(Obj);
+    }
+    return MakeShared<FJsonValueString>(Text);
+}
+
+FString FAgentHelperDiscovery::ToJson(const TArray<FAgentHelperDescriptor>& List)
+{
+    TArray<TSharedPtr<FJsonValue>> Arr;
+    Arr.Reserve(List.Num());
+    for (const FAgentHelperDescriptor& D : List)
+    {
+        TSharedRef<FJsonObject> O = MakeShared<FJsonObject>();
+        O->SetStringField(TEXT("name"), D.Name);
+        O->SetStringField(TEXT("category"), D.Category);
+        O->SetStringField(TEXT("tooltip"), D.Tooltip);
+        O->SetStringField(TEXT("phase"), D.PhaseRequirement);
+        O->SetField(TEXT("arg_schema"), ParseJsonValue(D.ArgSchemaJson));
+        O->SetField(TEXT("return_schema"), ParseJsonValue(D.ReturnSchemaJson));
+        O->SetBoolField(TEXT("supported"), D.bSupported);
+        O->SetStringField(TEXT("unsupported_reason"), D.UnsupportedReason);
+        Arr.Add(MakeShared<FJsonValueObject>(O));
+    }
+    TSharedRef<FJsonObject> Root = MakeShared<FJsonObject>();
+    Root->SetArrayField(TEXT("helpers"), Arr);
+
+    FString Out;
+    TSharedRef<TJsonWriter<>> W = TJsonWriterFactory<>::Create(&Out);
+    FJsonSerializer::Serialize(Root, W);
+    return Out;
 }
 
 UFunction* FAgentHelperDiscovery::Resolve(const FString& FullName, UClass*& OutClass)

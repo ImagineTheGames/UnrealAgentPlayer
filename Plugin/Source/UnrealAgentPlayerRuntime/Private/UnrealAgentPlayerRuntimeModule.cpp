@@ -1,5 +1,7 @@
 #include "UnrealAgentPlayerRuntimeModule.h"
+#include "AgentInput.h"
 #include "AgentMotionController.h"
+#include "AgentSampler.h"
 #include "Misc/CommandLine.h"
 #include "Misc/Parse.h"
 #include "RemoteControlSettings.h"
@@ -66,6 +68,9 @@ void FUnrealAgentPlayerRuntimeModule::StartupModule()
 
 void FUnrealAgentPlayerRuntimeModule::ShutdownModule()
 {
+    // Drop the per-frame tickers first: they hold statics that outlive the module otherwise.
+    FAgentInput::ShutdownHolds();
+    FAgentSampler::Shutdown();
     if (MotionController.IsValid())
     {
         MotionController->Unregister();

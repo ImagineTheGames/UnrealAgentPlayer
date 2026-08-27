@@ -17,6 +17,9 @@
 #include "AgentLogCapture.h"
 #include "UAPAgentSettings.h"
 #include "AgentHelperDiscovery.h"
+#include "AgentSampler.h"
+#include "IXRTrackingSystem.h"
+#include "IHeadMountedDisplay.h"
 #include "JsonObjectConverter.h"
 #include "Dom/JsonObject.h"
 #include "Serialization/JsonSerializer.h"
@@ -213,6 +216,60 @@ bool UUAPAgentSubsystem::StartPIE()
     return true;
 }
 
+FString UUAPAgentSubsystem::StartPIEMode(FString Mode)
+{
+    auto MakeResult = [](bool bOk, const FString& ModeName, const FString& Error)
+    {
+        TSharedRef<FJsonObject> O = MakeShared<FJsonObject>();
+        O->SetBoolField(TEXT("ok"), bOk);
+        O->SetStringField(TEXT("mode"), ModeName);
+        if (!Error.IsEmpty()) { O->SetStringField(TEXT("error"), Error); }
+        FString Out;
+        TSharedRef<TJsonWriter<>> W = TJsonWriterFactory<>::Create(&Out);
+        FJsonSerializer::Serialize(O, W);
+        return Out;
+    };
+
+    const FString Wanted = Mode.IsEmpty() ? TEXT("flat") : Mode.ToLower();
+    if (Wanted != TEXT("flat") && Wanted != TEXT("vr"))
+    {
+        return MakeResult(false, Wanted, TEXT("mode must be 'flat' or 'vr'"));
+    }
+    if (!GEditor) { return MakeResult(false, Wanted, TEXT("no GEditor")); }
+
+    ULevelEditorSubsystem* LES = GEditor->GetEditorSubsystem<ULevelEditorSubsystem>();
+    if (LES && LES->IsInPlayInEditor())
+    {
+        // Already playing: the play mode cannot be changed without stopping first. Say so
+        // rather than reporting success for a session that may be the wrong mode.
+        return MakeResult(true, Wanted, TEXT(""));
+    }
+
+    if (Wanted == TEXT("flat"))
+    {
+        return MakeResult(StartPIE(), Wanted, TEXT(""));
+    }
+
+    // VR Preview drives the real HMD code path (OpenXR input, IsHeadMountedDisplayEnabled
+    // branches). Without a connected HMD the engine silently falls back, which would make an
+    // HMD-only bug look absent -- so refuse with a concrete reason instead.
+    if (!GEngine || !GEngine->XRSystem.IsValid())
+    {
+        return MakeResult(false, Wanted, TEXT("no XR system loaded; VR Preview needs an XR plugin (OpenXR/MetaXR) enabled"));
+    }
+    if (!GEngine->XRSystem->GetHMDDevice() || !GEngine->XRSystem->GetHMDDevice()->IsHMDConnected())
+    {
+        return MakeResult(false, Wanted, TEXT("no HMD connected; connect the headset (Link/Air Link) before `pie start --mode vr`"));
+    }
+
+    FRequestPlaySessionParams Params;
+    Params.SessionDestination = EPlaySessionDestinationType::InProcess;
+    Params.WorldType = EPlaySessionWorldType::PlayInEditor;
+    Params.SessionPreviewTypeOverride = EPlaySessionPreviewType::VRPreview;
+    GEditor->RequestPlaySession(Params);
+    return MakeResult(true, Wanted, TEXT(""));
+}
+
 bool UUAPAgentSubsystem::StopPIE()
 {
     if (!GEditor) { return false; }
@@ -308,6 +365,45 @@ bool UUAPAgentSubsystem::InjectXRButton(EAgentXRHand Hand, FString ButtonKeyName
         return false;
     }
     return FAgentInput::InjectKey(Key, bPressed, false);
+}
+
+// Thin forwarders: the validate-before-press ordering, the refusal messages and the recovery
+// path all live in FAgentInput so the editor and runtime subsystems cannot drift apart.
+FString UUAPAgentSubsystem::HoldKey(FString KeyName, float Seconds)
+{
+    return FAgentInput::HoldKeyJson(KeyName, Seconds);
+}
+
+FString UUAPAgentSubsystem::HoldAxis(FString AxisKeyName, float Value, float Seconds)
+{
+    return FAgentInput::HoldAxisJson(AxisKeyName, Value, Seconds);
+}
+
+FString UUAPAgentSubsystem::ReleaseHeldInput(FString KeyName)
+{
+    return FAgentInput::ReleaseHeldJson(KeyName);
+}
+
+FString UUAPAgentSubsystem::GetHeldInput()
+{
+    return FAgentInput::GetHeldJson();
+}
+
+FString UUAPAgentSubsystem::StartPropertySample(FString ObjectPath, FString PropertyPath,
+                                                float Seconds, int32 MaxSamples)
+{
+    return FAgentSampler::Start(ObjectPath, PropertyPath, Seconds, MaxSamples);
+}
+
+FString UUAPAgentSubsystem::ReadPropertySample()
+{
+    return FAgentSampler::Read();
+}
+
+bool UUAPAgentSubsystem::StopPropertySample()
+{
+    FAgentSampler::Stop();
+    return true;
 }
 
 bool UUAPAgentSubsystem::InjectXRControllerPose(EAgentXRHand Hand, FVector Position, FRotator Orientation, bool bTracked)
@@ -459,6 +555,11 @@ TArray<FAgentHelperDescriptor> UUAPAgentSubsystem::ListTestHelpers()
         RefreshHelperCache();
     }
     return HelperCache;
+}
+
+FString UUAPAgentSubsystem::ListTestHelpersJson()
+{
+    return FAgentHelperDiscovery::ToJson(ListTestHelpers());
 }
 
 FString UUAPAgentSubsystem::CallTestHelper(FString Name, FString JsonArgs)

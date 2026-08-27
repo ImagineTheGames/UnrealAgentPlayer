@@ -249,8 +249,249 @@ The HTTP server the plugin actually needs is the `WebRemoteControl` *module*, wh
 **RemoteControl** plugin (confirmed on 5.7, 5.8, and the Meta fork); `RemoteControlWebInterface` is a
 separate plugin providing the browser UI, which this plugin never uses.
 
+## 15. An injected key could not be HELD -- sustained locomotion was undrivable -- FIXED
+
+Was: `uap rc InjectKey KeyName=W bPressed=true` moved the player exactly once (350 cm/s on the
+first sample) and then the player sat at ~1 cm/s on every later sample, with no `bPressed=false`
+ever sent. This blocked a real bug verification (a 0.6s catch wind-up).
+
+Two causes, both in the injection design rather than in one bad call:
+
+1. **Only ever one `IE_Pressed`, never an `IE_Repeat`.** `FAgentInput::InjectKey` accepted a
+   `bRepeat` parameter and discarded it. A real held key repeats every frame, and that matters:
+   `UPlayerInput::InputKey` re-latches a key it sees repeat on (`bAutoReconcilePressedEventsOnFirst
+   Repeat`, added for exactly this "held across a flush" case). Without a repeat stream, the FIRST
+   `APlayerController::FlushPressedKeys` -- an input-mode change, focus loss, a PC recreation --
+   clears `bDown` permanently and the caller gets no signal at all. The key is dead and the agent
+   cannot tell.
+2. **Re-injecting per poll cannot work anyway.** The CLI round-trip is ~1s, longer than most
+   behaviour windows worth testing. And teleporting the pawn instead is not equivalent: it produces
+   displacement with no velocity, so movement-component and perception logic behave differently.
+
+Analog was worse. `InjectAxis` / `InjectGamepad` (stick axes) went through
+`FSlateApplication::ProcessAnalogInputEvent` -- the Slate *focus* path, i.e. exactly the path
+`InjectKey` had already abandoned because it drops input whenever the PIE viewport is not in the
+focus path (editor backgrounded, or PIE playing inside the level viewport). **This matters most for
+VR: locomotion is a thumbstick AXIS, not a digital key**, and there was an `InjectXRButton` but
+nothing for VR axes. A real stick also re-sends its value every frame, so a single sample is not
+what the game sees.
+
+Fixed:
+- `InjectKey` honours `bRepeat` (`IE_Repeat` instead of `IE_Pressed`) and zeroes `AmountDepressed`
+  on release.
+- New `FAgentInput::InjectAxisKey` routes analog samples through
+  `UGameViewportClient::InputAxis` -- the same viewport path as key injection, so it no longer
+  depends on Slate focus. `InjectAxis` and `InjectGamepad`'s **stick** cases now use it (Slate
+  remains a fallback only when there is no game viewport at all). Gamepad **buttons** stay on
+  the Slate path on purpose: a face/DPad press is also how UMG focus navigation is driven.
+- New held-input registry on the core ticker: `HoldKey(KeyName, Seconds)` and
+  `HoldAxis(AxisKeyName, Value, Seconds)` re-assert the input once per frame IN-ENGINE, then
+  release cleanly (digital -> `IE_Released`, analog -> recentre to 0). `ReleaseHeldInput` ends a
+  hold early; `GetHeldInput` reports what is held. Holds are dropped when the game viewport goes
+  away, so a hold can never outlive PIE.
+- CLI: `uap input hold|axis|release|status`. `hold`/`axis` return immediately -- the hold runs in
+  the engine, which is the point: you read game state WHILE it is held. `--wait` blocks instead.
+
+Requires a plugin rebuild. Not yet verified against a live editor.
+
+## 16. Transport dropped a live exec as a raw traceback -- FIXED
+
+Was: mid-poll-loop against a healthy running PIE session,
+
+    File "...\transport.py", line 371, in _read_command_result
+        chunk = conn.recv(65536)
+    ConnectionResetError: [WinError 10054] An existing connection was forcibly closed by the remote host
+
+`_read_command_result` caught only `socket.timeout`, so a reset escaped as an unhandled exception:
+the sample was lost and the caller got a traceback rather than a result it could branch on. The very
+next call succeeded, so this is transient, not a dead editor.
+
+Fixed: socket resets map to a new `ErrorCode.UE_CONNECTION_RESET` (domain `transport`, recoverable),
+and `exec_python` retries a reset up to 3 attempts with a 0.25s/0.75s backoff. Retries re-run
+discovery, so the **same project filter is re-applied on every attempt** -- a retry can never land
+on a different editor. Other error codes (e.g. no editor at all) still fail fast rather than
+tripling the wait. The CLI now emits `{"ok":false,"error":...,"code":...,"retryable":...}` for every
+AgentError, so a caller can distinguish a transient blip from a dead editor without string-matching.
+Also hardened: UDP `recvfrom` (Windows reports a prior ICMP port-unreachable as a reset on the next
+read), the connect-back `accept`, and the best-effort `close_connection` teardown.
+
+CLI-only -- no plugin rebuild needed.
+
+## 17. `uap rc ListTestHelpers` returned no names -- FIXED
+
+Was: `{"ok": true, "result": [{}, {}, {}, ... ]}` -- 13 helpers, zero usable information, from the
+verb whose entire point is discovering helper names.
+
+Root cause is in the engine, in the RemoteControl route the CLI uses. `uap rc` calls the *preset*
+endpoint `/remote/preset/<preset>/function/<func>`, and `FWebRemoteControlModule::HandlePresetCall
+FunctionRoute` serializes the return with:
+
+```cpp
+Policies.PropertyFilter = [&OutProperties](const FProperty* CurrentProp, const FProperty* ParentProp)
+{ return OutProperties.Contains(CurrentProp); };
+```
+
+`OutProperties` holds only the function's own out/return params. When the serializer descends into
+a returned struct, each member `FProperty` is not in that set, so **every nested field is filtered
+out** -- an array of structs serializes as `[{},{},...]` with the correct element count. The
+`/remote/object/call` route does not have this bug (its filter is
+`... || ParentProperty != nullptr`), which is why the MCP `helper_list` tool was unaffected.
+
+Fixed: `FAgentHelperDiscovery::ToJson` plus `ListTestHelpersJson()` on both subsystems return the
+list as a JSON string, sidestepping the engine filter -- the same shape `DumpViewportUI`,
+`GetLogsSince` and `CallTestHelper` already use. Each entry carries `name`, `category`, `tooltip`,
+`phase`, `arg_schema`, `return_schema`, `supported`, `unsupported_reason` (the schemas are embedded
+as real JSON, not escaped strings). New `uap helpers [--grep RE] [--names]` verb, and `uap rc
+ListTestHelpers` is transparently routed to the JSON twin so the documented incantation keeps
+working.
+
+**Rule for new UFUNCTIONs:** anything that must return structured data to the CLI returns a JSON
+`FString`. A `USTRUCT` or `TArray<USTRUCT>` return will arrive empty.
+
+Requires a plugin rebuild.
+
+## 18. `--agent` was rejected by half the verbs -- FIXED
+
+Was: `uap report assert "..." pass "..." --agent <token>` hard-errored with
+`error: unrecognized arguments: --agent`, while editor-touching verbs *require* the token. Each
+project's AGENTS.md tells agents to pass the SAME `--agent` token on EVERY related call, so
+appending it everywhere is the documented behaviour -- and it broke the run.
+
+Fixed: `--agent` moved to a shared parent parser that every subparser inherits, so it is accepted by
+every verb. `--project` is the same class of trap (an agent told to target one editor will append it
+everywhere) and moved with it, so the CLI now has ONE flag set across the whole surface. Verbs that
+do not touch the editor accept and ignore both, and the flags' help says so. A parser-level test
+asserts every verb takes both. CLI-only.
+
+## 19. No verb to read the editor log -- FIXED
+
+Was: diagnosing the janitor meant tailing `Saved/Logs/SchoolsOut.log` with shell tools, outside the
+report, so the evidence never reached the HTML -- and outside the CLI's per-project targeting, on a
+machine that runs two editors. The docs already told agents to "grab a log cursor before driving the
+condition" without giving them a verb for it.
+
+Fixed: `uap log cursor` / `uap log since <cursor>` / `uap log tail --lines N`, each with
+`--grep <regex>` (case-insensitive, over the message), `--category`, `--verbosity`. They call the
+plugin's existing `GetLogCursor` / `GetLogsSince` through the same `--project`-resolved RC port as
+every other verb, and the results are auto-captured into the active report.
+
+Scope: this is the plugin's in-process 4096-line ring buffer, populated from subsystem init onward
+-- not the whole `Saved/Logs/<Project>.log`. For a full session history, read that file directly.
+CLI-only -- no plugin rebuild needed.
+
+## 20. Only flat PIE was startable; HMD-only bugs were untestable -- FIXED
+
+Was: `uap pie start` always gave flat PIE. Several bug classes only exist on the HMD code path --
+OpenXR input injection (which ignores `bConsumeInput` and does not exist in flat PIE), and every
+`IsHeadMountedDisplayEnabled()` branch (e.g. a recap screen that spawns a world-space kiosk + laser
+pointers on HMD but falls back to `AddToViewport` in flat PIE).
+
+Fixed: `StartPIEMode(Mode)` sets `FRequestPlaySessionParams::SessionPreviewTypeOverride =
+EPlaySessionPreviewType::VRPreview` for `"vr"`, surfaced as `uap pie start --mode vr`. It returns a
+JSON status and **refuses with a concrete reason when no HMD is connected** (`no XR system loaded` /
+`no HMD connected`) rather than silently starting flat PIE -- a silent fallback would make an
+HMD-only bug look absent. State reads, `exec`, `read-ui` and screenshots address the same PIE world
+and game viewport in either mode.
+
+Requires a plugin rebuild. Not yet verified against a live editor with a headset attached.
+
+## 21. No sub-second sampling -- FIXED
+
+Was: the finest sampling granularity was one exec round-trip, roughly 1 second. Useless for
+animation judder, a 0.6s AI wind-up, or a one-frame pop. The motivating case: proving a VR player's
+camera transform no longer judders while being carried by an animated character (the old code
+attached the tracking origin to an animated bone; the fix attaches at the mesh root, and the
+difference is per-frame high-frequency jitter that a 1Hz sample cannot see).
+
+Fixed: `FAgentSampler` records a value once per frame on the core ticker for a bounded window and
+returns the whole series in one call. `StartPropertySample(ObjectPath, PropertyPath, Seconds,
+MaxSamples)` / `ReadPropertySample()` / `StopPropertySample()`, surfaced as
+`uap sample start <object> <property> --seconds N` and `uap sample read`. The CLI derives
+`delta_mean` / `delta_max` / `delta_p95` / `hz` from the series -- the frame-to-frame movement of
+the value is what a judder test asserts on.
+
+`ObjectPath` accepts an object path, an actor name (exact then substring) in the live world, or
+`PlayerPawn` / `PlayerController` / `PlayerCameraManager`. `PropertyPath` walks a dot-separated
+`FProperty` chain through object and struct properties (a component name is a valid step), or names
+a computed leaf: `WorldLocation`, `WorldRotation`, `WorldScale`, `WorldTransform`, `ForwardVector`,
+`Velocity`. One series at a time; clamped to 60s / 20000 samples.
+
+Requires a plugin rebuild. Not yet verified against a live editor.
+
+## 22. `input hold` leaked a permanently stuck key on its refusal path -- FIXED
+
+Found during the live verification of #15, on a clean PIE session:
+
+1. `uap input hold C --seconds 3` returned `ok:false` "unknown key name"
+2. ...but the engine immediately showed `C analog=1.0 down=True`
+3. `uap input status` showed `held: []` -- the registry did not know about it
+4. six seconds later the key was STILL down; it never auto-released
+5. `uap input release`, bare and by name, returned `released: 0` and could not clear it
+6. the pawn was left permanently crouched (capsule half-height 90 -> 20); only a PIE restart
+   recovered. `LeftControl` reproduced it too.
+
+Root cause: **`UGameViewportClient::InputKey`'s return value does not mean what the code assumed
+it meant.** It forwards `UPlayerInput::InputKey`, which for `IE_Pressed` ends with:
+
+```cpp
+if (Params.Event == IE_Pressed)
+{
+    return IsKeyHandledByAction(Params.Key);   // PlayerInput.cpp:465
+}
+return true;
+```
+
+and `IsKeyHandledByAction` (PlayerInput.cpp:2347) only scans the **legacy** `ActionMappings`
+array. `UEnhancedPlayerInput::InputKey` just forwards that result. So in a project on Enhanced
+Input -- which is every modern project -- a perfectly delivered keypress returns **false**.
+`FAgentInput::HoldKey` used that as its success check: it pressed `C` (the pawn crouched), read
+false, and returned *before* registering the hold. Nothing then repeated it, nothing released
+it, `input status` had no record of it, and `release` had nothing to find. `W` masked the bug
+because it happens to have a legacy mapping and so returned true.
+
+Three fixes, one per stacked symptom:
+
+1. **Delivery, not "handled".** `InjectKey` / `InjectAxisKey` now check `HasLiveViewport()`
+   (viewport exists, `Viewport` valid, `IgnoreInput()` false) up front, discard `InputKey`'s
+   handled bit, and return whether the event was DELIVERED. This also fixes `uap rc InjectKey`
+   and the `input_key` MCP tool, which had been reporting false for working injections.
+2. **Validate first, press second.** All refusal reasons -- unknown FKey, non-positive duration,
+   no live viewport, digital key passed to `input axis` -- are checked before anything is
+   injected, so a refused call has zero side effects. The refusal envelope carries
+   `"pressed": false` as a contract a caller (and a test) can assert on. The key-name check is
+   `FKey::IsValid()`, i.e. the engine's own `EKeys` registry -- `C` and `LeftControl` were always
+   valid keys and are accepted; there is no hand-maintained table to drift. (The "unknown key
+   name" text was a *guess* the CLI printed for any `false`, which is what sent the
+   investigation after a nonexistent validation table. The CLI now relays the plugin's own
+   message instead of inventing one.)
+3. **Unwind, and a recovery hatch.** `HoldKey`/`HoldAxis` register the hold BEFORE pressing, so
+   the ticker owns the key even if the press path fails, and unwind (`ReleaseHeld`) if it does.
+   `ReleaseHeldInput("")` now releases the registry AND calls
+   `APlayerController::FlushPressedKeys` on every local controller, clearing keys the registry
+   lost track of; a named key is force-released whether or not the registry knows it.
+   `GetHeldInput` reports `down` (engine ground truth via `IsInputKeyDown`) next to each entry,
+   so a registry/engine disagreement is visible rather than silent.
+
+`HoldKey`, `HoldAxis` and `ReleaseHeldInput` return JSON now (they were `bool`/`int32`), matching
+the rule from #17 -- a verb that can fail several ways has to say which. Requires a plugin
+rebuild, and the copy vendored into the game depot (P4 CL 1734) must be re-synced.
+
+Also fixed in the same pass: `uap help` documented `log since <cursor>` positionally while
+argparse only accepted `--since`. Both forms now work, and the docs use the positional one.
+
 ## Status
 
-Items 1-9, 11, 13, 14 resolved (1 and 5 doc fixes; 2, 3, 4, 7, 8, 9, 14 code changes; 6 reporting;
-11 config pin; 13 coordination lease). Items 10 and 12 are guidance -- both are engine-side crashes
-surfaced through `exec` (a DataTable exporter bug; game-thread re-entrancy during PIE transitions).
+Items 1-9, 11, 13-22 resolved (1 and 5 doc fixes; 2, 3, 4, 7, 8, 9, 14 code changes; 6 reporting;
+11 config pin; 13 coordination lease; 15-22 from the 2026-08-27 verification session). Items 10 and
+12 are guidance -- both are engine-side crashes surfaced through `exec` (a DataTable exporter bug;
+game-thread re-entrancy during PIE transitions).
+
+Verified live against a rebuilt editor on 2026-08-27: 15 (a held `W` sustained for a full 10s;
+analog `OculusTouch_Left_Thumbstick_X -1.0` produced VEL=350), 17 (13 real helper names), 19 (log
+ring), 18, 20 (VR preview correctly REFUSED with "no HMD connected" and did not fall back to flat
+PIE), 21 (121 samples in 2s at 59.7Hz, zero deltas while stationary). Item 16 is covered by unit
+tests only -- a transport reset is not reproducible on demand.
+
+Item 22 was found by that same run and is FIXED but NOT yet re-verified live. It changes C++, so
+it needs a **plugin rebuild** (via `Restart-Editor.ps1`) and a re-sync of the plugin copy vendored
+into the game depot (P4 CL 1734). Its `log since` half is CLI-only and live on pull.

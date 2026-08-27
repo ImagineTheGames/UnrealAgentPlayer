@@ -13,7 +13,7 @@ import webbrowser
 from unreal_agent_player.reporting import session as sess
 from unreal_agent_player.reporting.render import render
 from unreal_agent_player.transport import RemoteControlClient, PythonRemoteExecClient
-from unreal_agent_player.errors import AgentError
+from unreal_agent_player.errors import AgentError, ErrorCode
 from unreal_agent_player import coordination as _coord
 
 
@@ -34,6 +34,19 @@ def _require_active():
 
 def _emit(obj: dict) -> None:
     print(json.dumps(obj))
+
+
+def _err(exc: Exception) -> dict:
+    """Uniform failure body. Carries the machine-readable code (and whether a retry is
+    worth it) so a caller can tell a transient transport blip from a dead editor instead
+    of string-matching a message -- or, worse, getting a raw traceback."""
+    body: dict = {"ok": False, "error": str(exc)}
+    if isinstance(exc, AgentError):
+        body["code"] = exc.code.value
+        body["retryable"] = exc.recoverable
+        if exc.retry_hint:
+            body["retry_hint"] = exc.retry_hint
+    return body
 
 
 # --- report verbs ---
@@ -142,7 +155,7 @@ def _report_diag(args) -> int:
             body["env"] = env
             body["perf"] = perf
     except AgentError as exc:
-        body = {"ok": False, "error": str(exc)}
+        body = _err(exc)
     _capture("report:diag", {"project": args.project}, body, 0)
     _emit(body)
     return 0 if body["ok"] else 1
@@ -307,6 +320,18 @@ def _rc_call(func: str, params: dict, project: "str | None" = None):
         raise
 
 
+def _rc_json(func: str, params: dict, project: "str | None" = None) -> dict:
+    """Call a UFUNCTION that returns a JSON string and decode it to a dict.
+
+    Plugin verbs that can fail for more than one reason return a JSON envelope so the refusal
+    carries its own explanation; the CLI relays that verbatim rather than guessing.
+    """
+    raw = _rc_call(func, params, project)
+    if isinstance(raw, str):
+        return json.loads(raw)
+    return raw if isinstance(raw, dict) else {"ok": False, "error": f"{func}: unexpected result {raw!r}"}
+
+
 def _capture(tool: str, args: dict, body: dict, ms: int) -> None:
     s = _load_active()
     if s is None:
@@ -376,6 +401,13 @@ def _parse_rc_params(tokens: list[str]) -> dict:
     return out
 
 
+# UFUNCTIONs whose declared return type cannot survive RemoteControl's preset-call route:
+# it serializes the return through a filter that only admits the function's own out/return
+# params, which empties any nested struct. The plugin exposes a JSON-string twin; `uap rc`
+# transparently uses it so the documented incantation keeps working and keeps its data.
+_RC_JSON_TWINS = {"ListTestHelpers": "ListTestHelpersJson"}
+
+
 def _rc(args) -> int:
     try:
         params = _parse_rc_params(args.params)
@@ -384,10 +416,16 @@ def _rc(args) -> int:
         return 2
     t0 = time.monotonic()
     body: dict = {"ok": True}
+    func = args.rc_func
+    twin = _RC_JSON_TWINS.get(func) if not params else None
     try:
-        body["result"] = _rc_call(args.rc_func, params, args.project)
-    except AgentError as exc:
-        body = {"ok": False, "error": str(exc)}
+        if twin:
+            body["result"] = {"helpers": _helpers_payload(args.project)}
+            body["via"] = twin
+        else:
+            body["result"] = _rc_call(func, params, args.project)
+    except (AgentError, json.JSONDecodeError) as exc:
+        body = _err(exc)
     _capture(f"rc:{args.rc_func}", {"params": params}, body, int((time.monotonic() - t0) * 1000))
     _emit(body)
     return 0 if body["ok"] else 1
@@ -406,7 +444,7 @@ def _exec(args) -> int:
         if not body["ok"]:
             body["error"] = "exec returned success=false; see output"
     except AgentError as exc:
-        body = {"ok": False, "error": str(exc)}
+        body = _err(exc)
     _capture("exec", {"code": code[:200]}, body, int((time.monotonic() - t0) * 1000))
     _emit(body)
     return 0 if body["ok"] else 1
@@ -426,7 +464,18 @@ def _pie(args) -> int:
     body: dict = {"ok": True}
     try:
         if sub == "start":
-            body["result"] = _rc_call("StartPIE", {}, args.project)
+            # --mode vr uses the editor's VR Preview, i.e. the HMD code path: OpenXR input
+            # and every IsHeadMountedDisplayEnabled() branch. Flat PIE takes neither, so an
+            # HMD-only bug is invisible there. StartPIEMode refuses "vr" with a concrete
+            # reason when no headset is connected rather than silently starting flat PIE.
+            mode = getattr(args, "mode", "flat") or "flat"
+            raw = _rc_call("StartPIEMode", {"Mode": mode}, args.project)
+            res = json.loads(raw) if isinstance(raw, str) else (raw or {})
+            body["mode"] = res.get("mode", mode)
+            body["result"] = res
+            body["ok"] = bool(res.get("ok", False))
+            if not body["ok"]:
+                body["error"] = res.get("error", "StartPIEMode failed")
         elif sub == "stop":
             body["result"] = _rc_call("StopPIE", {}, args.project)
         elif sub == "wait":
@@ -439,9 +488,226 @@ def _pie(args) -> int:
             body["ok"] = playing
             if not playing:
                 body["error"] = f"PIE not running after {args.seconds}s"
-    except AgentError as exc:
-        body = {"ok": False, "error": str(exc)}
+    except (AgentError, json.JSONDecodeError) as exc:
+        body = _err(exc)
     _capture(f"pie:{sub}", {}, body, int((time.monotonic() - t0) * 1000))
+    _emit(body)
+    return 0 if body["ok"] else 1
+
+
+def _input(args) -> int:
+    """Sustained input. A single injected event cannot drive locomotion: the CLI round-trip is
+    ~1s and a latched key is silently dropped by any FlushPressedKeys, so the plugin re-asserts
+    the input every frame in-engine for the requested duration. `axis` is the VR locomotion
+    verb -- thumbsticks are analog axis FKeys, not buttons."""
+    sub = args.input_cmd
+    t0 = time.monotonic()
+    body: dict = {"ok": True, "action": sub}
+    try:
+        # The plugin returns a JSON envelope carrying the REAL reason for a refusal. The CLI
+        # must not invent one: a guessed "unknown key name" (for a key that was in fact valid,
+        # and had already been pressed) sent a live investigation after a validation table
+        # that does not exist. Pass the plugin's own message through.
+        if sub == "hold":
+            body.update(_rc_json("HoldKey", {"KeyName": args.key, "Seconds": args.seconds},
+                                 args.project))
+        elif sub == "axis":
+            body.update(_rc_json("HoldAxis", {"AxisKeyName": args.key, "Value": args.value,
+                                              "Seconds": args.seconds}, args.project))
+        elif sub == "release":
+            body.update(_rc_json("ReleaseHeldInput", {"KeyName": args.key or ""}, args.project))
+        else:  # status
+            body.update(_rc_json("GetHeldInput", {}, args.project))
+
+        # Non-blocking by default: the hold runs IN-ENGINE, so the point is to sample game
+        # state while it is still held. --wait blocks until it expires instead.
+        if body.get("ok") and sub in ("hold", "axis") and getattr(args, "wait", False):
+            time.sleep(args.seconds)
+            body["waited"] = True
+    except (AgentError, json.JSONDecodeError) as exc:
+        body = _err(exc)
+    _capture(f"input:{sub}", {k: v for k, v in vars(args).items()
+                              if k in ("key", "value", "seconds")},
+             body, int((time.monotonic() - t0) * 1000))
+    _emit(body)
+    # .get: the body is merged from the plugin's envelope, so never assume the key is there.
+    return 0 if body.get("ok") else 1
+
+
+def _sample_stats(samples: list) -> dict:
+    """Frame-to-frame movement of the sampled value: what a judder test actually asserts on.
+    Works for numbers and for the {x,y,z} / {pitch,yaw,roll} objects the sampler emits."""
+    def flat(v):
+        if isinstance(v, (int, float)):
+            return [float(v)]
+        if isinstance(v, dict):
+            out = []
+            for key in sorted(v):
+                out.extend(flat(v[key]))
+            return out
+        return []
+
+    vecs = [flat(s.get("v")) for s in samples]
+    vecs = [v for v in vecs if v]
+    if len(vecs) < 2 or len({len(v) for v in vecs}) != 1:
+        return {}
+    deltas = []
+    for a, b in zip(vecs, vecs[1:]):
+        deltas.append(sum((y - x) ** 2 for x, y in zip(a, b)) ** 0.5)
+    deltas.sort()
+    n = len(deltas)
+    times = [s.get("t", 0.0) for s in samples]
+    span = (times[-1] - times[0]) if len(times) > 1 else 0.0
+    return {
+        "delta_mean": round(sum(deltas) / n, 6),
+        "delta_max": round(deltas[-1], 6),
+        "delta_p95": round(deltas[min(n - 1, int(n * 0.95))], 6),
+        "hz": round((len(samples) - 1) / span, 1) if span > 0 else None,
+    }
+
+
+def _sample(args) -> int:
+    """Record a property once per frame IN-ENGINE for a bounded window, then return the series.
+    The finest granularity an exec round-trip can reach is ~1s, which cannot see judder, a 0.6s
+    wind-up, or a one-frame pop."""
+    t0 = time.monotonic()
+    body: dict = {"ok": True, "object": args.object, "property": args.property}
+    try:
+        raw = _rc_call("StartPropertySample",
+                       {"ObjectPath": args.object, "PropertyPath": args.property,
+                        "Seconds": args.seconds, "MaxSamples": args.max_samples},
+                       args.project)
+        start = json.loads(raw) if isinstance(raw, str) else (raw or {})
+        if not start.get("ok"):
+            body = {"ok": False, "error": start.get("error", "StartPropertySample failed"),
+                    "object": args.object, "property": args.property}
+        elif args.no_wait:
+            body["started"] = True
+            body["hint"] = "sampling in-engine; read it with `uap sample read`"
+        else:
+            time.sleep(args.seconds + 0.25)
+            raw = _rc_call("ReadPropertySample", {}, args.project)
+            body.update(json.loads(raw) if isinstance(raw, str) else (raw or {}))
+            body["stats"] = _sample_stats(body.get("samples") or [])
+            if args.summary:
+                body.pop("samples", None)
+    except (AgentError, json.JSONDecodeError) as exc:
+        body = _err(exc)
+    _capture("sample", {"object": args.object, "property": args.property,
+                        "seconds": args.seconds}, body, int((time.monotonic() - t0) * 1000))
+    _emit(body)
+    return 0 if body["ok"] else 1
+
+
+def _sample_read(args) -> int:
+    t0 = time.monotonic()
+    body: dict = {"ok": True}
+    try:
+        raw = _rc_call("ReadPropertySample", {}, args.project)
+        body.update(json.loads(raw) if isinstance(raw, str) else (raw or {}))
+        body["stats"] = _sample_stats(body.get("samples") or [])
+        if args.summary:
+            body.pop("samples", None)
+    except (AgentError, json.JSONDecodeError) as exc:
+        body = _err(exc)
+    _capture("sample:read", {}, body, int((time.monotonic() - t0) * 1000))
+    _emit(body)
+    return 0 if body["ok"] else 1
+
+
+def _log(args) -> int:
+    """Read the editor's log through the plugin's in-process capture, so log evidence lands in
+    the report instead of being tailed out-of-band with shell tools -- and so it targets the
+    SAME editor as every other verb (this machine runs two).
+
+    Note: this is the plugin's 4096-line ring buffer, populated from subsystem init onward. It
+    is not Saved/Logs/<Project>.log; for a whole-session history read that file directly."""
+    sub = args.log_cmd
+    t0 = time.monotonic()
+    body: dict = {"ok": True}
+    try:
+        if sub == "cursor":
+            body["cursor"] = int(_rc_call("GetLogCursor", {}, args.project) or 0)
+        else:
+            # `log since <cursor>` and `log since --since <cursor>` both work: the docs and
+            # every natural reading use the positional form, so rejecting it was a trap.
+            positional = getattr(args, "cursor", None)
+            after = positional if positional is not None else args.since
+            if sub == "tail":
+                current = int(_rc_call("GetLogCursor", {}, args.project) or 0)
+                after = max(0, current - args.lines)
+            raw = _rc_call("GetLogsSince",
+                           {"AfterCursor": after, "MaxLines": args.lines,
+                            "CategoryFilter": args.category,
+                            "MinVerbosity": args.verbosity},
+                           args.project)
+            parsed = json.loads(raw) if isinstance(raw, str) else (raw or {})
+            lines = parsed.get("lines") or []
+            if args.grep:
+                try:
+                    rx = re.compile(args.grep, re.IGNORECASE)
+                except re.error as exc:
+                    _emit({"ok": False, "error": f"bad --grep regex: {exc}"})
+                    return 2
+                lines = [ln for ln in lines if rx.search(str(ln.get("message", "")))]
+            body["cursor"] = parsed.get("cursor", after)
+            body["count"] = len(lines)
+            body["lines"] = lines
+    except (AgentError, json.JSONDecodeError) as exc:
+        body = _err(exc)
+    _capture(f"log:{sub}", {"grep": getattr(args, "grep", None)}, body,
+             int((time.monotonic() - t0) * 1000))
+    _emit(body)
+    return 0 if body["ok"] else 1
+
+
+def _helpers_payload(project: "str | None") -> list:
+    """Helper descriptors with their fields intact.
+
+    ListTestHelpers returns TArray<FAgentHelperDescriptor>, and RemoteControl's preset-call
+    route serializes a returned struct through a property filter that only admits the
+    function's own out/return params -- so every nested field is dropped and the call comes
+    back as [{},{},...]. The plugin exposes a JSON-string twin for exactly this reason.
+    """
+    try:
+        raw = _rc_call("ListTestHelpersJson", {}, project)
+    except AgentError:
+        # Plugin predates the JSON twin (CLI pulled, editor not rebuilt yet). Fall back so the
+        # verb still runs, and say plainly why the fields are missing.
+        legacy = _rc_call("ListTestHelpers", {}, project)
+        raise AgentError(
+            ErrorCode.UE_OBJECT_NOT_FOUND,
+            f"this editor's plugin has no ListTestHelpersJson, and the legacy "
+            f"ListTestHelpers returns {len(legacy) if isinstance(legacy, list) else '?'} "
+            "entries with every field stripped by RemoteControl's preset-call serializer. "
+            "Rebuild the plugin (Restart-Editor.ps1) to get helper names back.",
+            recoverable=False,
+        ) from None
+    parsed = json.loads(raw) if isinstance(raw, str) else (raw or {})
+    return parsed.get("helpers") or []
+
+
+def _helpers(args) -> int:
+    t0 = time.monotonic()
+    body: dict = {"ok": True}
+    try:
+        helpers = _helpers_payload(args.project)
+        if args.grep:
+            try:
+                rx = re.compile(args.grep, re.IGNORECASE)
+            except re.error as exc:
+                _emit({"ok": False, "error": f"bad --grep regex: {exc}"})
+                return 2
+            helpers = [h for h in helpers
+                       if rx.search(str(h.get("name", ""))) or rx.search(str(h.get("category", "")))]
+        if args.names:
+            body["helpers"] = [h.get("name") for h in helpers]
+        else:
+            body["helpers"] = helpers
+        body["count"] = len(helpers)
+    except (AgentError, json.JSONDecodeError) as exc:
+        body = _err(exc)
+    _capture("helpers", {"grep": args.grep}, body, int((time.monotonic() - t0) * 1000))
     _emit(body)
     return 0 if body["ok"] else 1
 
@@ -479,7 +745,7 @@ def _click(args) -> int:
             _rc_call("InjectMouseButton", {"Button": "Left", "bPressed": True}, args.project)
             _rc_call("InjectMouseButton", {"Button": "Left", "bPressed": False}, args.project)
     except (AgentError, ValueError, KeyError, json.JSONDecodeError) as exc:
-        body = {"ok": False, "error": str(exc)}
+        body = _err(exc)
     _capture("click", {"label": args.label}, body, int((time.monotonic() - t0) * 1000))
     _emit(body)
     return 0 if body["ok"] else 1
@@ -497,7 +763,7 @@ def _tab(args) -> int:
             body["error"] = (f"no tab '{args.tab_id}' on a live CommonUI tab list "
                              "(is PIE running and the menu open?)")
     except AgentError as exc:
-        body = {"ok": False, "error": str(exc)}
+        body = _err(exc)
     _capture("tab", {"tab": args.tab_id}, body, int((time.monotonic() - t0) * 1000))
     _emit(body)
     return 0 if body["ok"] else 1
@@ -511,7 +777,7 @@ def _nav(args) -> int:
     try:
         body["handled"] = bool(_rc_call("NavigateUI", {"Direction": args.direction}, args.project))
     except AgentError as exc:
-        body = {"ok": False, "error": str(exc)}
+        body = _err(exc)
     _capture("nav", {"direction": args.direction}, body, int((time.monotonic() - t0) * 1000))
     _emit(body)
     return 0 if body["ok"] else 1
@@ -523,7 +789,7 @@ def _read_ui(args) -> int:
     try:
         body["ui"] = _rc_call("DumpViewportUI", {}, args.project)
     except AgentError as exc:
-        body = {"ok": False, "error": str(exc)}
+        body = _err(exc)
     _capture("read-ui", {}, body, int((time.monotonic() - t0) * 1000))
     _emit(body)
     return 0 if body["ok"] else 1
@@ -557,7 +823,7 @@ def _screenshot(args) -> int:
             # proof is a screenshot of a DIFFERENT editor.
             body["provenance"] = _exec_project_name(args.project)
     except AgentError as exc:
-        body = {"ok": False, "error": str(exc)}
+        body = _err(exc)
     _capture("screenshot", {"file": args.file}, body, int((time.monotonic() - t0) * 1000))
     _emit(body)
     return 0 if body["ok"] else 1
@@ -606,6 +872,9 @@ REPORT (a verification is NOT done until `report finish` emits the HTML report; 
 
 PLAY-IN-EDITOR
   uap pie start                   start PIE (version-correct; do NOT use PlayWorldEditorSubsystem)
+  uap pie start --mode vr         start VR PREVIEW instead -- the HMD code path (OpenXR input,
+                                  IsHeadMountedDisplayEnabled branches). Flat PIE takes neither,
+                                  so an HMD-only bug looks absent there. Needs a connected headset.
   uap pie wait <seconds>          block until the game world is live
   uap pie stop
 
@@ -617,13 +886,41 @@ MULTI-AGENT COORDINATION (several agents sharing one editor; see docs/agent-coor
   uap lease release --agent <tok>           # ...then release (pass the SAME token every call)
 
 DRIVE + OBSERVE
-  uap rc <Func> [key=value ...]   call a plugin UFUNCTION (input injection lives here)
+  uap rc <Func> [key=value ...]   call a plugin UFUNCTION (one-shot input injection lives here)
   uap exec "<python>"             run `import unreal; ...` in the editor (escape hatch)
   uap read-ui                     dump on-screen UMG: [{text, x, y}, ...] + focused
   uap click "<label>"             click an on-screen UMG element by its visible text
   uap tab "<TabId>"               select a CommonUI tab by id (menus are tab-driven)
   uap nav up|down|left|right|accept|back   move UI focus / activate (Slate nav path)
   uap screenshot <file>           capture composited game+UMG frame (needs live PIE)
+  uap helpers [--grep RE] [--names]   list the project's test helpers with their arg schemas
+
+SUSTAINED INPUT (a single injected event CANNOT drive locomotion -- see below)
+  uap input hold <Key> --seconds N     hold a digital key; returns at once, held in-engine
+  uap input axis <AxisKey> <v> --seconds N   drive an analog axis -- THE VR LOCOMOTION VERB
+  uap input release                    RECOVERY: release every hold AND flush any key the
+                                       engine still has down (clears a stuck key without a
+                                       PIE restart). Run it if input starts behaving oddly.
+  uap input release <Key>              force-release one key, held or not
+  uap input status                     what is held, for how long, and whether it is really
+                                       down in the engine (`down`)
+  Why: `rc InjectKey bPressed=true` is ONE event. The CLI round-trip is ~1s, so re-injecting
+  per poll cannot cover a sub-second window, and any FlushPressedKeys (input-mode change,
+  focus loss, PC recreation) silently drops a latched key. `input hold/axis` re-asserts the
+  input every frame INSIDE the engine, then releases. VR sticks are AXES, not buttons.
+  Key names are exact FKeys from the engine's own registry (W, C, LeftControl, SpaceBar,
+  Gamepad_LeftY, OculusTouch_Left_Thumbstick_Y). A refused hold presses NOTHING.
+
+SAMPLING + LOGS (sub-second truth; a ~1s exec round-trip cannot see judder or a 0.6s wind-up)
+  uap sample start <object> <property> --seconds N   per-frame series + delta stats
+      object: /Game/... path | actor name in the live world | PlayerPawn | PlayerController
+              | PlayerCameraManager
+      property: dot path (CharacterMovement.Velocity) or a computed leaf
+              (WorldLocation|WorldRotation|WorldScale|WorldTransform|ForwardVector|Velocity)
+  uap sample read [--summary]          read the series (use with `sample start --no-wait`)
+  uap log cursor                       grab a cursor BEFORE driving the condition
+  uap log since <cursor> --grep RE     what the editor logged since then
+  uap log tail --lines 200 --grep RE   the last N captured lines
 
 RECIPES
   Click an on-screen button by label (one call):
@@ -633,15 +930,33 @@ RECIPES
     uap rc InjectMouseMove X=<x> Y=<y> bAbsolute=true
     uap rc InjectMouseButton Button=Left bPressed=true
     uap rc InjectMouseButton Button=Left bPressed=false
-  Press a key (routes through the real input path):
+  Press a key once (routes through the real input path):
     uap rc InjectKey KeyName=E bPressed=true ; uap rc InjectKey KeyName=E bPressed=false
+  WALK for 3 seconds and read state WHILE moving (this is what one-shot injection cannot do):
+    uap input hold W --seconds 3
+    uap rc CallTestHelper Name=... JsonArgs={}      # runs while the key is still held
+  VR locomotion -- push the left stick forward for 3s (thumbstick is an AXIS):
+    uap input axis OculusTouch_Left_Thumbstick_Y 1.0 --seconds 3
   VR controller button:
     uap rc InjectXRButton Hand=Right ButtonKeyName=OculusTouch_Right_Trigger_Click bPressed=true
+  Prove something is smooth (or juddering) at frame rate:
+    uap sample start PlayerCameraManager WorldLocation --seconds 2
+    # -> stats.delta_max / delta_p95 are the per-frame movement; a spiky p95 IS the judder
+  Tie a log line to an action:
+    C=$(uap log cursor | ...)      # grab the cursor first
+    uap input hold W --seconds 2
+    uap log since $C --grep "Janitor|Catch"
+  Input acting up (pawn stuck crouched, movement that won't stop)? Clear it without a restart:
+    uap input status               # what the registry thinks is held + engine `down` truth
+    uap input release              # release all holds AND flush any key still down
   Select a CommonUI tab / move focus:
     uap tab "VRTraining"            # select tab by id
     uap nav down ; uap nav accept   # focus nav + activate
   Read game-truth (preferred over screenshots): uap rc CallTestHelper Name=... JsonArgs={}
-    list helpers: uap rc ListTestHelpers
+    list helpers: uap helpers --names
+
+FLAGS: --project <name> and --agent <token> are accepted by EVERY verb (ignored by the ones
+that don't touch the editor), so you can pass the same pair on every call in a run.
 
 MORE: docs/agent-testing.md (usage), docs/capabilities.md (every tool), docs/known-issues.md.
 Per-verb flags: uap <verb> --help
@@ -655,7 +970,8 @@ def _help(args) -> int:
 
 # Editor-touching verbs auto-wait while another agent is rebuilding this editor (see main()).
 _REBUILD_GUARDED = {"status", "rc", "exec", "exec-file", "pie",
-                    "read-ui", "click", "tab", "nav", "screenshot"}
+                    "read-ui", "click", "tab", "nav", "screenshot",
+                    "input", "sample", "log", "helpers"}
 
 # ...and additionally wait out ANY other agent's exclusive lease (pie / level / rebuild).
 # `status` is deliberately exempt: it is the health probe you reach for WHILE diagnosing a
@@ -692,23 +1008,35 @@ def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="uap")
     sub = p.add_subparsers(dest="cmd", required=True)
 
-    # Shared --project for RC verbs: the RC HTTP port is resolved per editor (by project), so
-    # two editors are each addressed on their own port instead of both hitting 30010.
+    # ONE flag set, accepted by EVERY verb -- including the ones that never touch the editor.
+    # The documented workflow tells agents to pass the SAME --agent token on every related call,
+    # so appending it everywhere is the natural behaviour; a verb that hard-errored on it
+    # (`report assert ... --agent <tok>`: "unrecognized arguments") broke whole runs. --project
+    # is the same class of trap, so it lives here too. Verbs that do not touch the editor accept
+    # and ignore both rather than failing.
+    #
+    # --project also carries the per-editor targeting: the RC HTTP port is resolved per editor
+    # (by project), so two open editors are each addressed on their own port instead of both
+    # hitting 30010. Empty means "first editor that answers", never a hardcoded project.
     proj = argparse.ArgumentParser(add_help=False)
-    proj.add_argument("--project", default=_env_project(),
-                      help="editor to target (default $UAP_PROJECT); RC port resolved per project")
     proj.add_argument("--agent", default=None,
-                      help="your lease token (default $UAP_AGENT_ID). If ANOTHER agent holds the "
-                           "exclusive lease this op waits for it; passing your own token is what "
-                           "stops your own lease from blocking you.")
+                      help="your lease token (default $UAP_AGENT_ID). If ANOTHER agent holds "
+                           "the exclusive lease an editor op waits for it; passing your own "
+                           "token is what stops your own lease from blocking you. Accepted "
+                           "(and ignored) on verbs that do not touch the editor.")
+    proj.add_argument("--project", default=_env_project(),
+                      help="editor to target (default $UAP_PROJECT); RC port resolved per "
+                           "project. Ignored by verbs that do not touch the editor.")
+    common = proj
 
-    sub.add_parser("help", help="catalog of verbs + copy-paste recipes").set_defaults(func=_help)
-    sub.add_parser("tools", help="alias of help").set_defaults(func=_help)
+    sub.add_parser("help", parents=[common],
+                   help="catalog of verbs + copy-paste recipes").set_defaults(func=_help)
+    sub.add_parser("tools", parents=[common], help="alias of help").set_defaults(func=_help)
 
     rep = sub.add_parser("report").add_subparsers(dest="rcmd", required=True)
-    rs = rep.add_parser("start")
+    rs = rep.add_parser("start", parents=[common])
     rs.add_argument("task")
-    rs.add_argument("--project", default=_env_project())
+    # (--project comes from the shared parent; report start records it on the session.)
     # Screenshot proof is REQUIRED by default: `finish pass` auto-downgrades to fail unless a
     # screenshot is attached. --require-screenshot is the (now redundant) explicit-on;
     # --no-require-screenshot opts out for a genuinely headless/no-visual check.
@@ -717,23 +1045,22 @@ def build_parser() -> argparse.ArgumentParser:
     rs.add_argument("--no-require-screenshot", dest="require_screenshot", action="store_false",
                     help="rare: allow a pass with no screenshot (justify in the summary)")
     rs.set_defaults(func=_report_start)
-    ra = rep.add_parser("assert")
+    ra = rep.add_parser("assert", parents=[common])
     ra.add_argument("label")
     ra.add_argument("verdict", choices=["pass", "fail"])
     ra.add_argument("evidence", nargs="?", default="")
     ra.set_defaults(func=_report_assert)
-    rn = rep.add_parser("note")
+    rn = rep.add_parser("note", parents=[common])
     rn.add_argument("text")
     rn.set_defaults(func=_report_note)
-    rd = rep.add_parser("diag")
-    rd.add_argument("--project", default=_env_project(),
-                    help="editor project to source diagnostics from (default $UAP_PROJECT, via exec)")
+    rd = rep.add_parser("diag", parents=[common])
+    # --project (shared parent) selects the editor these diagnostics are read from, via exec.
     rd.set_defaults(func=_report_diag)
-    rsh = rep.add_parser("screenshot")
+    rsh = rep.add_parser("screenshot", parents=[common])
     rsh.add_argument("file")
     rsh.add_argument("--caption", default="")
     rsh.set_defaults(func=_report_screenshot)
-    rf = rep.add_parser("finish")
+    rf = rep.add_parser("finish", parents=[common])
     rf.add_argument("verdict", choices=["pass", "fail"])
     rf.add_argument("summary")
     rf.add_argument("--keep-pie", action="store_true",
@@ -756,7 +1083,12 @@ def build_parser() -> argparse.ArgumentParser:
     exf.add_argument("path")
     exf.set_defaults(func=_exec_file)
     pie = sub.add_parser("pie").add_subparsers(dest="pie_cmd", required=True)
-    pie.add_parser("start", parents=[proj]).set_defaults(func=_pie)
+    ps = pie.add_parser("start", parents=[proj])
+    ps.add_argument("--mode", choices=["flat", "vr"], default="flat",
+                    help="'vr' uses the editor's VR Preview -- the HMD code path (OpenXR input, "
+                         "IsHeadMountedDisplayEnabled branches) that flat PIE never takes. "
+                         "Needs a connected headset; fails with a reason if there is none.")
+    ps.set_defaults(func=_pie)
     pie.add_parser("stop", parents=[proj]).set_defaults(func=_pie)
     pw = pie.add_parser("wait", parents=[proj])
     pw.add_argument("seconds", type=float, help="max seconds to wait for PIE to be live")
@@ -777,6 +1109,83 @@ def build_parser() -> argparse.ArgumentParser:
     sc.add_argument("file")
     sc.add_argument("--caption", default="")
     sc.set_defaults(func=_screenshot)
+
+    # Sustained input. The plugin re-asserts the input every frame in-engine for the duration,
+    # which is the only way to hold anything across a ~1s CLI round-trip -- and the only way to
+    # drive an analog stick at all, since a real stick re-sends its value every frame.
+    inp = sub.add_parser("input", help="hold a key / drive an analog axis for N seconds")
+    inps = inp.add_subparsers(dest="input_cmd", required=True)
+    ih = inps.add_parser("hold", parents=[proj], help="hold a digital key for N seconds")
+    ih.add_argument("key", help="FKey name, e.g. W / SpaceBar / OculusTouch_Right_Trigger_Click")
+    ih.add_argument("--seconds", type=float, default=1.0)
+    ih.add_argument("--wait", action="store_true",
+                    help="block until the hold expires (default: return immediately so you can "
+                         "read game state WHILE it is held)")
+    ih.set_defaults(func=_input)
+    ia = inps.add_parser("axis", parents=[proj],
+                         help="drive an analog axis FKey for N seconds (VR/gamepad sticks)")
+    ia.add_argument("key", help="axis FKey, e.g. OculusTouch_Left_Thumbstick_Y or Gamepad_LeftY")
+    ia.add_argument("value", type=float, help="-1.0 .. 1.0")
+    ia.add_argument("--seconds", type=float, default=1.0)
+    ia.add_argument("--wait", action="store_true", help="block until the hold expires")
+    ia.set_defaults(func=_input)
+    ir = inps.add_parser("release", parents=[proj], help="end a hold early (default: all holds)")
+    ir.add_argument("key", nargs="?", default="", help="FKey name; omit to release everything")
+    ir.set_defaults(func=_input)
+    inps.add_parser("status", parents=[proj],
+                    help="what is currently held and for how much longer").set_defaults(func=_input)
+
+    # Frame-rate property sampling: sub-second behaviour a ~1s exec round-trip cannot see.
+    smp = sub.add_parser("sample", help="record a property per-frame in-engine, return the series")
+    smps = smp.add_subparsers(dest="sample_cmd", required=True)
+    sst = smps.add_parser("start", parents=[proj], help="sample a property for N seconds")
+    sst.add_argument("object", help="object path (/Game/...), an actor name in the live world, "
+                                    "or PlayerPawn / PlayerController / PlayerCameraManager")
+    sst.add_argument("property", help="dot path, e.g. CharacterMovement.Velocity, or a computed "
+                                      "leaf: WorldLocation|WorldRotation|WorldScale|"
+                                      "WorldTransform|ForwardVector|Velocity")
+    sst.add_argument("--seconds", type=float, default=2.0)
+    sst.add_argument("--max-samples", dest="max_samples", type=int, default=5000)
+    sst.add_argument("--no-wait", dest="no_wait", action="store_true",
+                     help="return as soon as sampling starts (read it later with `sample read`)")
+    sst.add_argument("--summary", action="store_true",
+                     help="omit the raw series; keep only the stats")
+    sst.set_defaults(func=_sample)
+    sr = smps.add_parser("read", parents=[proj], help="read the series collected so far")
+    sr.add_argument("--summary", action="store_true")
+    sr.set_defaults(func=_sample_read)
+
+    # Editor log, through the plugin's in-process capture -- same project targeting as every
+    # other verb, and the lines land in the report instead of a side-channel shell tail.
+    lg = sub.add_parser("log", help="read the editor log (cursor-based, grep-able)")
+    lgs = lg.add_subparsers(dest="log_cmd", required=True)
+    for name, helptext in (("tail", "the last N captured lines"),
+                           ("since", "lines after a cursor from an earlier call")):
+        lp = lgs.add_parser(name, parents=[proj], help=helptext)
+        lp.add_argument("--lines", type=int, default=200)
+        lp.add_argument("--grep", default="", help="case-insensitive regex over the message")
+        lp.add_argument("--category", default="", help="exact log category, e.g. LogUAP")
+        lp.add_argument("--verbosity", default="Log",
+                        choices=["Fatal", "Error", "Warning", "Display", "Log",
+                                 "Verbose", "VeryVerbose"],
+                        help="minimum verbosity to include (default Log)")
+        lp.add_argument("--since", type=int, default=0,
+                        help="cursor from a previous call (required for `log since`)")
+        if name == "since":
+            # Positional form too -- `uap log since 42` is what the docs show and what reads
+            # naturally; only accepting --since made the documented incantation an error.
+            lp.add_argument("cursor", type=int, nargs="?", default=None,
+                            help="cursor from `uap log cursor` (same as --since)")
+        lp.set_defaults(func=_log)
+    lgs.add_parser("cursor", parents=[proj],
+                   help="current log cursor -- grab one BEFORE driving the condition"
+                   ).set_defaults(func=_log)
+
+    hp = sub.add_parser("helpers", parents=[proj],
+                        help="list the project's test helpers (names + arg schemas)")
+    hp.add_argument("--grep", default="", help="case-insensitive regex over name/category")
+    hp.add_argument("--names", action="store_true", help="just the names")
+    hp.set_defaults(func=_helpers)
 
     # Multi-agent coordination: a per-editor lease so agents take turns instead of stepping on
     # each other. See docs/agent-coordination.md. Editor-touching verbs auto-wait through a

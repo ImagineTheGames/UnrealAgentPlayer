@@ -152,7 +152,7 @@ class PythonRemoteExecClient:
       4. We send a `command` over that TCP socket and read the `command_result`.
       5. We broadcast `close_connection`.
 
-    Messages are bare JSON (UTF-8), one object per datagram / per TCP exchange —
+    Messages are bare JSON (UTF-8), one object per datagram / per TCP exchange --
     no length prefix, no null framing.
     """
 
@@ -168,6 +168,12 @@ class PythonRemoteExecClient:
     T_CLOSE_CONNECTION = "close_connection"
     T_COMMAND = "command"
     T_COMMAND_RESULT = "command_result"
+
+    # A live editor occasionally resets the command socket mid-exec. That is transient --
+    # the next call succeeds -- so retry a couple of times with a short backoff instead of
+    # surfacing a raw ConnectionResetError traceback and losing the sample.
+    CONNECTION_RETRIES = 3
+    RETRY_BACKOFF = (0.25, 0.75)
 
     def __init__(self, discovery_timeout: float = 3.0, exec_timeout: float = 30.0,
                  command_ip: str = "127.0.0.1", node_project_substr: str | None = None):
@@ -222,7 +228,28 @@ class PythonRemoteExecClient:
         If multiple editors answer (e.g. two projects open at once) and
         node_project_substr is set, the editor whose project file path contains
         that substring is chosen; otherwise the first responder is used.
+
+        A dropped connection mid-exec (WinError 10054 and friends) is retried with a
+        small bounded backoff: the editor sometimes resets the command socket while
+        healthy, and losing a whole poll sample to a raw traceback is not acceptable.
+        Retries re-run discovery, so the SAME project filter is re-applied every attempt
+        -- a retry can never land on a different editor.
         """
+        last_exc: AgentError | None = None
+        for attempt in range(self.CONNECTION_RETRIES):
+            try:
+                return self._exec_python_once(code, unattended=unattended, exec_mode=exec_mode)
+            except AgentError as exc:
+                if exc.code is not ErrorCode.UE_CONNECTION_RESET:
+                    raise
+                last_exc = exc
+                if attempt < self.CONNECTION_RETRIES - 1:
+                    time.sleep(self.RETRY_BACKOFF[attempt])
+        assert last_exc is not None
+        raise last_exc
+
+    def _exec_python_once(self, code: str, *, unattended: bool,
+                          exec_mode: str) -> dict[str, Any]:
         try:
             mcast = self._make_multicast_socket()
         except OSError as exc:
@@ -290,6 +317,11 @@ class PythonRemoteExecClient:
                 if seen and first_at is not None and (time.monotonic() - first_at) >= settle:
                     break
                 continue
+            except OSError:
+                # Windows surfaces an ICMP port-unreachable from a previous datagram as a
+                # reset on the NEXT recvfrom of a UDP socket. Not fatal to discovery: keep
+                # pinging until the deadline.
+                continue
             msg = self._decode(raw)
             if msg and msg.get("type") == self.T_PONG and msg.get("source"):
                 src = str(msg["source"])
@@ -346,6 +378,8 @@ class PythonRemoteExecClient:
                     break
                 except socket.timeout:
                     continue
+                except OSError:
+                    continue
             if conn is None:
                 raise AgentError(
                     ErrorCode.UE_REMOTE_EXEC_OFF,
@@ -354,13 +388,23 @@ class PythonRemoteExecClient:
             try:
                 with conn:
                     conn.settimeout(self._exec_timeout)
-                    conn.sendall(self._encode(
-                        self.T_COMMAND, dest=node,
-                        data={"command": code, "unattended": unattended,
-                              "exec_mode": exec_mode}))
+                    try:
+                        conn.sendall(self._encode(
+                            self.T_COMMAND, dest=node,
+                            data={"command": code, "unattended": unattended,
+                                  "exec_mode": exec_mode}))
+                    except OSError as exc:
+                        raise AgentError(
+                            ErrorCode.UE_CONNECTION_RESET,
+                            f"Editor closed the command connection while sending: {exc}",
+                            retry_hint="transient; retry the call",
+                        ) from exc
                     return self._read_command_result(conn)
             finally:
-                mcast.sendto(self._encode(self.T_CLOSE_CONNECTION, dest=node), dest)
+                try:
+                    mcast.sendto(self._encode(self.T_CLOSE_CONNECTION, dest=node), dest)
+                except OSError:
+                    pass  # best-effort teardown; never mask the real error
         finally:
             cmd_server.close()
 
@@ -371,6 +415,16 @@ class PythonRemoteExecClient:
                 chunk = conn.recv(65536)
             except socket.timeout:
                 break
+            except OSError as exc:
+                # WinError 10054 / ECONNRESET: the editor dropped the command socket mid-read.
+                # Seen against a healthy PIE session -- the next call works -- so report it as a
+                # distinguishable, retryable transport error rather than letting a raw
+                # ConnectionResetError traceback escape and kill the caller's poll loop.
+                raise AgentError(
+                    ErrorCode.UE_CONNECTION_RESET,
+                    f"Editor reset the command connection mid-exec: {exc}",
+                    retry_hint="transient; retry the call",
+                ) from exc
             if not chunk:
                 break
             buf += chunk

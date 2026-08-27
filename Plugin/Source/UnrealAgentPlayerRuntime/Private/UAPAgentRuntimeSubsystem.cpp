@@ -4,6 +4,7 @@
 #include "AgentInput.h"
 #include "AgentLogCapture.h"
 #include "AgentHelperDiscovery.h"
+#include "AgentSampler.h"
 #include "AgentMotionController.h"
 #include "AgentUIReader.h"
 #include "AgentWorld.h"
@@ -134,6 +135,45 @@ bool UUAPAgentRuntimeSubsystem::InjectXRButton(EAgentXRHand Hand, FString Button
     return FAgentInput::InjectKey(Key, bPressed, false);
 }
 
+// Thin forwarders: the validate-before-press ordering, the refusal messages and the recovery
+// path all live in FAgentInput so the editor and runtime subsystems cannot drift apart.
+FString UUAPAgentRuntimeSubsystem::HoldKey(FString KeyName, float Seconds)
+{
+    return FAgentInput::HoldKeyJson(KeyName, Seconds);
+}
+
+FString UUAPAgentRuntimeSubsystem::HoldAxis(FString AxisKeyName, float Value, float Seconds)
+{
+    return FAgentInput::HoldAxisJson(AxisKeyName, Value, Seconds);
+}
+
+FString UUAPAgentRuntimeSubsystem::ReleaseHeldInput(FString KeyName)
+{
+    return FAgentInput::ReleaseHeldJson(KeyName);
+}
+
+FString UUAPAgentRuntimeSubsystem::GetHeldInput()
+{
+    return FAgentInput::GetHeldJson();
+}
+
+FString UUAPAgentRuntimeSubsystem::StartPropertySample(FString ObjectPath, FString PropertyPath,
+                                                       float Seconds, int32 MaxSamples)
+{
+    return FAgentSampler::Start(ObjectPath, PropertyPath, Seconds, MaxSamples);
+}
+
+FString UUAPAgentRuntimeSubsystem::ReadPropertySample()
+{
+    return FAgentSampler::Read();
+}
+
+bool UUAPAgentRuntimeSubsystem::StopPropertySample()
+{
+    FAgentSampler::Stop();
+    return true;
+}
+
 bool UUAPAgentRuntimeSubsystem::InjectXRControllerPose(EAgentXRHand Hand, FVector Position, FRotator Orientation, bool bTracked)
 {
     FUnrealAgentPlayerRuntimeModule* Rtm = FUnrealAgentPlayerRuntimeModule::Get();
@@ -227,6 +267,11 @@ TArray<FAgentHelperDescriptor> UUAPAgentRuntimeSubsystem::ListTestHelpers()
     return HelperCache;
 }
 
+FString UUAPAgentRuntimeSubsystem::ListTestHelpersJson()
+{
+    return FAgentHelperDiscovery::ToJson(ListTestHelpers());
+}
+
 FString UUAPAgentRuntimeSubsystem::CallTestHelper(FString Name, FString JsonArgs)
 {
     UClass* Cls = nullptr;
@@ -236,7 +281,7 @@ FString UUAPAgentRuntimeSubsystem::CallTestHelper(FString Name, FString JsonArgs
         return TEXT(R"({"ok":false,"error":{"code":"HELPER_UNKNOWN","message":"helper not found"}})");
     }
 
-    // Runtime: no PIE phase gating — game is always "Playing" when this subsystem is live.
+    // Runtime: no PIE phase gating -- game is always "Playing" when this subsystem is live.
     // Still respect the Phase metadata to catch misuse (e.g. editor-only helpers called at runtime).
     // UFunction metadata is editor-only (WITH_EDITORONLY_DATA); this DeveloperTool module also
     // compiles into non-editor Development builds where the metadata API does not exist - there

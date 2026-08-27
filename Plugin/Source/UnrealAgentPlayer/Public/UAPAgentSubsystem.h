@@ -48,6 +48,14 @@ public:
 
     // Stops Play-In-Editor. Wraps ULevelEditorSubsystem::EditorRequestEndPlay. Returns false
     // if the editor subsystem is unavailable.
+    // Starts PIE in a specific play mode. Mode: "flat" (default PIE window) or "vr"
+    // (the editor's VR Preview, i.e. the HMD code path -- OpenXR input, IsHeadMountedDisplay
+    // Enabled() branches). Returns a JSON status: {"ok":true,"mode":"vr"} or
+    // {"ok":false,"error":"..."}; "vr" fails cleanly when no HMD is connected instead of
+    // silently starting flat PIE and making an HMD-only bug look absent.
+    UFUNCTION(BlueprintCallable, Category="Agent|PIE")
+    FString StartPIEMode(FString Mode);
+
     UFUNCTION(BlueprintCallable, Category="Agent|PIE")
     bool StopPIE();
 
@@ -81,6 +89,41 @@ public:
     UFUNCTION(BlueprintCallable, Category="Agent|Input")
     bool InjectXRButton(EAgentXRHand Hand, FString ButtonKeyName, bool bPressed);
 
+    // --- Sustained input ------------------------------------------------------------------
+    // One injected event cannot drive sustained locomotion from outside the editor: the CLI
+    // round-trip is ~1s, and a latched key is silently dropped by any FlushPressedKeys. These
+    // re-assert the input every frame IN-ENGINE for Seconds, then release cleanly.
+    //
+    // All four return JSON so a refusal can say WHY. They validate fully BEFORE injecting, so
+    // a refusal has zero side effects ("pressed":false is part of the contract), and they
+    // unwind anything they pressed if a later step fails.
+
+    // Press KeyName and hold it for Seconds (IE_Repeat every frame), then release.
+    // {"ok":true,"key":..,"seconds":..,"pressed":true} | {"ok":false,"key":..,"error":..,"pressed":false}
+    UFUNCTION(BlueprintCallable, Category="Agent|Input")
+    FString HoldKey(FString KeyName, float Seconds);
+
+    // Drive an analog axis FKey at Value every frame for Seconds, then recentre to 0. This is
+    // the VR locomotion verb: thumbstick keys are axes, not buttons (e.g.
+    // OculusTouch_Left_Thumbstick_Y). A single sample is not what the game sees -- a real
+    // stick re-sends its value every frame.
+    UFUNCTION(BlueprintCallable, Category="Agent|Input")
+    FString HoldAxis(FString AxisKeyName, float Value, float Seconds);
+
+    // Release input, and the RECOVERY escape hatch. An empty KeyName releases every registry
+    // entry AND flushes every key the engine still has down, so a key the registry lost track
+    // of can always be cleared without restarting PIE. A named key is force-released whether
+    // or not the registry knows about it.
+    // {"ok":true,"released":N,"controllers_flushed":N,"flushed":bool}
+    // {"ok":true,"key":..,"released":N,"was_held":bool,"forced":bool,"down_before":bool}
+    UFUNCTION(BlueprintCallable, Category="Agent|Input")
+    FString ReleaseHeldInput(FString KeyName);
+
+    // JSON: {"ok":true,"held":[{key, analog, value, remaining_seconds, down}]}. `down` is
+    // engine ground truth; if it disagrees with the registry, use ReleaseHeldInput("").
+    UFUNCTION(BlueprintCallable, Category="Agent|Input")
+    FString GetHeldInput();
+
     UFUNCTION(BlueprintCallable, Category="Agent|Input")
     bool InjectXRControllerPose(EAgentXRHand Hand, FVector Position, FRotator Orientation, bool bTracked);
 
@@ -89,6 +132,27 @@ public:
 
     UFUNCTION(BlueprintCallable, Category="Agent|Helpers")
     TArray<FAgentHelperDescriptor> ListTestHelpers();
+
+    // Same list as ListTestHelpers, as a JSON string. Use THIS from an agent CLI: the
+    // RemoteControl preset-call route serializes a returned struct with a property filter
+    // that only admits the function's own out/return params, so every nested field of
+    // FAgentHelperDescriptor is dropped and ListTestHelpers comes back as [{},{},...].
+    // A JSON string return sidesteps the engine filter entirely (same shape as
+    // DumpViewportUI / GetLogsSince / CallTestHelper).
+    UFUNCTION(BlueprintCallable, Category="Agent|Helpers")
+    FString ListTestHelpersJson();
+
+    // --- Frame-rate sampling ---------------------------------------------------------------
+    // Records a property once per frame in-engine, so an agent can measure sub-second behaviour
+    // (judder, a 0.6s wind-up, a one-frame pop) that a ~1s exec round-trip cannot see.
+    UFUNCTION(BlueprintCallable, Category="Agent|Sample")
+    FString StartPropertySample(FString ObjectPath, FString PropertyPath, float Seconds, int32 MaxSamples);
+
+    UFUNCTION(BlueprintCallable, Category="Agent|Sample")
+    FString ReadPropertySample();
+
+    UFUNCTION(BlueprintCallable, Category="Agent|Sample")
+    bool StopPropertySample();
 
     UFUNCTION(BlueprintCallable, Category="Agent|Helpers")
     FString CallTestHelper(FString Name, FString JsonArgs);
