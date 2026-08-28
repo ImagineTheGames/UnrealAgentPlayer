@@ -38,6 +38,26 @@ def test_launcher_template_resolves_engine_like_the_engine_does():
     assert not [ln for ln in code if "InstalledDirectory" in ln]
 
 
+def test_launcher_template_prefers_a_resolver_the_project_already_has():
+    """A project that has its own engine resolver has it because it made a rule of it ("never
+    add a second resolver: route new scripts through this one"). The template used to inline a
+    copy unconditionally, so every generated launcher carried one and a fix had to be
+    re-applied per project -- which is why SchoolsOutVR deliberately does not use the
+    template's version. Prefer theirs; keep the inline copy as the fallback so a project with
+    no resolver is unaffected."""
+    text = _read("uap.ps1.template")
+    # The known resolvers, probed by path.
+    assert "Scripts\\Resolve-UnrealEngine.ps1" in text        # SchoolsOutVR
+    assert ".claude\\scripts\\find-engine.ps1" in text        # Project Broken Wings
+    # Their parameter contracts differ and may change, so the call degrades instead of
+    # assuming one: richest form first, then plainer, then the inline fallback.
+    assert "Resolve-EditorExeViaProject" in text
+    assert "Resolve-EditorExe $projectRoot" in text, "the inline fallback must still be reachable"
+    # ...and the project's own resolver is consulted FIRST.
+    assert text.index("Resolve-EditorExeViaProject $projectRoot") < \
+        text.index("if (-not $exe) { $exe = Resolve-EditorExe $projectRoot }")
+
+
 def test_command_template_is_project_agnostic():
     text = _read("agentplayertest.md")
     low = text.lower()
@@ -81,3 +101,33 @@ def test_docs_no_stale_slate_input_claim():
         text = (REPO / rel).read_text(encoding="utf-8")
         assert "ProcessKeyDownEvent" not in text, rel
         assert "in-process via Slate" not in text, rel
+
+
+def test_layer_mismatch_section_is_titled_for_five_and_says_the_headline_once():
+    """Three of the five traps are one risk -- input you injected silently never arriving. The
+    PBW director asked for that stated plainly and prominently rather than inferred across five
+    entries, because it is the single biggest way this tooling produces a confident wrong answer.
+    Pinned so a later edit cannot quietly drop it (or leave the title saying four)."""
+    text = _read("agentplayertest.md")
+    assert "## Layer mismatches -- five traps" in text
+    assert "four traps" not in text
+    assert "Three of these five are the same headline risk" in text
+    assert "input you injected silently never arrives" in text
+
+
+def test_the_fifth_trap_is_its_own_mechanism_not_a_footnote_of_the_second():
+    """#2 is the wrong LAYER, #5 is the right layer with the wrong USER. Conflating them costs
+    the fix, so the entry must carry the engine citation and the distinction."""
+    text = _read("agentplayertest.md")
+    assert "### 5. Injected input aimed at the WRONG SLATE USER" in text
+    assert "AnalogCursor.cpp:192" in text
+    assert "Distinct from #2" in text
+    assert "--user" in text
+
+
+def test_agents_snippet_carries_the_fifth_trap_and_the_headline():
+    text = _read("AGENTS-snippet.md")
+    assert "Five tooling traps" in text
+    assert "THREE OF THE FIVE ARE THE SAME HEADLINE" in text
+    assert "WRONG SLATE USER" in text
+    assert "AnalogCursor.cpp:192" in text

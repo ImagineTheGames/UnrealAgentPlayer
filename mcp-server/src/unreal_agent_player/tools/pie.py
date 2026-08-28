@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+import asyncio
+import time
 from typing import Any
 
 from unreal_agent_player.errors import AgentError, ErrorCode
-from unreal_agent_player.transport import RemoteControlClient, SUBSYSTEM_OBJECT_PATH
+from unreal_agent_player.transport import SUBSYSTEM_OBJECT_PATH, RemoteControlClient
 
 
 async def _get_phase(rc: RemoteControlClient) -> str:
@@ -49,15 +51,45 @@ async def pie_start(
         # UE 5.7: editor_play() does not exist; editor_request_begin_play() starts PIE.
         lines.append("_les.editor_request_begin_play()")
     py_exec.exec_python("\n".join(lines))
-    return {"ok": True, "phase": await _get_phase(rc), "elapsed": await _get_elapsed(rc)}
+    # An ack of QUEUED work, said out loud: RequestPlaySession only queues the session and the
+    # editor tick creates the play world later, so the phase below is not "the world exists".
+    # Poll pie_status until the phase is Playing before reading game state or capturing a frame.
+    return {"ok": True, "queued": True, "confirmed": False,
+            "phase": await _get_phase(rc), "elapsed": await _get_elapsed(rc)}
 
 
-async def pie_stop(*, rc: RemoteControlClient, py_exec: Any) -> dict[str, Any]:
+PIE_STOP_TIMEOUT_SECONDS = 30.0
+_PIE_STOP_POLL_SECONDS = 0.5
+
+
+async def pie_stop(*, rc: RemoteControlClient, py_exec: Any,
+                   timeout: float = PIE_STOP_TIMEOUT_SECONDS) -> dict[str, Any]:
+    """Stop PIE and do not return ok:true until the world is actually gone.
+
+    Two things this must not do, both of which it used to (see known-issues #25):
+
+    * Call `LevelEditorSubsystem.editor_request_end_play()` directly. That is a NO-OP unless the
+      play world already exists, so a stop landing between "start queued" and "play world created"
+      did nothing and the queued start then brought PIE up afterwards. The plugin's `stop_pie()`
+      CANCELS a queued start first, which serialises the stop against the engine's queued work.
+    * Report the phase read immediately after the request. Teardown happens on a later editor tick,
+      so that read is an ack of the request, not a result -- poll until the phase settles.
+    """
     py_exec.exec_python(
         "import unreal\n"
-        "unreal.get_editor_subsystem(unreal.LevelEditorSubsystem).editor_request_end_play()"
+        "unreal.get_editor_subsystem(unreal.UAPAgentSubsystem).stop_pie()"
     )
-    return {"ok": True, "phase": await _get_phase(rc)}
+    deadline = time.monotonic() + max(0.0, timeout)
+    phase = await _get_phase(rc)
+    while phase != "NotPlaying" and time.monotonic() < deadline:
+        await asyncio.sleep(_PIE_STOP_POLL_SECONDS)
+        phase = await _get_phase(rc)
+    stopped = phase == "NotPlaying"
+    out: dict[str, Any] = {"ok": stopped, "stopped": stopped, "phase": phase}
+    if not stopped:
+        out["error"] = (f"PIE still in phase {phase!r} {timeout}s after the stop request -- the "
+                        "editor is NOT free. Do not hand it to another agent; retry the stop.")
+    return out
 
 
 async def pie_pause(*, rc: RemoteControlClient, py_exec: Any) -> dict[str, Any]:

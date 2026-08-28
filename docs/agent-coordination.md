@@ -45,7 +45,8 @@ Record shape:
   a holder whose `pid` is no longer alive, OR whose `heartbeat_at` is older than its `ttl`
   (crash-safe: a dead agent never wedges the editor). Grant when: exclusive -> no other holders;
   shared -> no exclusive holder. On cap exceeded, return `busy` with the current holder.
-- **release(agent):** drop this agent's record.
+- **release(agent):** drop this agent's record. **Refuses while PIE is still in progress** (see
+  below) unless `--force`.
 - **heartbeat(agent):** refresh `heartbeat_at` for long holds.
 - **status:** dump holders + queue for humans/agents.
 - **generation:** bumped when the editor bounces (rebuild). Shared holders re-sync (their RC
@@ -97,11 +98,29 @@ stable per-agent id (see above). So v1 splits into automatic and opt-in:
 **Explicit (opt-in, needs a consistent `--agent` token):**
 - `uap lease acquire exclusive --reason pie|level:<path> --agent <tok> --wait 900` ... `uap lease
   release --agent <tok>` -- for holding PIE / a specific level across several calls so another agent
-  serializes behind you. `uap lease status` shows contention; `uap lease heartbeat --agent <tok>`
+  serializes behind you. Stop PIE (and see it confirmed) BEFORE releasing -- release refuses while a
+  session is live. `uap lease status` shows contention; `uap lease heartbeat --agent <tok>`
   extends a long hold.
 - **Carry that same token on your editor ops** (`--agent <tok>`, or export `UAP_AGENT_ID=<tok>`),
   or your own exclusive lease will block you. There is no reliable auto-identity in this harness,
   so an unidentified call is indistinguishable from a stranger's.
+
+### Release must hand over a CLEAN editor
+
+`uap lease release` is the moment the system says "the editor is free"; the next agent acquires on
+that word alone and never re-checks. So release now asks the editor whether PIE is still in
+progress (`IsPIEInProgress`, degrading to `IsInPIE` on an older plugin copy) and **refuses** while
+it is, telling the caller to `uap pie stop` first. `--force` releases anyway, for a deliberate
+handover of a live session. It is fail-open on an unreachable editor -- a dead editor has no PIE
+session, and a coordination check must never wedge the lease.
+
+Why this one is worth a hard refusal rather than a warning: a `pie stop` that lies is recoverable
+if the caller checks, but a release granted on that lie is not. By the time anyone notices, a
+DIFFERENT agent already holds the lease and is driving an editor still in PIE, and nothing in the
+system will ever tell either of them. That was live until 2026-08-28, because `pie stop` answered
+`ok:true` for a stop that had not happened (known-issues #25) and release took its word for it.
+`pie stop` now confirms the teardown and fails loudly if it does not happen; the release guard is
+the second line, for every other way a session can still be live.
 
 TTL is "time since the holder's last `uap` call": every editor op by the holder heartbeats its own
 lease, so an actively-working agent never needs manual heartbeating, while an abandoned hold ages

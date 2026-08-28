@@ -4,6 +4,7 @@
 #include "AgentInput.h"
 #include "AgentLogCapture.h"
 #include "AgentHelperDiscovery.h"
+#include "AgentSampler.h"
 #include "AgentMotionController.h"
 #include "AgentUIReader.h"
 #include "AgentWorld.h"
@@ -113,14 +114,30 @@ bool UUAPAgentRuntimeSubsystem::InjectMouseButton(EAgentMouseButton Button, bool
     return FAgentInput::InjectMouseButton(Button, bPressed);
 }
 
-bool UUAPAgentRuntimeSubsystem::InjectAxis(FString AxisName, float Value)
+bool UUAPAgentRuntimeSubsystem::InjectAxis(FString AxisName, float Value, FString SlateUser)
 {
-    return FAgentInput::InjectAxis(FName(*AxisName), Value);
+    int32 User = INDEX_NONE;
+    FString UserError;
+    if (!FAgentInput::ResolveSlateUserParam(SlateUser, User, UserError))
+    {
+        // bool cannot carry a reason, so the reason goes to the log where `uap log since`
+        // will find it. Silence here is what made the original defect unfileable.
+        UE_LOG(LogUAPRuntime, Error, TEXT("InjectAxis: %s"), *UserError);
+        return false;
+    }
+    return FAgentInput::InjectAxis(FName(*AxisName), Value, User);
 }
 
-bool UUAPAgentRuntimeSubsystem::InjectGamepad(EAgentGamepadButton Button, bool bPressed, float AnalogValue)
+bool UUAPAgentRuntimeSubsystem::InjectGamepad(EAgentGamepadButton Button, bool bPressed, float AnalogValue, FString SlateUser)
 {
-    return FAgentInput::InjectGamepad(Button, bPressed, AnalogValue);
+    int32 User = INDEX_NONE;
+    FString UserError;
+    if (!FAgentInput::ResolveSlateUserParam(SlateUser, User, UserError))
+    {
+        UE_LOG(LogUAPRuntime, Error, TEXT("InjectGamepad: %s"), *UserError);
+        return false;
+    }
+    return FAgentInput::InjectGamepad(Button, bPressed, AnalogValue, User);
 }
 
 bool UUAPAgentRuntimeSubsystem::InjectXRButton(EAgentXRHand Hand, FString ButtonKeyName, bool bPressed)
@@ -132,6 +149,46 @@ bool UUAPAgentRuntimeSubsystem::InjectXRButton(EAgentXRHand Hand, FString Button
         return false;
     }
     return FAgentInput::InjectKey(Key, bPressed, false);
+}
+
+// Thin forwarders: the validate-before-press ordering, the refusal messages and the recovery
+// path all live in FAgentInput so the editor and runtime subsystems cannot drift apart.
+FString UUAPAgentRuntimeSubsystem::HoldKey(FString KeyName, float Seconds)
+{
+    return FAgentInput::HoldKeyJson(KeyName, Seconds);
+}
+
+FString UUAPAgentRuntimeSubsystem::HoldAxis(FString AxisKeyName, float Value, float Seconds,
+                                            FString SlateUser)
+{
+    return FAgentInput::HoldAxisJson(AxisKeyName, Value, Seconds, SlateUser);
+}
+
+FString UUAPAgentRuntimeSubsystem::ReleaseHeldInput(FString KeyName)
+{
+    return FAgentInput::ReleaseHeldJson(KeyName);
+}
+
+FString UUAPAgentRuntimeSubsystem::GetHeldInput()
+{
+    return FAgentInput::GetHeldJson();
+}
+
+FString UUAPAgentRuntimeSubsystem::StartPropertySample(FString ObjectPath, FString PropertyPath,
+                                                       float Seconds, int32 MaxSamples)
+{
+    return FAgentSampler::Start(ObjectPath, PropertyPath, Seconds, MaxSamples);
+}
+
+FString UUAPAgentRuntimeSubsystem::ReadPropertySample()
+{
+    return FAgentSampler::Read();
+}
+
+bool UUAPAgentRuntimeSubsystem::StopPropertySample()
+{
+    FAgentSampler::Stop();
+    return true;
 }
 
 bool UUAPAgentRuntimeSubsystem::InjectXRControllerPose(EAgentXRHand Hand, FVector Position, FRotator Orientation, bool bTracked)
@@ -227,6 +284,11 @@ TArray<FAgentHelperDescriptor> UUAPAgentRuntimeSubsystem::ListTestHelpers()
     return HelperCache;
 }
 
+FString UUAPAgentRuntimeSubsystem::ListTestHelpersJson()
+{
+    return FAgentHelperDiscovery::ToJson(ListTestHelpers());
+}
+
 FString UUAPAgentRuntimeSubsystem::CallTestHelper(FString Name, FString JsonArgs)
 {
     UClass* Cls = nullptr;
@@ -236,7 +298,7 @@ FString UUAPAgentRuntimeSubsystem::CallTestHelper(FString Name, FString JsonArgs
         return TEXT(R"({"ok":false,"error":{"code":"HELPER_UNKNOWN","message":"helper not found"}})");
     }
 
-    // Runtime: no PIE phase gating — game is always "Playing" when this subsystem is live.
+    // Runtime: no PIE phase gating -- game is always "Playing" when this subsystem is live.
     // Still respect the Phase metadata to catch misuse (e.g. editor-only helpers called at runtime).
     // UFunction metadata is editor-only (WITH_EDITORONLY_DATA); this DeveloperTool module also
     // compiles into non-editor Development builds where the metadata API does not exist - there

@@ -8,11 +8,35 @@
 # when NO Unreal editor is running (CI has none; local dev usually does), so running it
 # here would false-block legitimate pushes.
 
+#
+# It also blocks a push that CHANGES a plugin UFUNCTION signature without saying so in a
+# commit message -- see CONTRIBUTING.md, "Changing a signature". Override: UAP_SKIP_SIGCHECK=1.
+
 root=$(git rev-parse --show-toplevel) || exit 0
+
+# The remote's current sha for the branch being pushed, read from the refs git feeds us on
+# stdin. All-zero means the branch is new on the remote -- compare against origin/main instead.
+base=""
+while read -r _local_ref _local_sha _remote_ref remote_sha; do
+    case "$remote_sha" in
+        ""|0000000000000000000000000000000000000000) : ;;
+        *) base="$remote_sha" ;;
+    esac
+done
+[ -n "$base" ] || base="origin/main"
+git rev-parse --verify --quiet "$base" >/dev/null 2>&1 || base=""
+
 cd "$root/mcp-server" 2>/dev/null || exit 0   # no python package here -> nothing to check
 
 PY="./.venv/Scripts/python.exe"
 [ -x "$PY" ] || PY="python"
+
+if [ -n "$base" ]; then
+    echo "[pre-push] plugin UFUNCTION signature check (vs $base)"
+    if ! "$PY" -m unreal_agent_player.sigcheck "$base"; then
+        exit 1
+    fi
+fi
 
 echo "[pre-push] ruff check src tests"
 if ! "$PY" -m ruff check src tests; then

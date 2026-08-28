@@ -136,7 +136,7 @@ if ((Test-Path $launchDest) -and -not $Force) {
     if ($engineExe) {
         Write-Host "        Engine resolves on this machine to: $engineExe"
     } else {
-        Write-Warning "Could not resolve this project's engine from its EngineAssociation on this machine. `uap status` still works; only game_launch needs the exe."
+        Write-Warning "Could not resolve this project's engine from its EngineAssociation on this machine. 'uap status' still works; only game_launch needs the exe."
     }
 }
 

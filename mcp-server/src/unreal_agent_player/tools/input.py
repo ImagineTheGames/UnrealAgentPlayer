@@ -4,7 +4,7 @@ import asyncio
 from typing import Any
 
 from unreal_agent_player.errors import AgentError, ErrorCode
-from unreal_agent_player.transport import RemoteControlClient, SUBSYSTEM_OBJECT_PATH
+from unreal_agent_player.transport import SUBSYSTEM_OBJECT_PATH, RemoteControlClient
 
 
 async def _call(rc: RemoteControlClient, fn: str, params: dict[str, Any],
@@ -12,7 +12,14 @@ async def _call(rc: RemoteControlClient, fn: str, params: dict[str, Any],
     resp = await rc.call_function(object_path, fn, parameters=params)
     val = resp.get("ReturnValue")
     if val is False:
-        raise AgentError(ErrorCode.INPUT_NO_VIEWPORT, f"{fn} returned false — no active PIE viewport.")
+        # A bool cannot carry a reason. The plugin logs the real one (no live viewport, or a
+        # Slate user index nothing is registered on), so point at it rather than asserting the
+        # first guess -- a guessed reason once sent a live investigation the wrong way entirely.
+        raise AgentError(
+            ErrorCode.INPUT_NO_VIEWPORT,
+            f"{fn} returned false. Usually no active PIE viewport; it is also what a "
+            f"slate_user Slate has no user for gives. The plugin logged the actual reason -- "
+            f"read it with `uap log since <cursor> --grep {fn}`.")
     return True
 
 
@@ -58,10 +65,18 @@ async def input_mouse_button(
 
 async def input_axis(
     *, rc: RemoteControlClient, py_exec: Any, axis_name: str, value: float,
+    slate_user: int | None = None,
     _object_path: str = SUBSYSTEM_OBJECT_PATH,
 ) -> dict[str, Any]:
-    await _call(rc, "InjectAxis", {"AxisName": axis_name, "Value": value}, _object_path)
-    return {"ok": True}
+    """slate_user routes the sample through Slate as that user -- the only route an analog or
+    virtual cursor (anything on RegisterInputPreProcessor) can see, and Slate DISCARDS an event
+    whose user index does not match the handler's owner. Omit it for the game-viewport route
+    (gameplay / Enhanced Input), which is the historical behaviour."""
+    params: dict[str, Any] = {"AxisName": axis_name, "Value": value}
+    if slate_user is not None:
+        params["SlateUser"] = str(slate_user)
+    await _call(rc, "InjectAxis", params, _object_path)
+    return {"ok": True, "route": "slate" if slate_user is not None else "viewport"}
 
 
 _GAMEPAD_BUTTONS = {
@@ -77,7 +92,7 @@ _GAMEPAD_BUTTONS = {
 
 async def input_gamepad(
     *, rc: RemoteControlClient, py_exec: Any,
-    button: str, pressed: bool, analog: float = 1.0,
+    button: str, pressed: bool, analog: float = 1.0, slate_user: int | None = None,
     _object_path: str = SUBSYSTEM_OBJECT_PATH,
 ) -> dict[str, Any]:
     if button not in _GAMEPAD_BUTTONS:
@@ -85,9 +100,10 @@ async def input_gamepad(
             ErrorCode.SCHEMA_VALIDATION, f"Unknown gamepad button: {button!r}",
             recoverable=False,
         )
-    await _call(rc, "InjectGamepad", {
-        "Button": button, "bPressed": pressed, "AnalogValue": analog,
-    }, _object_path)
+    params: dict[str, Any] = {"Button": button, "bPressed": pressed, "AnalogValue": analog}
+    if slate_user is not None:
+        params["SlateUser"] = str(slate_user)   # see input_axis
+    await _call(rc, "InjectGamepad", params, _object_path)
     return {"ok": True}
 
 

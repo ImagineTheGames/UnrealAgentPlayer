@@ -6,23 +6,23 @@ import re
 import shutil
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any
 
 
 class ReportSession:
     def __init__(self, *, task: str, run_dir: Path, quote: str,
-                 project: Optional[str] = None, requires_screenshot: bool = True):
+                 project: str | None = None, requires_screenshot: bool = True):
         self.task = task
         self.project = project
         self.quote = quote
         self.requires_screenshot = bool(requires_screenshot)
         self.status = "running"
         self.started = datetime.now()
-        self.finished: Optional[datetime] = None
-        self.duration_s: Optional[float] = None
+        self.finished: datetime | None = None
+        self.duration_s: float | None = None
         self.summary = ""
         self.env: dict[str, Any] = {}
-        self.perf: Optional[dict[str, Any]] = None
+        self.perf: dict[str, Any] | None = None
         self.notes: list[dict[str, Any]] = []
         self.assertions: list[dict[str, Any]] = []
         self.timeline: list[dict[str, Any]] = []
@@ -42,12 +42,12 @@ class ReportSession:
         self.assertions.append({"label": label, "passed": bool(passed), "evidence": evidence})
         self._persist()
 
-    def add_note(self, text: str, section: Optional[str] = None) -> None:
+    def add_note(self, text: str, section: str | None = None) -> None:
         self.notes.append({"text": text, "section": section})
         self._persist()
 
     def add_screenshot(self, src_path: str, caption: str = "",
-                       provenance: Optional[str] = None) -> Optional[str]:
+                       provenance: str | None = None) -> str | None:
         # provenance = the project of the editor the shot was captured FROM (stamped by
         # `uap screenshot`). Used to reject a pass whose only proof is a shot of another editor.
         idx = len(self.screenshots)
@@ -68,7 +68,7 @@ class ReportSession:
         self._persist()
         return rel
 
-    def set_caption(self, ref: Optional[Any], caption: str) -> bool:
+    def set_caption(self, ref: Any | None, caption: str) -> bool:
         if not self.screenshots:
             return False
         if ref is None:
@@ -84,7 +84,7 @@ class ReportSession:
         return False
 
     def add_tool_call(self, tool: str, args: dict[str, Any], *, ok: bool,
-                      ms: int, error: Optional[str] = None) -> None:
+                      ms: int, error: str | None = None) -> None:
         self.timeline.append({
             "t": self._hms(datetime.now()), "tool": tool, "args": args,
             "ok": bool(ok), "ms": int(ms), "error": error,
@@ -173,7 +173,7 @@ class ReportSession:
             json.dumps(self.to_dict(), indent=2), encoding="utf-8")
 
     @classmethod
-    def load(cls, run_dir) -> "ReportSession":
+    def load(cls, run_dir) -> ReportSession:
         run_dir = Path(run_dir)
         data = json.loads((run_dir / "data.json").read_text(encoding="utf-8"))
         # Build without re-running __init__ (which would reset lists + recreate dirs).
@@ -201,7 +201,7 @@ class ReportSession:
 
 # --- Active session registry ---
 
-_active: Optional[ReportSession] = None
+_active: ReportSession | None = None
 
 
 def _slug(text: str, maxlen: int = 40) -> str:
@@ -224,7 +224,7 @@ def set_active_run(run_dir) -> None:
     p.write_text(str(run_dir), encoding="utf-8")
 
 
-def get_active_run() -> Optional[Path]:
+def get_active_run() -> Path | None:
     p = _active_pointer()
     if not p.exists():
         return None
@@ -238,7 +238,7 @@ def clear_active_run() -> None:
         p.unlink()
 
 
-def start_session(*, task: str, project: Optional[str] = None,
+def start_session(*, task: str, project: str | None = None,
                   requires_screenshot: bool = True) -> ReportSession:
     global _active
     from unreal_agent_player.reporting.quotes import pick_quote
@@ -252,7 +252,7 @@ def start_session(*, task: str, project: Optional[str] = None,
     return _active
 
 
-def active() -> Optional[ReportSession]:
+def active() -> ReportSession | None:
     return _active
 
 
@@ -273,7 +273,7 @@ def _arg_summary(args: dict, limit: int = 200) -> dict:
     return out
 
 
-def record_call(session: "ReportSession", tool: str, args: dict,
+def record_call(session: ReportSession, tool: str, args: dict,
                 body: dict, ms: int) -> None:
     """Append a timeline entry and harvest known tool outputs. Never raises."""
     try:

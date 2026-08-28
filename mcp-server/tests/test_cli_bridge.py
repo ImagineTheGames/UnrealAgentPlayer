@@ -44,14 +44,19 @@ def test_exec_file_reads_and_runs(tmp_path, monkeypatch):
 
 
 def test_parse_rc_params_keyvalue_and_json():
+    """No declared types available -> the historical heuristic, and every key whose text it
+    RETYPED is reported as a guess. That is what lets `uap rc` say it inferred a JSON type
+    rather than knowing it -- a value that went out as the caller's own string cannot have been
+    silently downgraded, so it is not flagged.
+    """
     from unreal_agent_player.cli import _parse_rc_params
-    assert _parse_rc_params([]) == {}
+    assert _parse_rc_params([]) == ({}, [])
     # key=value with coercion
-    assert _parse_rc_params(["Command=stat fps"]) == {"Command": "stat fps"}
-    assert _parse_rc_params(["KeyName=E", "bPressed=true", "Count=3"]) == {
-        "KeyName": "E", "bPressed": True, "Count": 3}
-    # single JSON-object token escape hatch
-    assert _parse_rc_params(['{"Command":"stat fps"}']) == {"Command": "stat fps"}
+    assert _parse_rc_params(["Command=stat fps"]) == ({"Command": "stat fps"}, [])
+    assert _parse_rc_params(["KeyName=E", "bPressed=true", "Count=3"]) == (
+        {"KeyName": "E", "bPressed": True, "Count": 3}, ["bPressed", "Count"])
+    # single JSON-object token escape hatch: real JSON types already, nothing guessed
+    assert _parse_rc_params(['{"Command":"stat fps"}']) == ({"Command": "stat fps"}, [])
     # bad token (no '=' and not JSON) -> ValueError
     import pytest as _pt
     with _pt.raises(ValueError):

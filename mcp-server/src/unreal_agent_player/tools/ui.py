@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from unreal_agent_player.errors import error_response, ok_response, ErrorCode
+from unreal_agent_player.errors import ErrorCode, error_response, ok_response
 
 
 def _unavailable():

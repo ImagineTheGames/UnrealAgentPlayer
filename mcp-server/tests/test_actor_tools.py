@@ -1,8 +1,12 @@
 import json
+
 import pytest
 
 from unreal_agent_player.tools.actor import (
-    actor_call_function, actor_find, actor_get_properties, actor_set_property,
+    actor_call_function,
+    actor_find,
+    actor_get_properties,
+    actor_set_property,
 )
 
 

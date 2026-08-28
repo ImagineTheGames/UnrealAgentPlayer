@@ -3,8 +3,9 @@ from __future__ import annotations
 from typing import Any
 
 from unreal_agent_player.errors import AgentError, ErrorCode
-from unreal_agent_player.transport import RemoteControlClient, SUBSYSTEM_OBJECT_PATH
+from unreal_agent_player.throttle import throttle_annotation
 from unreal_agent_player.tools.perf import _parse_unit
+from unreal_agent_player.transport import SUBSYSTEM_OBJECT_PATH, RemoteControlClient
 
 
 def compare_metrics(
@@ -41,7 +42,9 @@ async def perf_baseline_save(
 ) -> dict[str, Any]:
     metrics = await _fetch_metrics(rc, stat_group)
     store.save(name, metrics)
-    return {"ok": True, "name": name, "metrics": metrics}
+    # A baseline captured in a throttled editor poisons every later comparison, so the
+    # warning has to land at the moment of saving.
+    return {"ok": True, "name": name, "metrics": metrics, **throttle_annotation(metrics)}
 
 
 async def perf_baseline_compare(
@@ -55,4 +58,5 @@ async def perf_baseline_compare(
         )
     current = await _fetch_metrics(rc, stat_group)
     cmp = compare_metrics(baseline=baseline, current=current, tolerance_pct=tolerance_pct)
-    return {"ok": True, **cmp}
+    # A "regression" measured against a throttled current reading is not a regression.
+    return {"ok": True, **cmp, **throttle_annotation(current)}

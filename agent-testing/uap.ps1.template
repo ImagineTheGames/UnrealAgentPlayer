@@ -7,8 +7,11 @@
 # COMMIT THIS FILE to your project's source control. It contains no machine-local paths --
 # everything is derived at run time, so the same file works for every teammate:
 #   * project root / .uproject -> this script's own location
-#   * engine editor exe        -> .uproject EngineAssociation -> registry (source build,
-#                                 launcher install, or an explicit path all work)
+#   * engine editor exe        -> the project's OWN engine resolver if it has one
+#                                 (Scripts\Resolve-UnrealEngine.ps1, .claude\scripts\
+#                                 find-engine.ps1), else .uproject EngineAssociation ->
+#                                 registry (source build, launcher install, or an explicit
+#                                 path all work)
 #   * UnrealAgentPlayer repo   -> $env:UAP_HOME, a path relative to the project, or a sibling
 #
 # Per-machine setup each teammate does once:
@@ -27,7 +30,53 @@ $projectRoot = $PSScriptRoot
 # --- Resolve this project's engine editor exe ------------------------------------------
 # Different projects use different engines (a custom fork vs stock UE), and teammates keep
 # them in different places, so this is resolved per machine rather than baked in.
-# Resolution order mirrors Epic's own, from FDesktopPlatformWindows::EnumerateEngineInstallations:
+#
+# PREFER THE PROJECT'S OWN RESOLVER. A project that already has one has it because it made a
+# rule of it ("never add a second resolver: route new scripts through this one"), and its
+# resolver knows things this copy cannot -- which fork, which registration step to name in the
+# error, which fallbacks that team supports. A second copy of the logic living in a generated
+# launcher is a fix that has to be re-applied per project and drifts silently in between.
+# Known resolvers are probed by path; the inline copy below is the fallback for a project that
+# has none, so nothing regresses for projects that never had one.
+$ProjectResolvers = @(
+    'Scripts\Resolve-UnrealEngine.ps1',      # SchoolsOutVR and projects that copied it
+    '.claude\scripts\find-engine.ps1'        # Project Broken Wings
+)
+
+# Turn whatever a resolver returned into an editor exe: some return the exe, some the engine
+# ROOT. Anything else (a warning object, a null, a path that is not there) is not a result.
+function ConvertTo-EditorExe($Value) {
+    $s = @($Value | Where-Object { $_ -is [string] -and $_ } | Select-Object -Last 1)[0]
+    if (-not $s) { return '' }
+    if ($s -like '*.exe') { if (Test-Path -LiteralPath $s) { return $s } else { return '' } }
+    $exe = Join-Path $s 'Engine\Binaries\Win64\UnrealEditor.exe'
+    if (Test-Path -LiteralPath $exe) { return $exe }
+    return ''
+}
+
+# Call a resolver without knowing its parameter contract: try the richest call first and fall
+# back to plainer ones. A resolver that does not take -Quiet, or that throws when nothing
+# resolves, must cost us nothing -- we simply move on to the next form, then to the inline copy.
+function Resolve-EditorExeViaProject([string] $Root) {
+    foreach ($rel in $ProjectResolvers) {
+        $resolver = Join-Path $Root $rel
+        if (-not (Test-Path -LiteralPath $resolver)) { continue }
+        foreach ($argSet in @(
+                @{ Binary = 'Editor'; ProjectRoot = $Root; Quiet = $true },
+                @{ Binary = 'Editor'; Quiet = $true },
+                @{ Binary = 'Editor' },
+                @{})) {
+            try {
+                $exe = ConvertTo-EditorExe (& $resolver @argSet)
+                if ($exe) { return $exe }
+            } catch { }
+        }
+    }
+    return ''
+}
+
+# Fallback for a project with no resolver of its own. Resolution order mirrors Epic's own, from
+# FDesktopPlatformWindows::EnumerateEngineInstallations:
 #   1. UE_ROOT               -- escape hatch for layouts nothing else knows about
 #   2. LauncherInstalled.dat -- every Epic Games Launcher install, any drive
 #   3. HKCU ...\Builds       -- source and per-user builds, GUID keyed
@@ -161,8 +210,9 @@ if (-not $env:UAP_UPROJECT) {
 }
 if (-not $env:UAP_EDITOR_EXE) {
     # Best effort: only `game_launch` needs it, and `uap status` reports the real problem
-    # better than failing here would.
-    $exe = Resolve-EditorExe $projectRoot
+    # better than failing here would. The project's own resolver wins when it has one.
+    $exe = Resolve-EditorExeViaProject $projectRoot
+    if (-not $exe) { $exe = Resolve-EditorExe $projectRoot }
     if ($exe) { $env:UAP_EDITOR_EXE = $exe }
 }
 

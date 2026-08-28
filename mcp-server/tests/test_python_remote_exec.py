@@ -70,8 +70,8 @@ def _fake_editor(node_id: str, ready: threading.Event, stop: threading.Event):
     ready.set()
     while not stop.is_set():
         try:
-            raw, addr = sock.recvfrom(8192)
-        except socket.timeout:
+            raw, _addr = sock.recvfrom(8192)
+        except TimeoutError:
             continue
         try:
             msg = json.loads(raw.decode("utf-8"))

@@ -6,7 +6,9 @@ import pytest
 from unreal_agent_player.errors import ErrorCode
 from unreal_agent_player.reporting import session as sess_mod
 from unreal_agent_player.tools.report import (
-    report_assert, report_finish, report_start,
+    report_assert,
+    report_finish,
+    report_start,
 )
 
 
@@ -56,8 +58,8 @@ async def test_finish_bad_verdict_errors():
     assert r["error"]["code"] == ErrorCode.SCHEMA_VALIDATION.value
 
 
-from unreal_agent_player.registry import register_all
 from unreal_agent_player.baselines import BaselineStore
+from unreal_agent_player.registry import register_all
 from unreal_agent_player.uia import UIADriver
 
 

@@ -2,6 +2,7 @@ import pathlib
 import re
 import shutil
 import subprocess
+import warnings
 
 import pytest
 
@@ -10,10 +11,23 @@ INSTALLER = REPO / "Install-AgentTest.ps1"
 
 
 def _powershell():
-    """Return a usable PowerShell executable name, or None to skip."""
-    for exe in ("pwsh", "powershell"):
-        if shutil.which(exe):
-            return exe
+    """Return a usable PowerShell executable name, or None to skip.
+
+    CI runs `pwsh` (PowerShell 7). Windows PowerShell 5.1 is a FALLBACK, not an
+    equivalent: 5.1 accepts syntax 7 rejects outright -- a bare backtick-u in a
+    double-quoted string is a literal in 5.1 and a parse error in 7.2+, which is how a
+    broken installer passed here and failed CI. So say which one answered rather than
+    letting 5.1 stand in silently.
+    """
+    if shutil.which("pwsh"):
+        return "pwsh"
+    if shutil.which("powershell"):
+        warnings.warn(
+            "no pwsh (PowerShell 7) on this machine; falling back to Windows PowerShell 5.1. "
+            "CI runs pwsh, which rejects syntax 5.1 accepts, so a pass here is weaker.",
+            stacklevel=2,
+        )
+        return "powershell"
     return None
 
 
@@ -30,7 +44,7 @@ def _run(tmp_project, *extra, python="C:/fake/python.exe", venv_base=None):
     if venv_base is not None:        # else default resolution under -VenvBase
         cmd += ["-VenvBase", venv_base]
     cmd += list(extra)
-    return subprocess.run(cmd, capture_output=True, text=True)
+    return subprocess.run(cmd, capture_output=True, text=True, check=False)
 
 
 @pytest.fixture

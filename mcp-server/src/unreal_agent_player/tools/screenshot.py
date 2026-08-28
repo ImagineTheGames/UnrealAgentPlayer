@@ -9,8 +9,7 @@ import time
 from typing import Any
 
 from unreal_agent_player.errors import AgentError, ErrorCode
-from unreal_agent_player.transport import RemoteControlClient, SUBSYSTEM_OBJECT_PATH
-
+from unreal_agent_player.transport import SUBSYSTEM_OBJECT_PATH, RemoteControlClient
 
 _RES_RE = re.compile(r"^(\d{2,5})x(\d{2,5})$")
 
@@ -73,7 +72,10 @@ async def screenshot_viewport(
         "width": width, "height": height, "size_bytes": size_bytes,
     }
     if inline:
-        with open(out_path, "rb") as f:
+        # ASYNC230: deliberate blocking read. The editor just wrote this file locally and
+        # each tool call is serviced on its own; a thread hop would change scheduling for
+        # no gain.
+        with open(out_path, "rb") as f:  # noqa: ASYNC230
             body["image_base64"] = base64.b64encode(f.read()).decode("ascii")
             body["image_mime"] = "image/png"
     return body
