@@ -233,6 +233,33 @@ wrote it down -- no cleverness involved.")
   registered indices listed, rather than discarded. A silent discard is worse than a missing
   verb: a missing verb 404s and someone notices.
 
+## One observation is not a property of the system
+
+Every trap above is a tool reporting something adjacent to the truth. This one is the reader
+doing it. Both happened on this machine on the same day, in opposite directions, and neither
+session noticed at the time:
+
+- **Inheriting a claim and amplifying it.** "uap cannot reach Enhanced Input" was repeated three
+  or four times across sessions, having originated in one agent's failure to drive a trigger. It
+  was never established -- it was the wrong verb (see the gamepad-button note above), and the
+  working one was documented the whole time. It took a human asking a direct "why" that nobody
+  could answer.
+- **Minting one from a single reading.** A single `Sensed=0` line in a perception dump became
+  "the test pawn is invisible to that project's custom sight sense", stated as a property of the
+  perception system. It sees the pawn fine; a later run had the AI acquire it through normal
+  perception with no help at all.
+
+Same error from both ends: **one observation treated as a property of the system.** The tell is
+different in each case, so learn both -- but the cheap, checkable version is:
+
+> **When you find yourself repeating a claim you did not personally establish, that repetition
+> IS the signal.** Ask "did I establish this, or did I inherit it?" -- that has an answer. "Am I
+> being appropriately sceptical?" does not.
+
+The expensive version is waiting for someone else to ask you the question you cannot answer. It
+works, but it needs another person in the room, and it costs whatever the wrong belief cost in
+the meantime -- here, several sessions of verification that could not have succeeded.
+
 ## Adding a verb? What a good failure message contains
 
 When a verb cannot do what was asked, the message is the whole recovery path -- an agent either
