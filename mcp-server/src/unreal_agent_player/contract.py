@@ -11,6 +11,20 @@ someone had remembered to guard -- and never learned it at all when the gap was 
 PARAMETER rather than a missing verb (`HoldAxis` without `SlateUser` accepts the call and
 silently drops the argument: #26's silent discard, one layer up).
 
+**The missing-PARAMETER case is what this mechanism exists for.** Missing-verb detection is
+almost incidental by comparison -- a missing verb already announces itself as a 404, and
+`_rc_require` translates it. A missing parameter announces nothing: the verb answers, the
+argument is silently dropped, the plugin runs its default, and the call reports success. That
+shape is invisible to the 404 guard, to a version stamp, and to a clean compile alike. If you
+are deciding whether some future check is worth keeping, ask whether it can see THAT.
+
+Verified against real history rather than a fixture: parsing the pre-`SlateUser` revision of
+`UAPAgentRuntimeSubsystem.h` out of Perforce (`#1`) and comparing it to the current header
+reports `behind` with 8 missing verbs AND
+`missing_args {InjectAxis: [SlateUser], InjectGamepad: [SlateUser]}` -- the exact gap that cost
+a day. A fixture proves the code does what its author expected; real history proves it does
+what actually happened. When you need an old version to test against, version control has one.
+
 Both sides are DERIVED. Nothing here is a number anyone has to remember to bump:
 
   expected -- parsed from the UFUNCTION declarations in this repo's own
