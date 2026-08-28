@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import webbrowser
-from typing import Any, Optional
+from typing import Any
 
 from unreal_agent_player.errors import ErrorCode, error_response, ok_response
 from unreal_agent_player.reporting import session as sess
@@ -14,7 +14,7 @@ def _no_session() -> dict[str, Any]:
 
 
 async def report_start(*, rc: Any = None, py_exec: Any = None,
-                       task: str, project: Optional[str] = None,
+                       task: str, project: str | None = None,
                        requires_screenshot: bool = True) -> dict[str, Any]:
     # Screenshot proof is required for a passing report by default; pass
     # requires_screenshot=False only for a genuinely headless/no-visual check.
@@ -32,7 +32,7 @@ async def report_assert(*, rc: Any = None, py_exec: Any = None,
 
 
 async def report_note(*, rc: Any = None, py_exec: Any = None,
-                      text: str, section: Optional[str] = None) -> dict[str, Any]:
+                      text: str, section: str | None = None) -> dict[str, Any]:
     s = sess.active()
     if s is None:
         return _no_session()
@@ -41,7 +41,7 @@ async def report_note(*, rc: Any = None, py_exec: Any = None,
 
 
 async def report_caption(*, rc: Any = None, py_exec: Any = None,
-                         caption: str, screenshot: Optional[Any] = None) -> dict[str, Any]:
+                         caption: str, screenshot: Any | None = None) -> dict[str, Any]:
     s = sess.active()
     if s is None:
         return _no_session()

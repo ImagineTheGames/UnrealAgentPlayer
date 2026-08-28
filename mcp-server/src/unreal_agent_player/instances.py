@@ -1,7 +1,9 @@
 from __future__ import annotations
+
 import socket
 import threading
-from typing import Any, Optional
+from typing import Any
+
 from unreal_agent_player.errors import AgentError, ErrorCode
 
 
@@ -13,7 +15,7 @@ class InstanceRegistry:
         self._counter = 0
         self._reserved: set[int] = set()
 
-    def register(self, *, port: int, pid: Optional[int]) -> str:
+    def register(self, *, port: int, pid: int | None) -> str:
         with self._lock:
             self._counter += 1
             iid = f"inst{self._counter}"
@@ -31,12 +33,12 @@ class InstanceRegistry:
         with self._lock:
             return [dict(v) for v in self._by_id.values()]
 
-    def get(self, instance_id: str) -> Optional[dict[str, Any]]:
+    def get(self, instance_id: str) -> dict[str, Any] | None:
         with self._lock:
             v = self._by_id.get(instance_id)
             return dict(v) if v else None
 
-    def resolve_port(self, target: Optional[str]) -> int:
+    def resolve_port(self, target: str | None) -> int:
         if target is None or target == "editor":
             return self._editor_port
         with self._lock:

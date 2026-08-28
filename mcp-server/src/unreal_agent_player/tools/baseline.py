@@ -3,9 +3,9 @@ from __future__ import annotations
 from typing import Any
 
 from unreal_agent_player.errors import AgentError, ErrorCode
-from unreal_agent_player.transport import RemoteControlClient, SUBSYSTEM_OBJECT_PATH
 from unreal_agent_player.throttle import throttle_annotation
 from unreal_agent_player.tools.perf import _parse_unit
+from unreal_agent_player.transport import SUBSYSTEM_OBJECT_PATH, RemoteControlClient
 
 
 def compare_metrics(

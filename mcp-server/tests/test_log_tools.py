@@ -1,4 +1,5 @@
 import json
+
 import pytest
 from pytest_httpx import HTTPXMock
 

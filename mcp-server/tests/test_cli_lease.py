@@ -2,10 +2,10 @@ import json
 
 import pytest
 
-from unreal_agent_player.cli import main
-from unreal_agent_player import cli as cli_mod
-from unreal_agent_player.errors import AgentError, ErrorCode
 import unreal_agent_player.coordination as co
+from unreal_agent_player import cli as cli_mod
+from unreal_agent_player.cli import main
+from unreal_agent_player.errors import AgentError, ErrorCode
 
 
 @pytest.fixture(autouse=True)

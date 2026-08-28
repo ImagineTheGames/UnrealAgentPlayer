@@ -1,4 +1,5 @@
 import pytest
+
 from unreal_agent_player.transport import RemoteControlClient
 
 
@@ -20,6 +21,7 @@ async def test_call_preset_unwraps_returnvalue(httpx_mock):
 @pytest.mark.asyncio
 async def test_call_preset_connect_error_maps_to_agenterror(httpx_mock):
     import httpx
+
     from unreal_agent_player.errors import AgentError, ErrorCode
     httpx_mock.add_exception(httpx.ConnectError("boom"))
     rc = RemoteControlClient()

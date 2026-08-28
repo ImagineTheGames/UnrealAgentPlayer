@@ -1,9 +1,12 @@
 from __future__ import annotations
+
 import asyncio
 import os
 import subprocess
-from typing import Any, Optional
+from typing import Any
+
 import httpx
+
 from unreal_agent_player.errors import ErrorCode, error_response, ok_response
 from unreal_agent_player.instances import InstanceRegistry
 
@@ -15,7 +18,7 @@ def _track_proc(instance_id: str, proc: Any) -> None:
     _PROCS[instance_id] = proc
 
 
-def _spawn(port: int, mapname: Optional[str], extra: Optional[list[str]],
+def _spawn(port: int, mapname: str | None, extra: list[str] | None,
            no_vr: bool = True) -> subprocess.Popen:
     exe = os.environ.get("UAP_EDITOR_EXE", r"E:\ImagineGames\IG_MetaEngine\Engine\Binaries\Win64\UnrealEditor.exe")
     uproject = os.environ.get("UAP_UPROJECT", r"E:\ImagineGames\SchoolsOutVR\SchoolsOut.uproject")
@@ -25,7 +28,7 @@ def _spawn(port: int, mapname: Optional[str], extra: Optional[list[str]],
     args += ["-game", "-windowed", "-ResX=1280", "-ResY=720", "-RCWebControlEnable", f"-UAPRCPort={port}"]
     if no_vr:
         # Run flat (no HMD) so the boot flow takes the desktop/FPS path and doesn't wait
-        # for a headset to be worn — required for headless agent auto-testing. The game's
+        # for a headset to be worn -- required for headless agent auto-testing. The game's
         # BootGameMode already has a no-HMD path; -nohmd makes IsHeadMountedDisplayEnabled
         # false so it triggers. (Run with the editor closed to avoid GPU contention.)
         args.append("-nohmd")
@@ -53,8 +56,8 @@ async def _wait_rc_ready(port: int, timeout: float = 90.0) -> bool:
 
 async def game_launch(
     *, registry: InstanceRegistry, rc: Any = None, py_exec: Any = None,
-    target: str = "standalone", map: Optional[str] = None,
-    extra_args: Optional[list[str]] = None, no_vr: bool = True,
+    target: str = "standalone", map: str | None = None,
+    extra_args: list[str] | None = None, no_vr: bool = True,
 ) -> dict[str, Any]:
     port = registry.next_free_port()
     proc = _spawn(port, map, extra_args, no_vr)

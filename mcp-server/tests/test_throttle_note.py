@@ -11,8 +11,7 @@ import json
 import pytest
 from pytest_httpx import HTTPXMock
 
-from unreal_agent_player import cli
-from unreal_agent_player import throttle
+from unreal_agent_player import cli, throttle
 from unreal_agent_player.reporting.render import render
 from unreal_agent_player.tools.baseline import perf_baseline_compare, perf_baseline_save
 from unreal_agent_player.tools.perf import perf_stat
@@ -249,7 +248,7 @@ def test_html_report_says_nothing_at_a_healthy_rate():
 
 # --- the pointer at the perf surface, in the docs an agent actually meets ----------------
 
-import pathlib  # noqa: E402
+import pathlib
 
 _REPO = pathlib.Path(__file__).resolve().parents[2]
 

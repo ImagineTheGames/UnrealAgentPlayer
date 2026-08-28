@@ -1,4 +1,5 @@
 import pytest
+
 from unreal_agent_player.errors import ErrorCode
 from unreal_agent_player.instances import InstanceRegistry
 from unreal_agent_player.tools import game as game_mod
@@ -55,8 +56,8 @@ async def test_game_list_and_stop():
 
 @pytest.mark.asyncio
 async def test_game_tools_registered(tmp_path):
-    from unreal_agent_player.registry import register_all
     from unreal_agent_player.baselines import BaselineStore
+    from unreal_agent_player.registry import register_all
     from unreal_agent_player.uia import UIADriver
 
     class FS:

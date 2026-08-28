@@ -30,7 +30,7 @@ def _run(tmp_project, *extra, python="C:/fake/python.exe", venv_base=None):
     if venv_base is not None:        # else default resolution under -VenvBase
         cmd += ["-VenvBase", venv_base]
     cmd += list(extra)
-    return subprocess.run(cmd, capture_output=True, text=True)
+    return subprocess.run(cmd, capture_output=True, text=True, check=False)
 
 
 @pytest.fixture

@@ -1,4 +1,5 @@
 import pytest
+
 from unreal_agent_player.errors import AgentError, ErrorCode
 from unreal_agent_player.instances import InstanceRegistry
 

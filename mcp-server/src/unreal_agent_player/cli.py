@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import itertools
 import json
 import os
 import pathlib
@@ -10,16 +11,16 @@ import sys
 import time
 import webbrowser
 
-from unreal_agent_player.reporting import session as sess
-from unreal_agent_player.reporting.render import render
-from unreal_agent_player.transport import RemoteControlClient, PythonRemoteExecClient
-from unreal_agent_player.errors import AgentError, ErrorCode
 from unreal_agent_player import contract as _contract
 from unreal_agent_player import coordination as _coord
 from unreal_agent_player import throttle as _throttle
+from unreal_agent_player.errors import AgentError, ErrorCode
+from unreal_agent_player.reporting import session as sess
+from unreal_agent_player.reporting.render import render
+from unreal_agent_player.transport import PythonRemoteExecClient, RemoteControlClient
 
 
-def _load_active() -> "sess.ReportSession | None":
+def _load_active() -> sess.ReportSession | None:
     run = sess.get_active_run()
     if run is None or not (run / "data.json").exists():
         return None
@@ -272,7 +273,7 @@ def _exec_rc_port(project: str) -> int:
     return 0
 
 
-def _exec_project_name(project: "str | None") -> "str | None":
+def _exec_project_name(project: str | None) -> str | None:
     """The project name of the editor matching `project` (via exec). Used to stamp a
     screenshot's provenance so a pass can't be proven with a shot of another editor."""
     code = ("import unreal\n"
@@ -289,7 +290,7 @@ def _exec_project_name(project: "str | None") -> "str | None":
     return None
 
 
-def _rc_port_for(project: "str | None") -> int:
+def _rc_port_for(project: str | None) -> int:
     """Resolve the RC HTTP port. UAP_RC_PORT env overrides everything; else resolve the
     editor's advertised port by project (cached), so two editors are each addressed on their
     own port. Falls back to 30010."""
@@ -312,7 +313,7 @@ def _rc_port_for(project: "str | None") -> int:
     return 30010
 
 
-def _rc_call(func: str, params: dict, project: "str | None" = None):
+def _rc_call(func: str, params: dict, project: str | None = None):
     port = _rc_port_for(project)
 
     def _call(p: int):
@@ -364,7 +365,7 @@ def _is_missing_verb(exc: Exception) -> bool:
     return isinstance(exc, AgentError) and "returned 404" in str(exc)
 
 
-def _skew_error(func: str, project: "str | None", needs: str) -> AgentError:
+def _skew_error(func: str, project: str | None, needs: str) -> AgentError:
     """The refusal for "this editor's plugin is too old to serve that request". Same shape as
     the ListTestHelpersJson message below: name the missing verb, say what is lost, and give
     the one action that fixes it."""
@@ -377,7 +378,7 @@ def _skew_error(func: str, project: "str | None", needs: str) -> AgentError:
     )
 
 
-def _live_contract(project: "str | None") -> "dict | None":
+def _live_contract(project: str | None) -> dict | None:
     """What this project's editor ACTUALLY exports right now: {verb: {arg: declared_type}},
     read from its RemoteControl preset. None when it cannot be read.
 
@@ -391,7 +392,7 @@ def _live_contract(project: "str | None") -> "dict | None":
     return _contract.fetch_live_contract(_rc_port_for(project))
 
 
-def _contract_report(project: "str | None") -> dict:
+def _contract_report(project: str | None) -> dict:
     """Compare what this checkout's plugin header declares against what the editor exports."""
     live = _live_contract(project)
     report = _contract.compare(_contract.expected_contract(), live)
@@ -401,7 +402,7 @@ def _contract_report(project: "str | None") -> dict:
     return report
 
 
-def _missing_arg(func: str, arg: str, project: "str | None") -> "str | None":
+def _missing_arg(func: str, arg: str, project: str | None) -> str | None:
     """The refusal text when this editor's plugin copy cannot receive `arg`, else None.
 
     None means "send it": either the parameter is there, or the contract could not be read at
@@ -416,7 +417,7 @@ def _missing_arg(func: str, arg: str, project: "str | None") -> "str | None":
     return _contract.arg_skew_message(func, arg, project)
 
 
-def _rc_require(func: str, params: dict, project: "str | None", needs: str):
+def _rc_require(func: str, params: dict, project: str | None, needs: str):
     """_rc_call for a verb an older plugin copy may not have: turns RemoteControl's raw 404
     into the version-skew refusal above. Every other failure passes through untouched."""
     try:
@@ -427,8 +428,8 @@ def _rc_require(func: str, params: dict, project: "str | None", needs: str):
         raise
 
 
-def _rc_json(func: str, params: dict, project: "str | None" = None,
-             *, needs: "str | None" = None) -> dict:
+def _rc_json(func: str, params: dict, project: str | None = None,
+             *, needs: str | None = None) -> dict:
     """Call a UFUNCTION that returns a JSON string and decode it to a dict.
 
     Plugin verbs that can fail for more than one reason return a JSON envelope so the refusal
@@ -510,7 +511,7 @@ def _coerce(v: str):
     return v
 
 
-def _coerce_declared(v: str, type_name: "str | None"):
+def _coerce_declared(v: str, type_name: str | None):
     """Encode a key=value string as the parameter's DECLARED type actually needs.
 
     Returns (value, guessed). `guessed` is True when the declared type gives no answer (enum,
@@ -539,7 +540,7 @@ def _coerce_declared(v: str, type_name: "str | None"):
     return val, not isinstance(val, str)
 
 
-def _parse_rc_params(tokens: list[str], types: "dict | None" = None) -> tuple[dict, list[str]]:
+def _parse_rc_params(tokens: list[str], types: dict | None = None) -> tuple[dict, list[str]]:
     """Parse rc params from CLI tokens. Returns (params, guessed_keys).
 
     Two forms (the first dodges Windows shell quoting, which mangles embedded
@@ -658,7 +659,7 @@ def _exec_file(args) -> int:
     return _exec(argparse.Namespace(code=code, project=args.project))
 
 
-def _pie_start(mode: str, project: "str | None") -> dict:
+def _pie_start(mode: str, project: str | None) -> dict:
     """Start PIE in `mode`, tolerating a plugin copy that predates StartPIEMode -- for FLAT
     only.
 
@@ -745,7 +746,7 @@ def _pie_stop_settle() -> float:
     return _float_env("UAP_PIE_STOP_SETTLE", 5.0)
 
 
-def _pie_in_progress(project: "str | None", *, degraded: bool) -> bool:
+def _pie_in_progress(project: str | None, *, degraded: bool) -> bool:
     """True while a play session is live OR queued.
 
     `degraded` selects the older, WEAKER verb. IsInPIE only sees a live play world, so it reads
@@ -762,7 +763,7 @@ _DEGRADED_NOTE = (
 )
 
 
-def _pie_stop(project: "str | None", timeout: float) -> dict:
+def _pie_stop(project: str | None, timeout: float) -> dict:
     """Stop PIE and do not return ok:true until the world is actually gone."""
     t0 = time.monotonic()
     degraded = False
@@ -796,7 +797,7 @@ def _pie_stop(project: "str | None", timeout: float) -> dict:
     # the stop "fails" while PIE is in fact gone.
     settle = min(_pie_stop_settle(), max(0.0, timeout)) if degraded else 0.0
     deadline = t0 + max(0.0, timeout)
-    clear_since: "float | None" = None
+    clear_since: float | None = None
     restops = 0
     while True:
         live = _pie_in_progress(project, degraded=degraded)
@@ -957,7 +958,7 @@ def _sample_stats(samples: list) -> dict:
     if len(vecs) < 2 or len({len(v) for v in vecs}) != 1:
         return {}
     deltas = []
-    for a, b in zip(vecs, vecs[1:]):
+    for a, b in itertools.pairwise(vecs):
         deltas.append(sum((y - x) ** 2 for x, y in zip(a, b)) ** 0.5)
     deltas.sort()
     n = len(deltas)
@@ -1068,7 +1069,7 @@ def _log(args) -> int:
     return 0 if body["ok"] else 1
 
 
-def _helpers_payload(project: "str | None") -> list:
+def _helpers_payload(project: str | None) -> list:
     """Helper descriptors with their fields intact.
 
     ListTestHelpers returns TArray<FAgentHelperDescriptor>, and RemoteControl's preset-call
@@ -1125,7 +1126,7 @@ def _helpers(args) -> int:
 _NEEDS_UI = "reading/driving on-screen UI (read-ui, click, tab, nav)"
 
 
-def _find_clickable(elements: list, label: str) -> "dict | None":
+def _find_clickable(elements: list, label: str) -> dict | None:
     """Choose the on-screen element to click for a label: exact (case-insensitive) match
     first, then a substring match. Returns the element dict (with x/y) or None."""
     low = label.strip().lower()
@@ -1449,7 +1450,7 @@ _REBUILD_GUARDED = {"status", "rc", "exec", "exec-file", "pie",
 _LEASE_GUARDED = _REBUILD_GUARDED - {"status"}
 
 
-def _pie_state_for_lease(project: "str | None") -> "tuple[bool | None, str]":
+def _pie_state_for_lease(project: str | None) -> tuple[bool | None, str]:
     """Best-effort "is this editor still in PIE", for the release guard.
 
     Returns (in_progress, how). `None` means the question could not be asked at all (editor down /

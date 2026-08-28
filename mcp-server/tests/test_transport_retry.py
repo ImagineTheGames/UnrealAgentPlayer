@@ -5,7 +5,6 @@ editor reset the command connection (WinError 10054); the next call worked fine,
 raw ConnectionResetError escaped `_read_command_result` and killed the run's sample.
 """
 
-import socket
 
 import pytest
 
@@ -22,7 +21,7 @@ class _ResettingConn:
 
 class _TimingOutConn:
     def recv(self, _n):
-        raise socket.timeout()
+        raise TimeoutError()
 
 
 def test_read_command_result_maps_reset_to_agent_error():

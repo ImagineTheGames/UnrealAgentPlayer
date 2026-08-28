@@ -3,44 +3,67 @@
 from __future__ import annotations
 
 import json
-from typing import Any, Awaitable, Callable
+import time as _time
+from collections.abc import Awaitable, Callable
+from typing import Any
 
 from mcp.server import Server
 from mcp.types import TextContent, Tool
 
-from unreal_agent_player.errors import AgentError
-from unreal_agent_player.tools.console import exec_console as tool_exec_console
-from unreal_agent_player.tools.pie import (
-    pie_pause, pie_resume, pie_start, pie_status, pie_stop,
-)
-from unreal_agent_player.tools.python_exec import exec_python as tool_exec_python
-from unreal_agent_player.tools.actor import (
-    actor_call_function, actor_find, actor_get_properties, actor_set_property,
-)
-from unreal_agent_player.tools.log import log_since, log_tail
-from unreal_agent_player.tools.screenshot import screenshot_viewport
-from unreal_agent_player.tools.status import bridge_status
-from unreal_agent_player.tools.input import (
-    input_axis, input_gamepad, input_key, input_mouse_button,
-    input_mouse_move, input_sequence,
-    input_xr_button, input_xr_clear, input_xr_pose,
-)
-from unreal_agent_player.tools.helpers import helper_call, helper_list
-from unreal_agent_player.tools.perf import perf_stat, perf_trace_start, perf_trace_stop
-from unreal_agent_player.tools.baseline import perf_baseline_save, perf_baseline_compare
-from unreal_agent_player.tools.ui import ui_find_window, ui_list_menus, ui_menu_click
 from unreal_agent_player.baselines import BaselineStore
-from unreal_agent_player.uia import UIADriver
-from unreal_agent_player.tools.ui_read import read_viewport_ui
-from unreal_agent_player.transport import PythonRemoteExecClient, RemoteControlClient, SUBSYSTEM_OBJECT_PATH, rc_for_port
-from unreal_agent_player.tools.report import (
-    report_assert, report_caption, report_finish, report_note, report_start,
-)
+from unreal_agent_player.errors import AgentError
+from unreal_agent_player.instances import InstanceRegistry
 from unreal_agent_player.reporting import session as report_session
 from unreal_agent_player.reporting.session import record_call
-from unreal_agent_player.instances import InstanceRegistry
-from unreal_agent_player.tools.game import game_launch, game_attach, game_list, game_stop
-import time as _time
+from unreal_agent_player.tools.actor import (
+    actor_call_function,
+    actor_find,
+    actor_get_properties,
+    actor_set_property,
+)
+from unreal_agent_player.tools.baseline import perf_baseline_compare, perf_baseline_save
+from unreal_agent_player.tools.console import exec_console as tool_exec_console
+from unreal_agent_player.tools.game import game_attach, game_launch, game_list, game_stop
+from unreal_agent_player.tools.helpers import helper_call, helper_list
+from unreal_agent_player.tools.input import (
+    input_axis,
+    input_gamepad,
+    input_key,
+    input_mouse_button,
+    input_mouse_move,
+    input_sequence,
+    input_xr_button,
+    input_xr_clear,
+    input_xr_pose,
+)
+from unreal_agent_player.tools.log import log_since, log_tail
+from unreal_agent_player.tools.perf import perf_stat, perf_trace_start, perf_trace_stop
+from unreal_agent_player.tools.pie import (
+    pie_pause,
+    pie_resume,
+    pie_start,
+    pie_status,
+    pie_stop,
+)
+from unreal_agent_player.tools.python_exec import exec_python as tool_exec_python
+from unreal_agent_player.tools.report import (
+    report_assert,
+    report_caption,
+    report_finish,
+    report_note,
+    report_start,
+)
+from unreal_agent_player.tools.screenshot import screenshot_viewport
+from unreal_agent_player.tools.status import bridge_status
+from unreal_agent_player.tools.ui import ui_find_window, ui_list_menus, ui_menu_click
+from unreal_agent_player.tools.ui_read import read_viewport_ui
+from unreal_agent_player.transport import (
+    SUBSYSTEM_OBJECT_PATH,
+    PythonRemoteExecClient,
+    RemoteControlClient,
+    rc_for_port,
+)
+from unreal_agent_player.uia import UIADriver
 
 _GAME_RUNTIME_OBJ = "/Script/UnrealAgentPlayerRuntime.Default__UAPAgentRuntimeSubsystem"
 

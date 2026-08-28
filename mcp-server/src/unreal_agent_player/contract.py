@@ -143,7 +143,7 @@ _UFUNCTION_RE = re.compile(
     r"UFUNCTION\s*\([^)]*\)\s*"          # the macro and its specifiers
     r"[\w:]+(?:\s*<[^>]*>)?[\s*&]+"      # return type (optionally templated)
     r"(\w+)\s*\(([^)]*)\)\s*(?:const\s*)?;",
-    re.S,
+    re.DOTALL,
 )
 
 

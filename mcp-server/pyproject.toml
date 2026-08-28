@@ -18,7 +18,10 @@ dev = [
   "pytest>=8.0",
   "pytest-asyncio>=0.23",
   "pytest-httpx>=0.30",
-  "ruff>=0.5",
+  # Pinned exactly, not ">=": CI installs the dev extra fresh, so a floating ruff means CI
+  # silently lints with a newer rule set than the local pre-push hook and reports "clean"
+  # locally while failing on the identical command. Bump this deliberately, not by drift.
+  "ruff==0.16.5",
 ]
 windows = [
   "comtypes>=1.4",
@@ -39,7 +42,23 @@ asyncio_mode = "auto"
 line-length = 100
 target-version = "py310"
 
+[tool.ruff.lint]
+# Deliberate policy, not noise suppression. This tool drives a live Unreal editor over
+# RemoteControl, a UDP socket, Win32 ctypes and COM/UIA -- all of which raise arbitrary,
+# undocumented exception types. Every one of these sites is a fail-open boundary with an
+# explicit fallback value and a comment saying why; narrowing them would turn "editor not
+# reachable" into a crash, which is a behaviour change, not a lint fix.
+ignore = [
+  "BLE001",  # blind-except: intentional at every external-process boundary
+  "S110",    # try/except/pass: the fallback IS "carry on without this signal"
+  "S112",    # try/except/continue: same, inside discovery/scan loops
+]
+
 [tool.ruff.lint.per-file-ignores]
 # Tests use compact stub patterns: semicolon-joined stub bodies, throwaway vars,
 # and append-style imports partway down a file.
 "tests/**" = ["E402", "E702", "E741", "F841"]
+# Report timestamps are local wall clock on purpose: they name run directories and print
+# times a human reads next to their own clock. tz-aware UTC would rename every run dir and
+# show times nobody recognises.
+"src/unreal_agent_player/reporting/session.py" = ["DTZ005"]

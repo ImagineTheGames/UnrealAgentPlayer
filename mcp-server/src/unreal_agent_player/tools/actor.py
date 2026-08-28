@@ -5,7 +5,6 @@ from typing import Any
 
 from unreal_agent_player.errors import AgentError, ErrorCode
 
-
 _FIND_TEMPLATE = r"""
 import json, unreal, re
 world_kind = {world!r}

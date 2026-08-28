@@ -26,7 +26,7 @@ DEFAULT_PRESET_NAME = "UAP_Preset"
 PRESET_FUNCTION_URL = "/remote/preset/{preset}/function/{func}"
 
 
-def rc_for_port(port: int, timeout: float = 10.0) -> "RemoteControlClient":
+def rc_for_port(port: int, timeout: float = 10.0) -> RemoteControlClient:
     return RemoteControlClient(port=port, timeout=timeout)
 
 
@@ -45,7 +45,8 @@ class RemoteControlClient:
     async def aclose(self) -> None:
         await self._client.aclose()
 
-    async def __aenter__(self) -> "RemoteControlClient":
+    # PYI034 wants `Self`, which is typing.Self (3.11+); this package supports 3.10.
+    async def __aenter__(self) -> RemoteControlClient:  # noqa: PYI034
         return self
 
     async def __aexit__(self, exc_type, exc, tb) -> None:
@@ -313,7 +314,7 @@ class PythonRemoteExecClient:
                 next_ping = now + 0.5
             try:
                 raw, _ = mcast.recvfrom(8192)
-            except socket.timeout:
+            except TimeoutError:
                 if seen and first_at is not None and (time.monotonic() - first_at) >= settle:
                     break
                 continue
@@ -376,7 +377,7 @@ class PythonRemoteExecClient:
                 try:
                     conn, _ = cmd_server.accept()
                     break
-                except socket.timeout:
+                except TimeoutError:
                     continue
                 except OSError:
                     continue
@@ -413,7 +414,7 @@ class PythonRemoteExecClient:
         while True:
             try:
                 chunk = conn.recv(65536)
-            except socket.timeout:
+            except TimeoutError:
                 break
             except OSError as exc:
                 # WinError 10054 / ECONNRESET: the editor dropped the command socket mid-read.

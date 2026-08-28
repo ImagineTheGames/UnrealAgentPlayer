@@ -23,7 +23,7 @@ def test_report_finish_autostops_pie(tmp_path, monkeypatch, capsys):
     monkeypatch.setenv("UAP_REPORTS_DIR", str(tmp_path))
     import json
 
-    import unreal_agent_player.cli as cli
+    from unreal_agent_player import cli
     calls = []
     polls = {"left": 1}      # still in progress for one poll, then gone
 
@@ -53,7 +53,7 @@ def test_report_finish_reports_a_stop_that_did_not_take(tmp_path, monkeypatch, c
     monkeypatch.setenv("UAP_PIE_STOP_TIMEOUT", "2")
     import json
 
-    import unreal_agent_player.cli as cli
+    from unreal_agent_player import cli
 
     def fake_rc(func, params, project=None):
         if func == "StopPIEEx":
@@ -75,7 +75,7 @@ def test_report_finish_reports_a_stop_that_did_not_take(tmp_path, monkeypatch, c
 
 def test_report_finish_keep_pie_skips_stop(tmp_path, monkeypatch):
     monkeypatch.setenv("UAP_REPORTS_DIR", str(tmp_path))
-    import unreal_agent_player.cli as cli
+    from unreal_agent_player import cli
     calls = []
     monkeypatch.setattr(cli, "_rc_call", lambda f, p, project=None: calls.append(f))
     assert main(["report", "start", "t"]) == 0

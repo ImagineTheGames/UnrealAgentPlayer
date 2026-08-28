@@ -30,7 +30,7 @@ class ErrorCode(str, Enum):
     REPORT_NO_SESSION = "REPORT_NO_SESSION"
 
     @classmethod
-    def domain_of(cls, code: "ErrorCode") -> str:
+    def domain_of(cls, code: ErrorCode) -> str:
         transport = {cls.UE_UNREACHABLE, cls.UE_REMOTE_CONTROL_OFF, cls.UE_REMOTE_EXEC_OFF,
                      cls.UE_CONNECTION_RESET}
         mcp_side = {cls.SCHEMA_VALIDATION, cls.TIMEOUT, cls.UIA_UNAVAILABLE, cls.UIA_PATH_NOT_FOUND}

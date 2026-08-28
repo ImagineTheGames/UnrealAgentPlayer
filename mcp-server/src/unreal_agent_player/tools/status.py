@@ -3,7 +3,7 @@ from __future__ import annotations
 from typing import Any
 
 from unreal_agent_player.errors import AgentError
-from unreal_agent_player.transport import RemoteControlClient, SUBSYSTEM_OBJECT_PATH
+from unreal_agent_player.transport import SUBSYSTEM_OBJECT_PATH, RemoteControlClient
 
 
 async def bridge_status(*, rc: RemoteControlClient, py_exec: Any) -> dict[str, Any]:

@@ -69,8 +69,8 @@ def collect(base: str) -> dict[str, list[str]]:
             continue
         new_text = _header_at("HEAD", path) or ""
         d = diff_signatures(signatures(old_text), signatures(new_text))
-        for key in acc:
-            acc[key].update(d[key])
+        for key, vals in acc.items():
+            vals.update(d[key])
     # The editor and runtime subsystems mirror most verbs, so the same break is found twice.
     # Report it once -- a duplicated list reads as two separate problems.
     return {key: sorted(vals) for key, vals in acc.items()}

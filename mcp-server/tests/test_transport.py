@@ -2,7 +2,7 @@ import pytest
 from pytest_httpx import HTTPXMock
 
 from unreal_agent_player.errors import AgentError, ErrorCode
-from unreal_agent_player.transport import RemoteControlClient, SUBSYSTEM_OBJECT_PATH
+from unreal_agent_player.transport import SUBSYSTEM_OBJECT_PATH, RemoteControlClient
 
 
 @pytest.mark.asyncio
