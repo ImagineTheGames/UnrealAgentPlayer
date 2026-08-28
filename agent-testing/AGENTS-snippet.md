@@ -5,8 +5,23 @@ text), run `/AgentPlayerTest <question>`. It drives the `uap` CLI (`uap.ps1` at 
 project root), which talks to the running editor over Remote Control + Python remote-exec
 and renders an HTML report.
 
+- **NEVER END A TURN WITH PIE RUNNING.** Stop PIE and release your lease before you finish --
+  `uap pie stop`, or `uap report finish`, which stops it for you unless you pass `--keep-pie`. A
+  human is often watching that window, and a live PIE session with nobody at the controls is not an
+  idle editor: it is a game being played by nothing. On 2026-08-28 an agent left one running and a
+  Project Broken Wings aircraft flew unattended into a building.
+- **Do NOT tight-loop `uap exec` while PIE is starting or stopping** -- Python remote-exec runs on
+  the GAME THREAD, and re-entering it during a PIE transition HARD-CRASHES the editor
+  (`RecursionGuard` assert). **DO use the blocking verbs:** `uap pie start` waits for the live
+  world by itself (1-5s typically; `--no-wait` opts out), and `uap pie wait <seconds>` polls over
+  RemoteControl, a different channel from `exec`, safely. Both halves belong together: "never poll"
+  on its own reads as "wait for a callback", and the background watcher that follows is exactly
+  what left PIE running unattended. Never poll with `exec`; never invent a waiting strategy either.
 - A verification is NOT complete until `uap report finish` emits a report at
-  `~/.uap-reports/<ts>/index.html`. Cite the path.
+  `~/.uap-reports/<ts>/index.html`. Cite the path. It also **auto-stops PIE** (`pie_stopped` in the
+  response) unless you pass `--keep-pie`, so an agent that always finishes its report never leaves
+  a session live -- but check the field rather than assuming, and if `pie_stop_error` comes back
+  the editor is still in PIE.
 - A passing report REQUIRES a screenshot FROM THE EDITOR UNDER TEST -- capture with
   `uap screenshot <abs.png>` via this project's `uap.ps1` (it stamps the source editor). A shot of
   another editor (or a manual attach of unknown origin) auto-FAILS the pass. Pixels are not proof
@@ -36,7 +51,7 @@ and renders an HTML report.
   `Saved/Logs/*.log`.
 - If the behavior is HMD-only (OpenXR input, an `IsHeadMountedDisplayEnabled()` branch such as
   a world-space VR screen), start with `uap pie start --mode vr` -- flat PIE takes neither path,
-  so the bug will look absent.
+  so the bug will look absent. `--mode vr` blocks for the live world exactly like flat does.
 - The `uap` CLI needs no MCP tools; it works in any session as long as the editor is up
   (`uap status` to check; launch the editor if it is down). Run `uap help` for the verb
   catalog + recipes -- don't reverse-engineer by dumping `dir()` on the subsystem.
@@ -85,9 +100,15 @@ and renders an HTML report.
     result.* `uap pie stop` used to answer ok:true while PIE kept running -- the stop landed
     before the queued start had created the play world, so it did nothing and PIE came up ~4s
     later. Poll the authoritative completion signal (and check it can actually SEE the state you
-    care about), bounded, failing loudly on timeout. `pie stop` now waits and confirms; `pie
-    start` still returns at once by design and says so (`queued:true, confirmed:false`) -- follow
-    it with `uap pie wait <sec>`.
+    care about), bounded, failing loudly on timeout. Both `pie stop` and `pie start` now wait and
+    confirm (`stopped`/`playing` + `waited_seconds`), and fail rather than ack on timeout.
+    **The sequel is the more useful half:** labelling the ack honestly was NOT enough. `pie start`
+    shipped `queued:true, confirmed:false, next: "uap pie wait <sec>"` and agents still built
+    background watchers and ended their turns three times that same day -- because those fields
+    imply an ASYNC JOB, and the right move for an async job is exactly a watcher. It was a 1-5
+    second call. **A response field implies a shape, not just a fact; and response-field guidance
+    fixes failures, not wrong-but-confident behaviour -- that needs the DEFAULT changed.** The old
+    ack survives only behind an explicit `--no-wait`.
 - **"this editor's plugin has no `<Verb>` ... sync and rebuild `<project>`" is a TOOLING version
   gap**, not a broken editor and not a product bug: the `uap` CLI is shared by every project while
   each project vendors its own plugin copy. Flat `uap pie start` degrades to the legacy verb on its

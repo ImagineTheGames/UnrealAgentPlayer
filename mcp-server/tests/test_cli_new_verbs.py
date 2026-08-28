@@ -297,16 +297,23 @@ def test_log_cursor_verb(monkeypatch, capsys):
 # --- P6: VR preview ---------------------------------------------------------------------
 
 def test_pie_start_defaults_to_flat_mode(monkeypatch, capsys):
-    seen = _stub_rc(monkeypatch, {"StartPIEMode": json.dumps({"ok": True, "mode": "flat"})})
+    seen = _stub_rc(monkeypatch, {"StartPIEMode": json.dumps({"ok": True, "mode": "flat"}),
+                                  "IsInPIE": True})
     assert cli.main(["pie", "start"]) == 0
     assert seen[0][1] == {"Mode": "flat"}
 
 
 def test_pie_start_vr_requests_vr_preview(monkeypatch, capsys):
-    seen = _stub_rc(monkeypatch, {"StartPIEMode": json.dumps({"ok": True, "mode": "vr"})})
+    seen = _stub_rc(monkeypatch, {"StartPIEMode": json.dumps({"ok": True, "mode": "vr"}),
+                                  "IsInPIE": True})
     assert cli.main(["pie", "start", "--mode", "vr"]) == 0
     assert seen[0][1] == {"Mode": "vr"}
-    assert _out(capsys)["mode"] == "vr"
+    body = _out(capsys)
+    assert body["mode"] == "vr"
+    # VR Preview waits for the live world exactly like flat does -- an unattended VR session is
+    # the same incident with a headset attached.
+    assert body["playing"] is True
+    assert [c[0] for c in seen] == ["StartPIEMode", "IsInPIE"]
 
 
 def test_pie_start_vr_without_a_headset_fails_loudly(monkeypatch, capsys):
@@ -396,11 +403,15 @@ def _missing(*funcs):
 def test_pie_start_flat_falls_back_when_plugin_predates_start_pie_mode(monkeypatch, capsys):
     """An older plugin copy has StartPIE but not StartPIEMode. Flat PIE is the SAME session
     either way, so it must keep working instead of surfacing a raw 404."""
-    seen = _stub_rc(monkeypatch, {**_missing("StartPIEMode"), "StartPIE": True})
+    seen = _stub_rc(monkeypatch, {**_missing("StartPIEMode"), "StartPIE": True,
+                                  "IsInPIE": True})
     assert cli.main(["pie", "start"]) == 0
     body = _out(capsys)
     assert body["ok"] and body["mode"] == "flat" and body["via"] == "StartPIE"
-    assert [c[0] for c in seen] == ["StartPIEMode", "StartPIE"]
+    # The legacy start still WAITS -- the degraded path is about which verb starts PIE, not
+    # about whether the caller is handed a live world.
+    assert [c[0] for c in seen] == ["StartPIEMode", "StartPIE", "IsInPIE"]
+    assert body["playing"] is True
     # The fallback must not be silent: say the plugin is behind and what to do about it.
     assert "rebuild" in body["note"].lower()
 

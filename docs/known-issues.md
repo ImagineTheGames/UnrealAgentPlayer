@@ -223,6 +223,16 @@ injecting input. A window-based wait never touches the game thread. `uap pie wai
 prefer a window-based signal over game-thread polling (follow-up). Reflected in `uap help`, the
 /AgentPlayerTest common-mistakes block, and each project's AGENTS.md/CLAUDE.md.
 
+**Half of this guidance was a trap WE BUILT -- the only self-inflicted one in this file.** Every
+other entry here is something the engine or a tool did to us, sprung in the session that made it.
+This one we wrote ourselves, and it was sprung by a reader: "never tight-loop `exec` during a PIE
+transition" was true and was stated with no mention of a supported way to wait. An agent reasoning
+correctly from two true statements -- do not poll, and PIE is not up yet -- concludes "wait for a
+callback", builds a background watcher, and ends its turn. That is #29, and it ran a PBW aircraft
+into a building. **Both halves must always appear together:** never poll with `exec`; DO use the
+blocking verbs, which poll the plugin over RemoteControl, a different channel from `exec`. As of
+#29 `uap pie start` does the waiting itself, so the question mostly does not arise.
+
 ## 13. Multiple agents on one editor stepped on each other / hard-failed -- FIXED
 
 Was: several agents share ONE editor per project (one level, one PIE, and a rebuild takes it down).
@@ -600,7 +610,7 @@ before teardown finishes; the second without the first can only observe the race
 2. **Confirm (CLI).** `uap pie stop` polls the new `IsPIEInProgress()` -- live **or** queued,
    `UEditorEngine::IsPlaySessionInProgress()` -- until it reads false, then returns
    `{"ok":true,"stopped":true,"waited_seconds":N}`. On timeout (default 30s, `--timeout` /
-   ``) it returns `ok:false` saying the editor is NOT free -- never a bare ack
+   `$UAP_PIE_STOP_TIMEOUT`) it returns `ok:false` saying the editor is NOT free -- never a bare ack
    of the queued RC call.
 
 `IsInPIE()` is NOT sufficient to confirm a stop: it wraps `IsPlayingSessionInEditor()`, which is
@@ -627,12 +637,14 @@ Three callers changed with it:
   unreachable (a dead editor has no PIE session), and it degrades to `IsInPIE` on an older plugin.
 
 `uap pie start` has the mirror shape and was left ALONE on purpose: it acks a queued start, which
-is correct for a verb whose caller may want to do other work while PIE comes up, and agents rely on
-it returning at once. `uap pie wait <seconds>` is the confirmation half and was already the
-documented next step. What changed is that the ack now says what it is -- `queued: true,
-confirmed: false`, plus the verb that confirms it -- so it cannot be read as "the world exists".
-(`pie wait` correctly keeps polling `IsInPIE`: it asks whether the world is LIVE, and a queued
-session is precisely what it must wait through.)
+looked correct for a verb whose caller may want to do other work while PIE comes up. What changed
+here is that the ack said what it was -- `queued: true, confirmed: false`, plus the verb that
+confirms it -- so it could not be read as "the world exists".
+
+**That judgement was wrong, and it was overturned the same day by #29.** The labelled ack shipped
+in the morning; agents left PIE running unattended three times in the afternoon. The label was
+accurate and the callers acted on the SHAPE the fields implied rather than on the hint beside them.
+`pie start` now blocks by default. See #29.
 
 The plugin half changes C++, so a project only gets the serialisation after a **rebuild**
 (`Restart-Editor.ps1`) and a re-sync of its vendored plugin copy. The CLI half -- confirmation,
@@ -821,9 +833,75 @@ that finds nothing (`unknown`, with the reason).
 
 CLI-only -- live on pull, no plugin rebuild. **Zero change under `Plugin/Source/`.**
 
+## 29. `uap pie start` returned before PIE was live; agents ended their turns on it -- FIXED
+
+Was: `uap pie start` returned as soon as the play session was QUEUED. Observed three times in one
+day (2026-08-28), by a human, across different agents: the agent, not knowing how to wait, invented
+its own waiting strategy -- typically a background watcher -- and **ended its turn**. PIE then ran
+live and unattended with nobody at the controls. In one case a Project Broken Wings aircraft flew
+into a building. The user's words: "uap starts and agents are waiting for something like as if they
+dont know it started".
+
+`uap pie wait <seconds>` already existed and blocks correctly. Nothing at the point of failure made
+the caller use it.
+
+**A partial fix shipped that morning and was not enough.** Commit `cb8b52b` (#25) added
+`queued: true, confirmed: false, next: "uap pie wait <seconds>"` to the start response. All three
+incidents happened AFTER it. Two things explain that, and both are worth more than the bug:
+
+1. **A response field does not only inform -- it implies a SHAPE.** `queued` implies a queue you
+   come back to; `confirmed: false` implies confirmation arriving on its own schedule. Together
+   they describe an ASYNC JOB, so an agent did the correct thing for async work -- registered a
+   watcher, ended the turn -- for an operation that takes **1-5 seconds**. Nobody builds watcher
+   infrastructure around a two-second call deliberately; the response told them to. The fields
+   were accurate and still wrong, and they were louder than the `next:` hint sitting beside them.
+2. **Response-field guidance fixes FAILURES, not wrong-but-confident behaviour.** Every case where
+   it worked in this repo (the `--mode vr` refusal, the skew message, `route: slate|viewport`)
+   reached an agent already in a failure state, hunting for why. This one reached an agent
+   confidently proceeding. Nothing in a response was going to make it stop and read. **A hint is
+   not a default.**
+
+A contributing factor, and the one self-inflicted trap in this file: #12 correctly says never
+tight-loop `uap exec` during a PIE transition (it re-enters the game thread and hard-crashes the
+editor), and said it with no mention of `pie wait`. "Do not poll" plus "PIE is not up yet" reasons
+straight to "wait for a callback" -- the background watcher, arrived at correctly from two true
+statements our own docs stated apart.
+
+Fixed (CLI + MCP only -- **no change under `Plugin/Source/`**):
+
+1. **`uap pie start` BLOCKS by default** until the play world is live, bounded by 60s
+   (`--timeout` / `$UAP_PIE_START_TIMEOUT`). It reuses the same wait `pie wait` uses
+   (`_pie_wait_for_live`, polling `IsInPIE` over RemoteControl) -- one notion of "PIE is live", not
+   two. `--mode vr` waits identically; an unattended VR Preview is the same incident with a headset
+   attached.
+2. **The async vocabulary left the default path.** A blocking start answers `playing: true` +
+   `waited_seconds`, exactly as `stop` answers `stopped: true` + `waited_seconds`. Keeping
+   `queued`/`confirmed` there would have preserved the misleading shape after the behaviour was
+   fixed. `waited_seconds` also quietly conveys "this is a short synchronous call", and makes an
+   abnormally long start visible instead of invisible.
+3. **`queued`/`confirmed` survive exactly where they are TRUE:** under the explicit `--no-wait`,
+   and on the timeout path, where a session really is outstanding.
+4. **Timeout fails loudly**, never a cheerful ok: it names the signal that did not turn true
+   (`IsInPIE`), says the editor is NOT idle and the queued session may still come up afterwards,
+   and gives the remedy (`uap pie stop`, then retry, or raise the bound).
+5. **The MCP twin (`tools/pie.py` `pie_start`) got the same treatment** -- it had the identical
+   shape -- blocking on `GetPIEPhase` until a live phase, with `wait: false` as the opt-out. Its
+   registry schema carries both. No other caller relied on the immediate return: nothing in
+   `reporting/` starts PIE, and `report finish` only ever STOPS it.
+6. **Docs state all three facts together** (`agent-testing/agentplayertest.md`,
+   `agent-testing/AGENTS-snippet.md`, `docs/agent-testing.md`, `docs/capabilities.md`, `uap help`):
+   do not tight-loop `exec` during a transition; DO use the blocking wait, which `pie start` now
+   does for you; and **never end a turn with PIE running** -- stop PIE and release the lease first.
+   The third was written nowhere before this.
+
+**Never end a turn with PIE running.** `uap report finish` auto-stops PIE unless you pass
+`--keep-pie` (and confirms the teardown, #25), so an agent that always finishes its report never
+leaves a session live. That covers the common case but not all of it: a run that ends early, errors
+out, or deliberately passes `--keep-pie` still needs an explicit `uap pie stop`.
+
 ## Status
 
-Items 1-9, 11, 13-23, 26-28 resolved (1 and 5 doc fixes; 2, 3, 4, 7, 8, 9, 14 code changes; 6 reporting;
+Items 1-9, 11, 13-23, 26-29 resolved (1 and 5 doc fixes; 2, 3, 4, 7, 8, 9, 14 code changes; 6 reporting;
 11 config pin; 13 coordination lease; 15-22 from the 2026-08-27 verification session). Items 10 and
 12 are guidance -- both are engine-side crashes surfaced through `exec` (a DataTable exporter bug;
 game-thread re-entrancy during PIE transitions).
@@ -847,8 +925,14 @@ were in use by other sessions. Its CLI half (confirmation, the `lease release` g
 `Restart-Editor.ps1` plus a re-sync of the vendored plugin copy. Live verification recipe is in
 "Verifying the PIE-stop fix" in `docs/agent-testing.md`.
 
-Items 27 and 28 are CLI-only -- live on pull, **no plugin rebuild and no change under
-`Plugin/Source/`**. Item 28's contract preflight was verified live on 2026-08-28 against a
+Items 27, 28 and 29 are CLI-only -- live on pull, **no plugin rebuild and no change under
+`Plugin/Source/`**. (Item 29 also changes the MCP server's `pie_start`.) Item 28's contract preflight was verified live on 2026-08-28 against a
 freshly rebuilt School's Out editor: `uap status` returned
 `"contract": {"state": "current", "checked_verbs": 37, ...}` while `plugin_version` still read
 the stale `"0.0.1"` -- the two answers side by side, which is the point.
+
+Item 29 is covered by unit tests (`tests/test_cli_pie_start_waits.py`, plus the MCP twin in
+`tests/test_pie_tools.py`) and NOT yet verified live: it was written while both editors on the
+machine were in use, and verifying it means starting PIE. The live check is one command --
+`uap pie start` must return `playing: true` with a non-zero `waited_seconds` a few seconds later,
+and `uap pie start --no-wait` must return at once with `queued: true`.

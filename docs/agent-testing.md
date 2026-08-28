@@ -46,11 +46,16 @@ bone delta, log line) settle a question -- never a screenshot alone.
   Same annotation on `perf_stat`, on both perf baselines, and on `uap sample` when the sampler's
   own `hz` comes back at that rate. Do not report a sub-5-fps number as a performance finding --
   see trap #1 in `agent-testing/agentplayertest.md`.
-- `uap pie start [--mode flat|vr]` / `uap pie wait <sec>` / `uap pie stop [--timeout 30]` --
+- `uap pie start [--mode flat|vr] [--no-wait] [--timeout 60]` / `uap pie wait <sec>` /
+  `uap pie stop [--timeout 30]` --
   start / await / stop Play-In-Editor (wraps the version-correct engine call; agents never touch
-  the raw subsystem). **`start` and `stop` are deliberately asymmetric.** `start` only QUEUES the
-  session and returns at once (`queued:true, confirmed:false`) -- the play world does not exist
-  yet, so `pie wait <sec>` is the confirmation half and is not optional. `stop` BLOCKS until the
+  the raw subsystem). **`start` and `stop` are now the same shape: both block, both fail rather
+  than ack.** `start` waits until the play world is LIVE and answers `playing:true` +
+  `waited_seconds` (a normal start is 1-5s); on timeout it returns `ok:false` and says the session
+  may still be queued, so the editor is not to be handed over or walked away from. `--no-wait` is
+  the old fire-and-forget ack (`queued:true, confirmed:false`) and is the only place that
+  vocabulary survives -- it implied an async job for a 1-5 second call, and agents acted on the
+  implication (known-issues #29). `stop` BLOCKS until the
   teardown is confirmed (it polls `IsPIEInProgress`, i.e. live **or** queued) and returns
   `ok:false` on timeout saying the editor is not free, because `stop` is the handover point: the
   lease, the next agent and `report finish` all act on "the editor is free". `ok:true` +
@@ -62,6 +67,12 @@ bone delta, log line) settle a question -- never a screenshot alone.
   an older one; **flat** `pie start` falls back to the legacy `StartPIE` by itself. Every project
   vendors its own plugin copy while sharing this one CLI, so that skew is normal -- see
   "CLI/plugin version skew" in `capabilities.md` and known-issues #23 before adding a new verb.
+  `--mode vr` waits for the live world exactly like flat does.
+  **Never end a turn with PIE running.** Stop it (`uap pie stop`) or let `uap report finish` do it
+  (`--keep-pie` opts out), and release the lease. And never poll PIE with a tight `uap exec` loop:
+  exec runs on the game thread and re-entering it during a PIE transition hard-crashes the editor
+  (known-issues #12). The blocking verbs above are the supported way to wait; they poll the plugin
+  over RemoteControl, which is a different channel.
 - `uap exec "<python>"` -- arbitrary `import unreal; ...` in the editor.
 - `uap rc <FunctionName> [key=value ...]` -- call a UAP_Preset UFUNCTION (use `uap exec` for nested args).
 - `uap read-ui` -- dump viewport UMG text. `uap screenshot <file> [--caption ...]` -- capture
@@ -115,7 +126,9 @@ still confirms the stop, but at the reduced guarantee it labels `degraded: true`
    `uap rc IsPIEInProgress` must return `{"ok": true, "result": false}` on an idle editor -- a 404
    / "this editor's plugin has no ..." means the rebuild has not landed.
 2. **The original race, on purpose.** Start PIE and stop it IMMEDIATELY, with no wait in between:
-   `uap pie start` then, as the very next command, `uap pie stop`.
+   `uap pie start --no-wait` then, as the very next command, `uap pie stop`. (`--no-wait` is
+   required to reproduce it now -- a plain `pie start` blocks until the world is live, which closes
+   the window the race lives in. That is the fix working, not the test failing.)
    * Expected now: the stop reports `cancelled_queued_start: true` (it consumed the queued start
      rather than racing it) and `stopped: true`.
    * The bug: `{"ok": true, "result": true}` returned in well under a second, followed ~4s later by
@@ -126,7 +139,8 @@ still confirms the stop, but at the reduced guarantee it labels `degraded: true`
      LIVE; `<Project> - Unreal Editor` means it is gone;
    * `uap log tail --grep "Shutting down PIE online subsystems"` (and `--grep "Creating play world
      package"` for anything that came up after your stop).
-4. **The normal path.** `uap pie start` -> `uap pie wait 12` -> `uap pie stop`. The stop should
+4. **The normal path.** `uap pie start` (it blocks; expect `playing:true` and a non-zero
+   `waited_seconds`) -> `uap pie stop`. The stop should
    report `was_playing: true`, `stopped: true`, and a `waited_seconds` that is non-zero: teardown
    takes at least a tick, so an instant return is itself the symptom.
 5. **The timeout path** (optional, needs a wedged teardown; skip if you cannot produce one). With

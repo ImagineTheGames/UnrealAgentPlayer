@@ -54,6 +54,20 @@ These are the errors agents make every time. Don't.
    rows** (`get_editor_property('row_names')` / row handles + per-row property reads) -- **never**
    `ExportDataTableToJSONString`. Treat any whole-asset `...ToJSONString` exporter as unsafe, and
    prefer `blueprint-mcp` / asset-author tools for inspecting assets rather than runtime `exec`.
+9. **NEVER END A TURN WITH PIE RUNNING.** Stop PIE and release your lease before you finish --
+   `uap pie stop`, or `uap report finish`, which stops it for you unless you pass `--keep-pie`. A
+   human is often watching that window, and a live PIE session with nobody at the controls is not
+   an idle editor -- it is a game being played by nothing. On 2026-08-28 an agent left one running
+   and a Project Broken Wings aircraft flew unattended into a building.
+10. **Do NOT tight-loop `uap exec` while PIE is starting or stopping** -- Python remote-exec runs
+   on the GAME THREAD, and re-entering it during a PIE transition hard-crashes the editor
+   (`RecursionGuard` assert; `docs/known-issues.md` #12). **DO use the blocking verbs instead:**
+   `uap pie start` now waits for the live world by itself (1-5s typically; `--no-wait` opts out),
+   and `uap pie wait <seconds>` polls the plugin over RemoteControl -- a different channel from
+   `exec`, and safe. Both halves belong in the same breath: stated apart, "never poll" with no
+   named way to wait reads as "wait for a callback", and the background watcher that follows is
+   exactly what left PIE running unattended. Never poll with `exec`, and never invent a waiting
+   strategy of your own.
 
 ## Layer mismatches -- five traps that silently give you a WRONG answer
 
@@ -197,10 +211,20 @@ wrote it down -- no cleverness involved.")
     gate diverge on the next release. `ruff==0.16.5`, not `ruff>=0.5` -- and the same for anything
     else CI installs fresh. A gate that drifts is worse than no gate: it spends its credibility
     saying "clean" right up to the moment it is wrong.
-- **In this CLI today:** `uap pie stop` blocks until teardown is confirmed and FAILS on timeout
-  rather than acking (`ok:true` + `stopped:true` is the only "it stopped"). `uap pie start` still
-  returns at once by design, and now says so: `queued: true, confirmed: false` -- follow it with
-  `uap pie wait <seconds>`, which is the confirmation half.
+- **In this CLI today:** BOTH halves block. `uap pie stop` waits until teardown is confirmed and
+  FAILS on timeout rather than acking (`ok:true` + `stopped:true` is the only "it stopped"), and
+  `uap pie start` waits until the play world is LIVE, answering `playing: true` + `waited_seconds`
+  in the same vocabulary. On timeout it fails and says the session may still be queued. Explicit
+  `--no-wait` is the only way to get the old ack, and it is the only place `queued`/`confirmed`
+  still appear.
+- **The sequel, and it is the more useful half (2026-08-28, same day):** labelling the ack was NOT
+  enough. `pie start` shipped `queued: true, confirmed: false, next: "uap pie wait <seconds>"` that
+  morning, and agents still built background watchers and ended their turns three times afterwards
+  -- once leaving a PBW aircraft flying into a building unattended. The reason is in the fields
+  themselves: `queued` implies a queue you come back to and `confirmed: false` implies confirmation
+  arriving on its own schedule, so an agent did the right thing for an async job over a call that
+  takes 1-5 SECONDS. **Naming a queued ack honestly does not stop callers acting on it; making the
+  call block does.** See "The limit of putting the answer in the response" below.
 
 ### 5. Injected input aimed at the WRONG SLATE USER -- right layer, discarded anyway
 
@@ -280,6 +304,29 @@ The `--mode vr` refusal is the pattern to copy; it does all three in one string:
 Same rule for a fallback: fall back only to a verb that answers the **same** question, and say in
 the result that you did (`via`, `note`, `degraded`). Never to one that answers a different
 question -- that is a silent wrong answer wearing a success.
+
+### The limit of putting the answer in the response
+
+Everything above says "put the answer where the caller is already looking". It works, and it has a
+sharp edge that cost three incidents in one day (2026-08-28). Two limits, in the order they bite:
+
+> **A response field does not only inform -- it implies a SHAPE.** `uap pie start` answered
+> `queued: true, confirmed: false, next: "uap pie wait <seconds>"`. Every field was accurate: the
+> session really was queued. But that vocabulary describes an ASYNC JOB, so agents did the correct
+> thing for an async job -- registered a background watcher and ended the turn -- for an operation
+> that takes 1-5 SECONDS. Before you add a field, ask what shape it implies about the operation,
+> not only whether it is true. These were true and still wrong.
+
+> **Response-field guidance fixes FAILURES. It does not fix wrong-but-confident behaviour.** Every
+> case where it worked -- the `--mode vr` refusal, the skew message, `route: slate|viewport` --
+> reached an agent already in a failure state, hunting for why. This one reached an agent
+> confidently proceeding, and nothing in a response was going to make it stop and read.
+> Wrong-but-confident needs the DEFAULT changed so the wrong path is not reachable -- which is why
+> `pie start` now blocks rather than advising you to wait. **A hint is not a default.**
+
+The worked example is the whole point: the hint shipped on the morning of the 28th, and all three
+incidents happened after it. Nothing about the message was unclear. It was answering an agent who
+had not asked.
 
 ## The bridge is the `uap` CLI
 
@@ -366,13 +413,16 @@ Verbs used in this flow:
 - `uap report finish pass|fail "<summary>"` -- render + open `index.html`; prints the path.
 - `uap exec "<python>"` -- run `import unreal; ...` in the live editor.
 - `uap rc <FunctionName> [key=value ...]` -- call a UAP_Preset UFUNCTION (use `uap exec` for complex/nested args).
-- `uap pie start [--mode flat|vr]` / `uap pie wait <sec>` / `uap pie stop [--timeout 30]` --
-  start / await / stop Play-In-Editor (version-correct; wraps the engine call so you never touch
-  the raw subsystem). `start` only QUEUES the session (`queued:true, confirmed:false`) -- the world
-  does not exist when it returns, so always follow it with `pie wait`. `stop` is the opposite
-  shape: it BLOCKS until the teardown is confirmed, and fails (`ok:false`) if it never happens
-  rather than acking a stop that did not take. `ok:true` + `stopped:true` is the only "PIE is
-  gone"; treat anything else as a still-live editor and do not release the lease.
+- `uap pie start [--mode flat|vr] [--no-wait] [--timeout 60]` / `uap pie wait <sec>` /
+  `uap pie stop [--timeout 30]` -- start / await / stop Play-In-Editor (version-correct; wraps the
+  engine call so you never touch the raw subsystem). `start` BLOCKS until the play world is live
+  and answers `playing:true` + `waited_seconds` (a normal start is 1-5s); on timeout it FAILS and
+  says the session may still be queued, so you never mistake a request for a world. `stop` is the
+  same shape in reverse: it blocks until the teardown is confirmed and fails rather than acking a
+  stop that did not take. `ok:true` + `stopped:true` is the only "PIE is gone"; treat anything else
+  as a still-live editor and do not release the lease. **`--no-wait` is the old fire-and-forget
+  ack** (`queued:true, confirmed:false`) -- only for a caller that genuinely has work to do while
+  PIE comes up, and never something to end a turn on.
   `--mode vr` starts VR Preview -- the HMD code path (OpenXR input, `IsHeadMountedDisplayEnabled()`
   branches) that flat PIE never takes. Needs a connected headset; it fails with a reason rather
   than silently falling back, so an HMD-only bug cannot look absent.
@@ -448,10 +498,13 @@ State the concrete pass condition before running. A non-zero speed with a frozen
    throttled run cannot be quietly summarised as a slow game.
 4. **Scene**: `uap exec` to `load_level('/Game/...')` if the question implies a specific map;
    else use the open level and `uap report note "using level X"`.
-5. **Start PIE**: `uap pie start`, then `uap pie wait 12` -- blocks until the game world is
-   live (up to 12s) and fails if it never comes up. (These wrap whichever engine call is
-   correct for the version in use; do NOT reach for `PlayWorldEditorSubsystem`, which was
-   removed and does not exist on any engine this supports.) If the question touches the HMD
+5. **Start PIE**: `uap pie start` -- it BLOCKS until the game world is live (1-5s typically) and
+   fails if it never comes up, so there is nothing to poll and nothing to wait on afterwards. Do
+   NOT build a watcher, and do NOT tight-loop `uap exec` to check whether PIE is up: exec runs on
+   the game thread and re-entering it during a PIE transition hard-crashes the editor. (`uap pie
+   wait <sec>` is still there for a session you did not start, or after `--no-wait`.) These wrap
+   whichever engine call is correct for the version in use; do NOT reach for
+   `PlayWorldEditorSubsystem`, which was removed and does not exist on any engine this supports. If the question touches the HMD
    code path -- OpenXR input, or an `IsHeadMountedDisplayEnabled()` branch such as a world-space
    VR screen -- use `uap pie start --mode vr` (VR Preview) instead; flat PIE takes neither path,
    so the bug will look absent. Give it a beat for a frame to render before capturing a
@@ -488,6 +541,9 @@ State the concrete pass condition before running. A non-zero speed with a frozen
    observed. If it comes back with `pie_stop_error`, the editor is still in PIE -- say so and do
    not release an editor lease.
 10. **Report back**: verdict, the read-back numbers, and the report path. State failures plainly.
+    **Before you end the turn, PIE must be stopped** -- step 9 does it for you unless you passed
+    `--keep-pie`, and if you did, `uap pie stop` yourself. A finished turn that leaves PIE live
+    hands a human a game nobody is playing (see mistake 9 at the top of this file).
 
 ## A verification is not done until the report exists
 

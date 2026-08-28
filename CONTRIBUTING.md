@@ -102,6 +102,16 @@ contains"):
 
 A silent wrong answer is worse than a missing verb: a missing verb 404s and somebody notices.
 
+**Know where this stops working.** A response field also implies a SHAPE, and callers act on the
+shape before they read the hint: `uap pie start` answered `queued: true, confirmed: false,
+next: "uap pie wait <seconds>"` -- every field true -- and agents read "async job", built
+background watchers and ended their turns over a 1-5 second call, three times in the day after
+that shipped ([#29](docs/known-issues.md)). Response-field guidance reaches an agent already in a
+failure state, hunting for why; it does not reach one confidently proceeding. **Wrong-but-confident
+needs the DEFAULT changed so the wrong path is not reachable** -- which is why `pie start` now
+blocks instead of advising you to wait. A hint is not a default. Full write-up: "The limit of
+putting the answer in the response" in `agent-testing/agentplayertest.md`.
+
 ## Tests
 
 `mcp-server/tests/`. Pytest, no live editor. Conventions worth copying:
