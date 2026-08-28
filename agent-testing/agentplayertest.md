@@ -357,6 +357,15 @@ Verbs used in this flow:
   exact FKeys (`W`, `C`, `LeftControl`, `OculusTouch_Left_Thumbstick_Y`); a refused hold
   presses nothing. Bare `uap input release` is the RECOVERY hatch -- it clears every hold and
   flushes any key the engine still has down, so a stuck key never needs a PIE restart.
+  **GAMEPAD BUTTONS go here too** -- `uap input hold Gamepad_LeftTrigger --seconds N` takes the
+  viewport route and reaches Enhanced Input. Do NOT reach for `rc InjectGamepad` to drive
+  gameplay: its BUTTON branch is Slate-routed **by design**, because a face/DPad press is also
+  how UMG focus navigation is driven, so it only reaches gameplay input while the PIE viewport
+  holds Slate focus -- and when it does not, a working feature looks dead. Sticks and keyboard
+  keys are unaffected; both already take the viewport route. This exact confusion cost another
+  project on this machine several sessions, during which "uap cannot reach Enhanced Input" was
+  repeated as though it were a diagnosis. It was the wrong verb, not a missing capability --
+  which is why a symptom repeated confidently is still not a mechanism.
 - `uap sample start <object> <property> --seconds N` / `uap sample read` -- per-frame series +
   delta stats. The only way to see sub-second behaviour.
 - `uap log cursor` / `uap log since <c> [--grep RE]` / `uap log tail [--grep RE]` --

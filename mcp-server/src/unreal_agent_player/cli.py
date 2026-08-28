@@ -1373,6 +1373,15 @@ SUSTAINED INPUT (a single injected event CANNOT drive locomotion -- see below)
   input every frame INSIDE the engine, then releases. VR sticks are AXES, not buttons.
   Key names are exact FKeys from the engine's own registry (W, C, LeftControl, SpaceBar,
   Gamepad_LeftY, OculusTouch_Left_Thumbstick_Y). A refused hold presses NOTHING.
+  GAMEPAD BUTTONS (Gamepad_FaceButton_Bottom, Gamepad_LeftTrigger, DPad...): use
+  `input hold <GamepadKey>` -- it takes the VIEWPORT route and reaches Enhanced Input.
+  `rc InjectGamepad` routes BUTTONS through Slate BY DESIGN, because a face/DPad press is
+  also how UMG focus navigation is driven -- so a button injected that way reaches gameplay
+  input only while the PIE viewport holds Slate focus, and looks like a dead feature when it
+  does not. Sticks and keyboard keys are unaffected: both already take the viewport route.
+  Reaching for `rc InjectGamepad` to drive gameplay, failing, and concluding "uap cannot
+  reach Enhanced Input" has already cost another project several sessions -- it was the
+  wrong verb, not a missing capability.
 
 SAMPLING + LOGS (sub-second truth; a ~1s exec round-trip cannot see judder or a 0.6s wind-up)
   uap sample start <object> <property> --seconds N   per-frame series + delta stats

@@ -18,7 +18,12 @@ and renders an HTML report.
 - To HOLD input (walking, a stick push), use `uap input hold <Key> --seconds N` /
   `uap input axis <AxisKey> <v> --seconds N`, never repeated `rc InjectKey`: one injected
   event is a single frame, the CLI round-trip is ~1s, and any FlushPressedKeys silently
-  drops a latched key. VR locomotion is an analog AXIS, not a button. Key names are exact
+  drops a latched key. VR locomotion is an analog AXIS, not a button. **For a GAMEPAD BUTTON
+  (trigger, face, DPad) use `uap input hold <GamepadKey>`** -- it takes the viewport route and
+  reaches Enhanced Input. `rc InjectGamepad` routes buttons through Slate BY DESIGN (a face/DPad
+  press is also how UMG focus nav is driven), so it reaches gameplay input only while the PIE
+  viewport holds Slate focus, and otherwise looks exactly like a dead feature. Sticks and
+  keyboard keys already take the viewport route. Key names are exact
   FKeys (`W`, `C`, `LeftControl`, `SpaceBar`, `OculusTouch_Left_Thumbstick_Y`).
 - If input starts behaving oddly mid-session (a pawn stuck crouched, movement that will not
   stop), run `uap input release` -- it clears every hold AND flushes any key the engine still
