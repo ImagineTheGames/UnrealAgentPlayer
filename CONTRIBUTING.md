@@ -20,6 +20,13 @@ cd mcp-server
 
 The pre-push hook runs the same lint + tests CI runs, plus the signature check below.
 
+A check that does not run the same thing as the gate it stands in for is not a check. The hook
+and `ci-python` run the same `ruff check src tests`, which is necessary and was not sufficient:
+`ruff>=0.5` let the hook lint with the venv's ruff while CI installed a newer one with a wider
+default rule set, so the hook said "clean" and CI failed on the identical command. The dev extra
+now pins `ruff==0.16.5` exactly. If you add a local gate, pin what it runs -- and if you bump the
+pin, run `ruff check src tests` before pushing, because the new version is allowed to disagree.
+
 ## The shape of this repo, and why it bites
 
 A CLI change is live in every project the moment someone pulls. A plugin change reaches a

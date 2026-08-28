@@ -176,6 +176,27 @@ wrote it down -- no cleverness involved.")
   whenever PIE is genuinely running, and false in exactly the window where the stop silently did
   nothing. Before you trust a check, ask what it returns when the thing you are checking for has
   gone wrong.
+- **The general form, one level up:** *a check that does not run the same thing as the gate it
+  stands in for is not a check.* The rule above asks what your signal reports when things have gone
+  wrong. This one asks the prior question: is it measuring the same quantity the real gate measures?
+  A check can be perfectly honest about the wrong quantity, and it looks rigorous the entire time it
+  is answering a question nobody asked.
+  - **Worked example (real, 2026-08-28) -- unpinned tooling.** `.githooks/pre-push` runs
+    `ruff check src tests`, character for character the command `ci-python` runs. It still reported
+    "lint clean" while CI failed on 148 errors, because `mcp-server/pyproject.toml` asked for
+    `ruff>=0.5`: the hook used the venv's ruff 0.15.17, CI installed a fresh 0.16.5, and 0.16's
+    default rule set is wider. Same command, different tool, different question. The most relatable
+    form of this bug is "my local check passes, CI fails, same command".
+  - **The same shape twice more, both in this repo.** `IsInPIE` stood in for "PIE is torn down" and
+    measured "a play world exists right now", so it read false in exactly the window where a stop
+    had silently done nothing (the trap above). `GetPluginVersion` stood in for "is this plugin
+    copy current" and measured a hardcoded `"0.0.1"` nobody ever bumped, so a copy missing half the
+    verbs reported itself current (`docs/known-issues.md` #27); `uap status` now compares parsed
+    header declarations against what the editor exports, which measures the actual quantity.
+  - **Corollary, for anyone writing a local gate:** pin the tool version, or your gate and the real
+    gate diverge on the next release. `ruff==0.16.5`, not `ruff>=0.5` -- and the same for anything
+    else CI installs fresh. A gate that drifts is worse than no gate: it spends its credibility
+    saying "clean" right up to the moment it is wrong.
 - **In this CLI today:** `uap pie stop` blocks until teardown is confirmed and FAILS on timeout
   rather than acking (`ok:true` + `stopped:true` is the only "it stopped"). `uap pie start` still
   returns at once by design, and now says so: `queued: true, confirmed: false` -- follow it with

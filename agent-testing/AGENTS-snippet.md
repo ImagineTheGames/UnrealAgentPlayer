@@ -88,5 +88,10 @@ and renders an HTML report.
   each project vendors its own plugin copy. Flat `uap pie start` degrades to the legacy verb on its
   own; `pie start --mode vr`, `uap input hold/axis`, `uap sample` and helper NAMES need the plugin
   rebuilt for this project. Do not retry it as if it were flaky.
+- **A check that does not run the same thing as the gate it stands in for is not a check.**
+  Matching command TEXT is not enough: a pre-push hook ran the identical `ruff check` line CI runs
+  and reported "clean" while CI failed, because `ruff>=0.5` let the two resolve different versions.
+  Pin the tool version in any local gate, and ask what quantity your confirmation signal measures --
+  not just what it returns when things go well.
 - Run the CLI via this project's `uap.ps1` so commands target THIS editor; calling it with no
   `--project` while another editor is open cross-targets the wrong one.
