@@ -298,7 +298,20 @@ Deeper docs (in the UnrealAgentPlayer repo): `docs/agent-testing.md` (usage),
 `docs/capabilities.md` (every tool + the input model), `docs/known-issues.md`.
 
 Verbs used in this flow:
-- `uap status` -- preflight; returns JSON `{ok, rc_reachable, plugin_version}`.
+- `uap status` -- preflight; returns JSON
+  `{ok, rc_reachable, plugin_version, rc_port, contract}`. **Read `contract`.** This
+  project vendors its own copy of the uap plugin while the CLI is shared by every
+  project, so the CLI runs ahead of this project until it syncs and rebuilds.
+  `contract.state` is `current`, `behind` (with a `message` naming what is unavailable
+  and the remedy -- sync and rebuild), or `unknown` when it could not be checked. A
+  `behind` copy can FAIL a verb with a 404, and can also accept a call and silently drop
+  a parameter it does not have, which is worse: it answers `ok` having done something
+  else. Check it before blaming the product. `plugin_version` is a stale build stamp --
+  it says `0.0.1` on every copy ever built; ignore it.
+- `uap rc <Func> key=value` encodes each value against that function's DECLARED
+  parameter type. If the result carries `coercion.guessed`, the type of those values was
+  inferred from your text and may not have bound -- pass them as one JSON object
+  instead: `uap rc <Func> '{"Name": "value"}'`.
 - `uap report start "<task>"` -- open a new report (writes `~/.uap-reports/<ts>/data.json`).
 - `uap report assert "<label>" pass|fail "<evidence>"` -- record a pass/fail check.
 - `uap report note "<text>"` -- add a free-text note.

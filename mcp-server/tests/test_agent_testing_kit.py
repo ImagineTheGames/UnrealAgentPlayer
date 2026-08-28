@@ -38,6 +38,26 @@ def test_launcher_template_resolves_engine_like_the_engine_does():
     assert not [ln for ln in code if "InstalledDirectory" in ln]
 
 
+def test_launcher_template_prefers_a_resolver_the_project_already_has():
+    """A project that has its own engine resolver has it because it made a rule of it ("never
+    add a second resolver: route new scripts through this one"). The template used to inline a
+    copy unconditionally, so every generated launcher carried one and a fix had to be
+    re-applied per project -- which is why SchoolsOutVR deliberately does not use the
+    template's version. Prefer theirs; keep the inline copy as the fallback so a project with
+    no resolver is unaffected."""
+    text = _read("uap.ps1.template")
+    # The known resolvers, probed by path.
+    assert "Scripts\\Resolve-UnrealEngine.ps1" in text        # SchoolsOutVR
+    assert ".claude\\scripts\\find-engine.ps1" in text        # Project Broken Wings
+    # Their parameter contracts differ and may change, so the call degrades instead of
+    # assuming one: richest form first, then plainer, then the inline fallback.
+    assert "Resolve-EditorExeViaProject" in text
+    assert "Resolve-EditorExe $projectRoot" in text, "the inline fallback must still be reachable"
+    # ...and the project's own resolver is consulted FIRST.
+    assert text.index("Resolve-EditorExeViaProject $projectRoot") < \
+        text.index("if (-not $exe) { $exe = Resolve-EditorExe $projectRoot }")
+
+
 def test_command_template_is_project_agnostic():
     text = _read("agentplayertest.md")
     low = text.lower()

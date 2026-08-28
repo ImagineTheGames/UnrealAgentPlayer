@@ -1,4 +1,4 @@
-# Known issues (UE 5.7 / 5.8, plugin v0.0.1)
+# Known issues (UE 5.7 / 5.8)
 
 Field findings from driving agent tests on UE 5.7 and 5.8. Each entry has a concrete repro and a
 status. "Fixed" means corrected in this repo; "Open" means it still needs a code change.
@@ -725,9 +725,105 @@ vendored plugin copy. The CLI half (`--user`, the relayed refusal, `route` in th
 on pull; `--user` against a plugin that predates the parameter is the only combination that needs
 the rebuild.
 
+## 27. `uap rc <Func> key=value` silently DOWNGRADED a numeric-looking string -- FIXED
+
+Found live on Project Broken Wings, 2026-08-28 (ClickUp 86ak7kcm7).
+
+```
+uap rc InjectGamepad Button=FaceBottom bPressed=true SlateUser=9
+{"ok": true, "result": true}
+```
+
+`ok`, no refusal -- **and the Slate user was never set**. Sending `SlateUser="9"` refuses
+correctly ("Slate has no registered user 9..."), so ONLY numeric-looking strings were
+swallowed, which is exactly what made it invisible.
+
+The chain, and note that every link behaves reasonably on its own:
+
+1. `cli._coerce` turns the shell text `9` into the JSON number `9` -- it has to guess,
+   because `uap rc` receives untyped shell text.
+2. RemoteControl binds the argument struct BY JSON TYPE. A number does not bind to an
+   `FString` parameter, and RemoteControl does not refuse -- it leaves that field at its
+   zero-initialised default.
+3. The plugin reads `""`, which is its documented "no explicit user -- resolve it yourself"
+   value (#26), and takes the auto route.
+4. The auto route succeeds. `ok: true`.
+
+**This is a CLASS, not an instance.** Any `FString` parameter given a numeric-looking value
+has the same hole (`KeyName=1`, `TabId=2`, `Name=404`), and the mirror case -- a key the
+function does not declare at all -- is dropped just as silently, so a typo'd parameter
+"succeeds" having sent nothing.
+
+Three fixes were on the table. `--user` on `uap rc` patches the instance and leaves the class;
+making the plugin distinguish "absent" from "empty" costs every project a rebuild and *still*
+leaves the class (it only helps this one parameter). What shipped fixes the class with no
+plugin change at all:
+
+1. **Encode against the DECLARED type, do not guess.** `uap rc` reads the target function's
+   parameter types from the editor's own RemoteControl preset (#28) and encodes each
+   `key=value` accordingly: `FString` stays a string, `float` becomes a number, `bool` becomes
+   a bool. No table of signatures is maintained anywhere -- the types come from the compiled
+   binary's reflection data.
+2. **An undeclared parameter is REFUSED**, with the function's real parameter list, instead of
+   being dropped.
+3. **A remaining guess is REPORTED.** Enums bind by name or by index so there is no single
+   right encoding, and a contract that cannot be read leaves the old heuristic. When the
+   heuristic actually RETYPED the caller's text, the result carries
+   `coercion: {guessed: [...], note: ...}` naming the escape hatch that carries real JSON
+   types: `uap rc <Func> '{"SlateUser": "9"}'`.
+4. **`input axis --user N` refuses** when this editor's plugin copy has no `SlateUser`
+   parameter, rather than sending it and having it dropped (#28).
+
+CLI-only -- live on pull, no plugin rebuild.
+
+## 28. CLI/plugin skew was only ever discovered by FAILING -- FIXED
+
+#23 taught the CLI to translate a RemoteControl 404 into "your plugin copy is behind". That is
+REACTIVE: it fires after a verb has already failed, and only for the verbs someone remembered
+to route through `_rc_require`. It also cannot see the worse gap. When a verb EXISTS but is
+missing a PARAMETER -- `HoldAxis` before `SlateUser` (#26) -- there is no 404 at all:
+RemoteControl accepts the call, drops the argument it cannot bind, and the plugin runs its
+default behaviour and reports success. Skew with no error is the silent wrong answer again.
+
+`uap status` now reports the gap UP FRONT, in the call every documented workflow starts with:
+
+```json
+"contract": {"state": "current", "checked_verbs": 37, "missing_verbs": [], "missing_args": {}}
+```
+
+**Both sides are DERIVED. Nothing here is a number anyone has to remember to bump** -- which
+matters, because a stamp that reports "up to date" while being wrong is worse than no stamp:
+
+- *expected* is parsed from the `UFUNCTION` declarations in this repo's own
+  `Plugin/Source/**/Public/UAPAgent*Subsystem.h`. That header IS the newest plugin; a project's
+  copy is a copy of it. Change the header and the expectation moves in the same commit.
+- *live* is read from the editor's RemoteControl preset (`GET /remote/preset/UAP_Preset`),
+  which RemoteControl builds from the COMPILED binary's reflection data -- including each
+  argument's name and declared type. It is the same route `_rc_call` uses, so it cannot
+  disagree with the calls the CLI makes. It is a plain RemoteControl endpoint, not a plugin
+  verb, so **old plugin copies answer it too** -- which is the whole point.
+
+The plugin's own `GetPluginVersion()` is deliberately NOT the signal. It is a hardcoded
+`TEXT("0.0.1")` in two .cpp files that has never been bumped across every verb added since the
+first release -- it reported "0.0.1" from a copy predating `StartPIEMode`, `HoldAxis` and the
+sampler alike. It stays in `uap status` as an informational build string and decides nothing.
+Making it accurate would need a plugin edit, a rebuild in every project, and would still be
+forgettable; the probe is exact, per-parameter, and cannot be forgotten.
+
+Degradation is deliberate and one-directional: no header (a non-editable install), no editor,
+or a RemoteControl that will not answer all produce `state: "unknown"`, never `"current"`, and
+the CLI behaves exactly as it did before the check existed. `_rc_require`'s 404 translation
+stays as the backstop.
+
+Two things are reported but are NOT skew: a verb the editor has and this checkout does not
+(`plugin_ahead` -- that project rebuilt from a newer commit; nothing breaks), and a parser
+that finds nothing (`unknown`, with the reason).
+
+CLI-only -- live on pull, no plugin rebuild. **Zero change under `Plugin/Source/`.**
+
 ## Status
 
-Items 1-9, 11, 13-23, 26 resolved (1 and 5 doc fixes; 2, 3, 4, 7, 8, 9, 14 code changes; 6 reporting;
+Items 1-9, 11, 13-23, 26-28 resolved (1 and 5 doc fixes; 2, 3, 4, 7, 8, 9, 14 code changes; 6 reporting;
 11 config pin; 13 coordination lease; 15-22 from the 2026-08-27 verification session). Items 10 and
 12 are guidance -- both are engine-side crashes surfaced through `exec` (a DataTable exporter bug;
 game-thread re-entrancy during PIE transitions).
@@ -750,3 +846,9 @@ were in use by other sessions. Its CLI half (confirmation, the `lease release` g
 `IsPIEInProgress`, the queued-start cancel) changes C++, so it needs a **plugin rebuild** via
 `Restart-Editor.ps1` plus a re-sync of the vendored plugin copy. Live verification recipe is in
 "Verifying the PIE-stop fix" in `docs/agent-testing.md`.
+
+Items 27 and 28 are CLI-only -- live on pull, **no plugin rebuild and no change under
+`Plugin/Source/`**. Item 28's contract preflight was verified live on 2026-08-28 against a
+freshly rebuilt School's Out editor: `uap status` returned
+`"contract": {"state": "current", "checked_verbs": 37, ...}` while `plugin_version` still read
+the stale `"0.0.1"` -- the two answers side by side, which is the point.

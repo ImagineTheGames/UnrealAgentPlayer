@@ -18,6 +18,8 @@ Health of the whole bridge in one call.
 **Returns:** `ue_running`, `rc_reachable`, `remote_exec_reachable`, `plugin_version`.
 Use this first — it tells the agent whether the editor is up and which channels are live before attempting anything else.
 
+`plugin_version` is a build stamp, not a capability signal: it is a hardcoded literal in the plugin that has never been bumped, so it reads `0.0.1` from a copy missing half the verbs. For the real answer use the CLI's `uap status`, whose `contract` block compares the CLI's plugin headers against what the editor actually exports (docs/known-issues.md #28).
+
 ---
 
 ## PIE (Play-In-Editor)

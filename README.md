@@ -133,8 +133,23 @@ Verify, from your project root with the editor running:
 powershell -NoProfile -File uap.ps1 status
 ```
 
-Expected: `{"ok": true, "rc_reachable": true, "plugin_version": "0.0.1", "rc_port": <n>}`.
+Expected:
+
+```json
+{"ok": true, "rc_reachable": true, "plugin_version": "0.0.1", "rc_port": 30079,
+ "contract": {"state": "current", "checked_verbs": 37, "missing_verbs": [], "missing_args": {}}}
+```
+
 `rc_port` differs per project; any number is fine as long as `rc_reachable` is true.
+
+`contract` is the one to read. Every project vendors its own copy of the plugin while sharing
+this CLI, so a pulled CLI runs ahead of a project until that project rebuilds. `status`
+compares the `UFUNCTION` declarations in this repo's plugin headers against what your editor
+actually exports and tells you the gap before anything fails -- including a verb that exists
+but is missing a *parameter*, which produces no error at all. `behind` carries a `message`
+naming what is unavailable and the remedy; `unknown` means it could not be checked, and is
+never reported as `current`. `plugin_version` is a build stamp that has never been bumped --
+informational only. See [docs/known-issues.md](docs/known-issues.md) #28.
 
 With the MCP server registered, ask your client to call `bridge_status` instead and expect
 `ue_running: true`, `rc_reachable: true`, `remote_exec_reachable: true`.
@@ -169,11 +184,15 @@ The plugin and Remote Control / Python bridges are cross-platform in principle, 
 ## Repository layout
 
 ```
-Plugin/        UE editor plugin (C++)
-mcp-server/    Python MCP server + tests
+Plugin/        UE editor plugin (C++) -- every project vendors its OWN COPY
+mcp-server/    Python MCP server + `uap` CLI + tests -- every project SHARES THIS ONE
+agent-testing/ The kit installed into a project (uap.ps1 template, command + AGENTS snippets)
 docs/          Setup, architecture, capabilities, use cases, writing test helpers
 examples/      Example project-side test helpers
 ```
+
+Contributing (and the rules that fall out of that copy/share split, including what a commit
+that changes a plugin signature has to say): **[CONTRIBUTING.md](CONTRIBUTING.md)**.
 
 ## License
 

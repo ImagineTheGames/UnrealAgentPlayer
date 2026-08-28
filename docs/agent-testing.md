@@ -25,7 +25,15 @@ bone delta, log line) settle a question -- never a screenshot alone.
 
 ## `uap` verbs
 
-- `uap status` -- preflight; `{ok, rc_reachable, plugin_version}`.
+- `uap status` -- preflight; `{ok, rc_reachable, plugin_version, rc_port, contract}`.
+  **Read `contract`.** Every project vendors its own copy of the plugin while sharing one
+  CLI, so a pulled CLI runs ahead of a project until that project rebuilds. `contract`
+  compares what this CLI's plugin headers declare against what your editor actually
+  exports: `current`, `behind` (with a `message` naming what is unavailable and the
+  remedy), or `unknown` when it could not be checked -- never `current` on a guess. It
+  catches the gap a failed call cannot: a verb that EXISTS but is missing a parameter,
+  which RemoteControl accepts and silently drops. `plugin_version` is a build stamp that
+  has never been bumped; it is informational and decides nothing.
 - `uap report start "<task>" [--project X] [--require-screenshot]` -- `--require-screenshot`
   makes `finish pass` auto-downgrade to fail unless a screenshot is attached.
 - `uap report assert "<label>" pass|fail "<evidence>"` / `note "<text>"` / `finish pass|fail "<summary>"`.

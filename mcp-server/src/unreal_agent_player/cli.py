@@ -14,6 +14,7 @@ from unreal_agent_player.reporting import session as sess
 from unreal_agent_player.reporting.render import render
 from unreal_agent_player.transport import RemoteControlClient, PythonRemoteExecClient
 from unreal_agent_player.errors import AgentError, ErrorCode
+from unreal_agent_player import contract as _contract
 from unreal_agent_player import coordination as _coord
 from unreal_agent_player import throttle as _throttle
 
@@ -376,6 +377,45 @@ def _skew_error(func: str, project: "str | None", needs: str) -> AgentError:
     )
 
 
+def _live_contract(project: "str | None") -> "dict | None":
+    """What this project's editor ACTUALLY exports right now: {verb: {arg: declared_type}},
+    read from its RemoteControl preset. None when it cannot be read.
+
+    This is the proactive half of the skew story. `_rc_require` below still catches a missing
+    verb REACTIVELY, after a call has already failed; this answers the same question up front,
+    and answers the question a 404 cannot -- "the verb is there, but does it have the parameter
+    I am about to send?". See contract.py for why neither side is a hand-bumped number.
+
+    One localhost GET. Every failure is None, so a call that would have worked still does.
+    """
+    return _contract.fetch_live_contract(_rc_port_for(project))
+
+
+def _contract_report(project: "str | None") -> dict:
+    """Compare what this checkout's plugin header declares against what the editor exports."""
+    live = _live_contract(project)
+    report = _contract.compare(_contract.expected_contract(), live)
+    msg = _contract.skew_message(report, project)
+    if msg:
+        report["message"] = msg
+    return report
+
+
+def _missing_arg(func: str, arg: str, project: "str | None") -> "str | None":
+    """The refusal text when this editor's plugin copy cannot receive `arg`, else None.
+
+    None means "send it": either the parameter is there, or the contract could not be read at
+    all and the CLI must not block a call that would otherwise have worked.
+    """
+    live = _live_contract(project)
+    if live is None:
+        return None
+    args = live.get(func)
+    if args is None or arg in args:
+        return None     # verb missing entirely -> let the 404 path name it; it says more
+    return _contract.arg_skew_message(func, arg, project)
+
+
 def _rc_require(func: str, params: dict, project: "str | None", needs: str):
     """_rc_call for a verb an older plugin copy may not have: turns RemoteControl's raw 404
     into the version-skew refusal above. Every other failure passes through untouched."""
@@ -416,6 +456,14 @@ def _capture(tool: str, args: dict, body: dict, ms: int) -> None:
 
 
 def _status(args) -> int:
+    """Preflight. Also the ONE place the CLI/plugin skew check runs by default, because it is
+    the call every documented workflow starts with -- so a project whose plugin copy is behind
+    finds out here, in a verb that is meant to diagnose, rather than three steps later inside a
+    verb that silently did the wrong thing.
+
+    `plugin_version` is a BUILD STAMP, not a capability signal: it is a hardcoded literal in the
+    plugin that has never been bumped. `contract` is the real answer -- see contract.py.
+    """
     t0 = time.monotonic()
     out = {"ok": True, "rc_reachable": False, "plugin_version": None, "rc_port": _rc_port_for(args.project)}
     try:
@@ -425,13 +473,27 @@ def _status(args) -> int:
     except AgentError as exc:
         out["ok"] = False
         out["error"] = str(exc)
+    if out["rc_reachable"]:
+        out["contract"] = _contract_report(args.project)
     _capture("status", {}, out, int((time.monotonic() - t0) * 1000))
     _emit(out)
     return 0 if out["rc_reachable"] else 1
 
 
 def _coerce(v: str):
-    """Coerce a key=value string value to bool/int/float, else leave as string."""
+    """Coerce a key=value string value to bool/int/float, else leave as string.
+
+    A GUESS, and only correct by luck. `uap rc` sees shell text with no types, so this used to
+    be the only rule -- and it silently broke a whole CLASS of call: RemoteControl binds the
+    argument struct BY JSON TYPE, so a value guessed into a number cannot bind to an FString
+    parameter. RemoteControl does not refuse; it leaves that field at its zero-initialised
+    default and the plugin runs its "argument omitted" path, reporting success
+    (`rc InjectGamepad ... SlateUser=9` -> plugin reads "" -> auto route; ClickUp 86ak7kcm7).
+    Every FString parameter with a numeric-looking value has the same hole.
+
+    So this is now the FALLBACK, used only where the declared type is unknown, and the caller
+    is told which values were guessed. `_coerce_declared` below is the primary path.
+    """
     low = v.lower()
     if low == "true":
         return True
@@ -448,26 +510,64 @@ def _coerce(v: str):
     return v
 
 
-def _parse_rc_params(tokens: list[str]) -> dict:
-    """Parse rc params from CLI tokens.
+def _coerce_declared(v: str, type_name: "str | None"):
+    """Encode a key=value string as the parameter's DECLARED type actually needs.
+
+    Returns (value, guessed). `guessed` is True when the declared type gives no answer (enum,
+    struct, or no contract at all) and the heuristic had to run -- reported, never hidden.
+    """
+    kind = _contract.kind_of(type_name)
+    if kind == "string":
+        return v, False                      # "9" stays "9"; this is the whole bug
+    if kind == "bool":
+        return v.strip().lower() not in ("false", "0", "no", ""), False
+    if kind == "int":
+        try:
+            return int(v, 0), False
+        except ValueError:
+            return _coerce(v), True
+    if kind == "float":
+        try:
+            return float(v), False
+        except ValueError:
+            return _coerce(v), True
+    # Enum / struct / no contract. The risk in this whole class is text being silently
+    # RETYPED, so flag it only when that actually happened: `Button=FaceBottom` goes out as
+    # the caller's own string and carries no risk, while `Button=3` became a number on a guess
+    # and the caller deserves to know.
+    val = _coerce(v)
+    return val, not isinstance(val, str)
+
+
+def _parse_rc_params(tokens: list[str], types: "dict | None" = None) -> tuple[dict, list[str]]:
+    """Parse rc params from CLI tokens. Returns (params, guessed_keys).
 
     Two forms (the first dodges Windows shell quoting, which mangles embedded
     double-quotes in a JSON string arg):
       - key=value pairs:  Command=stat\\ fps   KeyName=E   bPressed=true
       - a single JSON object token:  '{"Command":"stat fps"}'  (when the caller
-        can pass quotes through intact).
+        can pass quotes through intact). This form already carries real JSON types, so it is
+        passed through untouched and is the escape hatch when no contract can be read.
+
+    `types` is {arg_name: declared_type} for the target UFUNCTION, read live from the editor.
+    None means no contract could be read, so every value falls back to the heuristic -- and a
+    key lands in `guessed` when that heuristic actually RETYPED the caller's text, which is the
+    only way this can go silently wrong.
     """
     if not tokens:
-        return {}
+        return {}, []
     if len(tokens) == 1 and tokens[0].lstrip().startswith("{"):
-        return json.loads(tokens[0])
+        return json.loads(tokens[0]), []
     out: dict = {}
+    guessed: list[str] = []
     for tok in tokens:
         if "=" not in tok:
             raise ValueError(f"param must be key=value or a single JSON object, got: {tok!r}")
         k, v = tok.split("=", 1)
-        out[k] = _coerce(v)
-    return out
+        out[k], was_guess = _coerce_declared(v, types.get(k) if types else None)
+        if was_guess:
+            guessed.append(k)
+    return out, guessed
 
 
 # UFUNCTIONs whose declared return type cannot survive RemoteControl's preset-call route:
@@ -478,14 +578,37 @@ _RC_JSON_TWINS = {"ListTestHelpers": "ListTestHelpersJson"}
 
 
 def _rc(args) -> int:
+    """The raw UFUNCTION passthrough -- and the one verb whose parameters arrive as untyped
+    shell text, so it is where a mistyped argument gets silently dropped by RemoteControl. It
+    now asks the editor for the target function's DECLARED parameter types first and encodes
+    against them, instead of guessing from the text (see `_coerce` / ClickUp 86ak7kcm7)."""
+    func = args.rc_func
+    types = None
+    if any("=" in t for t in args.params):
+        live = _live_contract(args.project)
+        if live is not None:
+            types = live.get(func)
     try:
-        params = _parse_rc_params(args.params)
+        params, guessed = _parse_rc_params(args.params, types)
     except (ValueError, json.JSONDecodeError) as exc:
         _emit({"ok": False, "error": f"bad rc params: {exc}"})
         return 2
+
+    # A parameter the function does not declare is dropped by RemoteControl exactly as silently
+    # as a mistyped one -- so a typo'd key today "succeeds" having sent nothing. Refuse instead,
+    # and only when the contract was actually read (never on a guess).
+    if types is not None:
+        unknown = [k for k in params if k not in types]
+        if unknown:
+            _emit({"ok": False, "error": (
+                f"`{func}` has no parameter(s) {', '.join(sorted(unknown))}. RemoteControl "
+                f"would accept the call and DROP them, so it would report success having sent "
+                f"nothing. Declared parameters: "
+                f"{', '.join(f'{k}: {v}' for k, v in types.items()) or '(none)'}.")})
+            return 2
+
     t0 = time.monotonic()
     body: dict = {"ok": True}
-    func = args.rc_func
     twin = _RC_JSON_TWINS.get(func) if not params else None
     try:
         if twin:
@@ -495,6 +618,16 @@ def _rc(args) -> int:
             body["result"] = _rc_call(func, params, args.project)
     except (AgentError, json.JSONDecodeError) as exc:
         body = _err(exc)
+    if guessed and body.get("ok"):
+        # Say so. A guessed encoding is the failure mode that produces an `ok` with the wrong
+        # behaviour, and the reader has no other way to know it happened.
+        body["coercion"] = {
+            "guessed": sorted(guessed),
+            "note": ("no declared type for these; their JSON type was inferred from the text. "
+                     "If the plugin behaved as though the value were absent, pass the whole "
+                     "parameter set as one JSON object instead: "
+                     "uap rc " + func + " '{\"Name\": \"value\"}'"),
+        }
     _capture(f"rc:{args.rc_func}", {"params": params}, body, int((time.monotonic() - t0) * 1000))
     _emit(body)
     return 0 if body["ok"] else 1
@@ -774,6 +907,15 @@ def _input(args) -> int:
             # it yourself / keep the game-viewport route", which is the historical behaviour.
             params = {"AxisKeyName": args.key, "Value": args.value, "Seconds": args.seconds}
             if args.user is not None:
+                # An older plugin copy HAS HoldAxis but without the SlateUser parameter, so
+                # there is no 404 for `_rc_require` to catch: RemoteControl would take the call,
+                # drop the argument, and the hold would go out the viewport route reporting ok
+                # -- the silent discard of #26 all over again, one layer up. Check the live
+                # contract first and refuse. Unreadable contract -> proceed as before.
+                gap = _missing_arg("HoldAxis", "SlateUser", args.project)
+                if gap:
+                    _emit({"ok": False, "action": sub, "pressed": False, "error": gap})
+                    return 1
                 params["SlateUser"] = str(args.user)
             body.update(_rc_json("HoldAxis", params, args.project, needs=_NEEDS_HOLD))
         elif sub == "release":
@@ -1145,7 +1287,15 @@ COMMON MISTAKES (don't)
     NEVER ExportDataTableToJSONString. Treat any whole-asset "...ToJSONString" exporter as unsafe.
 
 PREFLIGHT
-  uap status                      liveness + plugin version + resolved RC port
+  uap status                      liveness + resolved RC port + CLI/plugin CONTRACT
+                                  READ `contract`. This project vendors its own plugin copy
+                                  while the CLI is shared, so the CLI runs ahead of it until
+                                  it syncs + rebuilds. state: current | behind (with a
+                                  `message` saying what is unavailable and the remedy) |
+                                  unknown (could not check -- never reported as current).
+                                  A `behind` copy can 404 a verb, and can also ACCEPT a call
+                                  and silently drop a parameter it lacks -- ok, wrong result.
+                                  `plugin_version` is a stale build stamp; it decides nothing.
   uap report diag                 capture editor/level/PIE + frame perf into the report
                                   A rate <= 5 fps comes back `throttled:true` + a `warning`:
                                   that is the editor's NOT-FOREGROUND throttle (it pins ~3.0
@@ -1187,6 +1337,14 @@ MULTI-AGENT COORDINATION (several agents sharing one editor; see docs/agent-coor
 
 DRIVE + OBSERVE
   uap rc <Func> [key=value ...]   call a plugin UFUNCTION (one-shot input injection lives here)
+                                  Values are encoded against the function's DECLARED parameter
+                                  type, read from the editor -- so `SlateUser=9` goes out as the
+                                  string "9" rather than the number 9, which would not bind and
+                                  would be dropped in silence. A parameter the function does not
+                                  declare is REFUSED, not dropped. If the result carries
+                                  `coercion.guessed`, those types were inferred from your text:
+                                  pass them as one JSON object instead --
+                                  uap rc <Func> '{"Name": "value"}'
   uap exec "<python>"             run `import unreal; ...` in the editor (escape hatch)
   uap read-ui                     dump on-screen UMG: [{text, x, y}, ...] + focused
   uap click "<label>"             click an on-screen UMG element by its visible text
