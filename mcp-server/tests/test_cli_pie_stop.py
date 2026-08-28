@@ -158,11 +158,14 @@ def test_degraded_stop_restops_a_queued_start_that_lands_afterwards(monkeypatch,
 
 # --- start is deliberately the other shape ----------------------------------------------
 
-def test_start_labels_itself_as_a_queued_ack(monkeypatch, capsys):
-    """`pie start` still returns immediately (agents rely on it), but it must not read as "the
-    world exists": it says the session is queued and names the verb that confirms it."""
+def test_only_the_opt_out_start_labels_itself_as_a_queued_ack(monkeypatch, capsys):
+    """`pie start` used to return immediately and say so -- `queued: true, confirmed: false` plus
+    the verb that confirms it. That labelling was correct and insufficient: it shipped the same
+    morning agents left PIE running unattended three times (see test_cli_pie_start_waits.py), so
+    the DEFAULT now blocks and the ack shape is confined to the explicit `--no-wait` opt-out,
+    where a ticket really is outstanding."""
     _stub(monkeypatch, {"StartPIEMode": json.dumps({"ok": True, "mode": "flat"})})
-    assert cli.main(["pie", "start"]) == 0
+    assert cli.main(["pie", "start", "--no-wait"]) == 0
     body = _out(capsys)
     assert body["queued"] is True and body["confirmed"] is False
     assert "pie wait" in body["next"]

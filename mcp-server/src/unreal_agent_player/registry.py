@@ -90,16 +90,24 @@ def register_all(
         ),
         Tool(
             name="pie_start",
-            description=("QUEUE a Play-In-Editor session. Optional map_path and start_location. "
-                         "Returns queued:true, confirmed:false + phase/elapsed -- the play world "
-                         "does not exist yet, so poll pie_status for phase Playing before reading "
-                         "game state or capturing a frame."),
+            description=("Start a Play-In-Editor session and BLOCK until the play world is live "
+                         "(a normal start is 1-5s). Returns playing:true + waited_seconds, the "
+                         "same shape pie_stop returns. On timeout it returns ok:false and says "
+                         "the session may still be queued -- never a bare ack. Optional map_path "
+                         "and start_location. Pass wait:false only if you genuinely have other "
+                         "work to do while PIE comes up; then poll pie_status for phase Playing "
+                         "before reading game state. NEVER leave PIE running unattended -- stop "
+                         "it (report_finish does) before you finish."),
             inputSchema={
                 "type": "object",
                 "properties": {
                     "mode": {"type": "string", "enum": ["PlayInViewport", "PlayInNewWindow", "Simulate"], "default": "PlayInViewport"},
                     "map_path": {"type": "string"},
                     "start_location": {"type": "array", "items": {"type": "number"}, "minItems": 3, "maxItems": 3},
+                    "wait": {"type": "boolean", "default": True,
+                             "description": "block until the play world is live (default). false returns as soon as the session is queued -- the world does not exist yet."},
+                    "timeout": {"type": "number", "default": 60.0,
+                                "description": "max seconds to wait for the live world when wait is true."},
                 },
                 "additionalProperties": False,
             },

@@ -26,8 +26,8 @@ Use this first — it tells the agent whether the editor is up and which channel
 
 | Tool | Purpose |
 | --- | --- |
-| `pie_start` | Begin a PIE session (`editor_request_begin_play`). |
-| `pie_stop` | End the PIE session. |
+| `pie_start` | Begin a PIE session (`editor_request_begin_play`) and BLOCK until the play world is live. |
+| `pie_stop` | End the PIE session, blocking until the teardown is confirmed. |
 | `pie_pause` | Pause PIE. |
 | `pie_resume` | Resume a paused PIE session. |
 | `pie_status` | Current phase + elapsed seconds. |
@@ -35,6 +35,23 @@ Use this first — it tells the agent whether the editor is up and which channel
 **`pie_status` returns:** `phase` (`NotPlaying` / `Playing` / `Paused` / `Ending`), `elapsed_seconds`.
 
 > PIE starts the level currently open in the editor. To play a specific map, load it first via `exec_python` (`LevelEditorSubsystem.load_level("/Game/...")`).
+
+**Starting PIE blocks by default** (CLI `uap pie start`, MCP `pie_start`). It returns once the play
+world is LIVE, reporting `playing: true` + `waited_seconds` -- the same vocabulary `pie_stop`
+reports with -- and on timeout (60s; `--timeout` / `$UAP_PIE_START_TIMEOUT` / the `timeout` field)
+it FAILS, saying the session may still be queued rather than acking a start that has not happened.
+A normal start is 1-5 seconds.
+
+It used to return the moment the session was queued, labelled `queued: true, confirmed: false`.
+Accurate, and it still cost three incidents in one day: that vocabulary implies an async job, so
+agents registered background watchers and ended their turns over a 1-5 second call, leaving PIE
+live and unattended (known-issues #29). The ack survives only behind an explicit `--no-wait` /
+`wait: false`, which is where it is true.
+
+**Never end a turn with PIE running.** Stop it and release the lease; `uap report finish` stops it
+for you unless you pass `--keep-pie`. And never poll PIE with a tight `exec` loop -- `exec` runs on
+the game thread, and re-entering it during a PIE transition hard-crashes the editor (known-issues
+#12). The blocking verbs poll the plugin over RemoteControl instead, which is a separate channel.
 
 ### VR Preview (`StartPIEMode`, `uap pie start --mode vr`)
 

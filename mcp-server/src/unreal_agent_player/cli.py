@@ -738,6 +738,17 @@ def _pie_stop_timeout() -> float:
     return _float_env("UAP_PIE_STOP_TIMEOUT", 30.0)
 
 
+def _pie_start_timeout() -> float:
+    """Seconds `uap pie start` waits for the play world to go LIVE before it fails.
+
+    A start normally takes 1-5 seconds. The bound is generous because a cold map load is the
+    slow case, not because the call is expected to be long: `waited_seconds` in the result is
+    what tells the caller which of the two they got.
+    $UAP_PIE_START_TIMEOUT overrides.
+    """
+    return _float_env("UAP_PIE_START_TIMEOUT", 60.0)
+
+
 def _pie_stop_settle() -> float:
     """DEGRADED path only (see _pie_stop): how long IsInPIE must read false CONTINUOUSLY before
     a stop is believed. IsInPIE cannot see a queued start, so a single false reading is exactly
@@ -831,17 +842,69 @@ def _pie_stop(project: str | None, timeout: float) -> dict:
     return out
 
 
+# --- PIE start: LIVE, not merely queued ---------------------------------------------------
+# One implementation of "is PIE live", shared by `pie wait` and by the blocking `pie start`.
+# Two notions of it would drift, and the whole class of bug here is a caller acting on a
+# weaker signal than the one it thinks it has.
+_PIE_WAIT_POLL_SECONDS = 0.5
+
+
+def _pie_wait_for_live(project: str | None, seconds: float) -> dict:
+    """Block until the play world is LIVE, bounded.
+
+    `IsInPIE` (a live play world), NOT `IsPIEInProgress` (live OR queued): this asks whether the
+    world EXISTS, and a queued-but-not-yet-created session is precisely what it must keep waiting
+    through. This is the one place the narrower verb is the right question.
+
+    It polls over RemoteControl and never through `uap exec`. Python remote-exec runs on the GAME
+    THREAD, and calling it repeatedly during a PIE transition re-enters the engine task graph and
+    HARD-CRASHES the editor (docs/known-issues.md #12). RC is a separate channel; polling it here
+    is what makes "do not tight-loop exec during a transition" survivable advice rather than a
+    reason to invent a waiting strategy of your own.
+    """
+    t0 = time.monotonic()
+    deadline = t0 + max(0.0, seconds)
+    playing = bool(_rc_call("IsInPIE", {}, project))
+    while not playing and time.monotonic() < deadline:
+        time.sleep(_PIE_WAIT_POLL_SECONDS)
+        playing = bool(_rc_call("IsInPIE", {}, project))
+    return {"playing": playing, "waited_seconds": round(time.monotonic() - t0, 2)}
+
+
+def _pie_start_timed_out(seconds: float) -> str:
+    return (
+        f"PIE was requested but the play world was not live {round(seconds, 1)}s later -- IsInPIE "
+        "still reads false, so nothing is playing yet. A start is QUEUED work, so it may still "
+        "come up AFTER this returns: the editor is NOT idle, NOT yours to hand over, and NOT safe "
+        "to end a turn on. Run `uap pie stop` (it cancels a queued start and confirms the "
+        "teardown), then retry -- or raise the bound with `--timeout <sec>` / "
+        "$UAP_PIE_START_TIMEOUT if this map is simply slow to load. A normal start is 1-5s."
+    )
+
+
 def _pie(args) -> int:
     """Start/stop PIE via the plugin's version-correct RC verbs, so agents never touch the raw,
     version-fragile engine subsystem.
 
-    `start` and `stop` are deliberately ASYMMETRIC, and that is not an oversight:
-      * `stop` blocks until teardown is confirmed. It is the handover point -- the lease, the next
-        agent and `report finish` all act on "the editor is free", so it must not ack a queue.
-      * `start` returns as soon as the session is QUEUED, because a caller may legitimately want to
-        do other work while PIE comes up (and because agents already rely on it returning at once).
-        It labels itself `queued: true, confirmed: false` and points at `uap pie wait <seconds>`,
-        which is the confirmation half. Nothing may treat a start ack as "the world exists".
+    `start` and `stop` are now the SAME shape: both block until the state they name is real, and
+    both fail loudly if it never arrives. `start` used to return the instant the session was
+    QUEUED, labelled `queued: true, confirmed: false, next: uap pie wait <seconds>`.
+
+    That default cost three incidents in one day (2026-08-28), the worst of which left a Project
+    Broken Wings aircraft flying unattended into a building. The mechanism was not that agents
+    missed the hint -- the hint shipped that morning and the incidents happened after it. It is
+    that the fields BESIDE the hint implied a SHAPE: `queued` implies a queue you come back to and
+    `confirmed: false` implies confirmation arriving on its own schedule, so an agent did the
+    correct thing for async work -- registered a watcher and ended its turn -- for an operation
+    that takes 1-5 SECONDS. The wrong behaviour followed logically from an accurate response.
+
+    So the async vocabulary is gone from the default path, not merely supplemented: a blocking
+    start answers `playing: true` + `waited_seconds`, exactly as `stop` answers `stopped: true` +
+    `waited_seconds`. `queued`/`confirmed` survive only where they are TRUE -- under `--no-wait`,
+    and on the timeout path, where a ticket really is outstanding.
+
+    `--no-wait` keeps fire-and-forget for a caller that genuinely wants to work while PIE comes
+    up. It is opt-in because the safe path has to be the DEFAULT path; a hint is not a default.
     """
     sub = args.pie_cmd
     t0 = time.monotonic()
@@ -850,27 +913,49 @@ def _pie(args) -> int:
         if sub == "start":
             body.update(_pie_start(getattr(args, "mode", "flat") or "flat", args.project))
             if body.get("ok"):
-                # An ack of QUEUED work, said out loud. See the docstring above.
-                body["queued"] = True
-                body["confirmed"] = False
-                body["next"] = "uap pie wait <seconds>   # blocks until the game world is live"
+                timeout = getattr(args, "timeout", None)
+                timeout = _pie_start_timeout() if timeout is None else timeout
+                if getattr(args, "no_wait", False):
+                    # Opt-in fire-and-forget: here the async vocabulary is the truth. It is
+                    # confined to this path on purpose -- see the docstring.
+                    body["queued"] = True
+                    body["confirmed"] = False
+                    body["next"] = "uap pie wait <seconds>   # blocks until the game world is live"
+                    body["warning"] = (
+                        "--no-wait: this is an ack of a QUEUED start, not a live world. PIE may "
+                        "come up AFTER this returns. Do not read game state, capture a frame, or "
+                        "END YOUR TURN on it -- run `uap pie wait <seconds>` first, and stop PIE "
+                        "(`uap pie stop`) before you finish."
+                    )
+                else:
+                    waited = _pie_wait_for_live(args.project, timeout)
+                    body["playing"] = waited["playing"]
+                    body["waited_seconds"] = waited["waited_seconds"]
+                    if not waited["playing"]:
+                        # A start we could not confirm IS still queued -- say so here, where it is
+                        # true, and never as a cheerful ok.
+                        body["ok"] = False
+                        body["queued"] = True
+                        body["confirmed"] = False
+                        body["error"] = _pie_start_timed_out(timeout)
         elif sub == "stop":
             timeout = getattr(args, "timeout", None)
             body.update(_pie_stop(args.project,
                                   _pie_stop_timeout() if timeout is None else timeout))
         elif sub == "wait":
-            # IsInPIE (live play world), NOT IsPIEInProgress: `wait` asks whether the world is
-            # LIVE, and a queued-but-not-yet-created session is precisely what it must keep
-            # waiting through. This is the one place the narrower verb is the right question.
-            deadline = time.monotonic() + args.seconds
-            playing = bool(_rc_call("IsInPIE", {}, args.project))
-            while not playing and time.monotonic() < deadline:
-                time.sleep(0.5)
-                playing = bool(_rc_call("IsInPIE", {}, args.project))
-            body["playing"] = playing
-            body["ok"] = playing
-            if not playing:
-                body["error"] = f"PIE not running after {args.seconds}s"
+            # The SAME implementation `pie start` blocks on -- see _pie_wait_for_live. `wait`
+            # remains for the `--no-wait` path and for waiting on a session someone else started.
+            waited = _pie_wait_for_live(args.project, args.seconds)
+            body.update(waited)
+            body["ok"] = waited["playing"]
+            if not waited["playing"]:
+                body["error"] = (
+                    f"PIE was not live {round(args.seconds, 1)}s after the wait began -- IsInPIE "
+                    "still reads false. The editor is NOT playing, and a queued start may still "
+                    "come up later, so do not read game state, capture a frame, or end your turn "
+                    "here. Run `uap pie stop` to clear any queued start, then `uap pie start`, "
+                    "which now waits for you. A normal start is 1-5s."
+                )
     except (AgentError, json.JSONDecodeError) as exc:
         body = _err(exc)
     _capture(f"pie:{sub}", {}, body, int((time.monotonic() - t0) * 1000))
@@ -1313,18 +1398,32 @@ REPORT (a verification is NOT done until `report finish` emits the HTML report; 
   -> attach proof: `uap screenshot <abs.png>` (auto-attaches), or `uap report screenshot <file>`
 
 PLAY-IN-EDITOR
-  uap pie start                   start PIE (version-correct; do NOT use PlayWorldEditorSubsystem)
+  uap pie start                   start PIE and BLOCK until the play world is live (default; a
+                                  normal start is 1-5s). Answers playing:true + waited_seconds,
+                                  the same shape `pie stop` answers with. On timeout (60s,
+                                  --timeout / $UAP_PIE_START_TIMEOUT) it FAILS and says the
+                                  session may still be queued -- never a cheerful ok.
+                                  (Version-correct; do NOT use PlayWorldEditorSubsystem.)
+  uap pie start --no-wait         fire-and-forget: return as soon as the session is QUEUED
+                                  (queued:true, confirmed:false). The world does NOT exist when it
+                                  returns -- follow with `pie wait` and never end a turn on it.
   uap pie start --mode vr         start VR PREVIEW instead -- the HMD code path (OpenXR input,
                                   IsHeadMountedDisplayEnabled branches). Flat PIE takes neither,
                                   so an HMD-only bug looks absent there. Needs a connected headset,
                                   and a plugin copy new enough to have StartPIEMode -- it REFUSES
-                                  on an older one rather than quietly giving you flat PIE.
-  uap pie wait <seconds>          block until the game world is live. REQUIRED after `pie start`:
-                                  start only QUEUES the session (it answers queued:true,
-                                  confirmed:false) -- the world does not exist yet when it returns.
+                                  on an older one rather than quietly giving you flat PIE. Waits
+                                  for the live world exactly like flat does.
+  uap pie wait <seconds>          block until the game world is live. Plain `pie start` now does
+                                  this for you; reach for `wait` after `--no-wait`, or to wait on
+                                  a session someone else started. Poll PIE through THIS, never a
+                                  tight `uap exec` loop -- exec runs on the game thread and
+                                  re-entering it during a PIE transition HARD-CRASHES the editor.
   uap pie stop [--timeout 30]     stop PIE and WAIT until the teardown is confirmed. ok:true means
                                   the world is gone; on timeout it FAILS and says the editor is
                                   not free. Never treat a stop as done without ok:true+stopped:true.
+  NEVER END A TURN WITH PIE RUNNING. Stop PIE and release your lease first -- `uap report finish`
+  does the stop for you unless you pass --keep-pie. A live PIE session nobody is driving is how a
+  PBW aircraft flew unattended into a building on 2026-08-28.
 
 MULTI-AGENT COORDINATION (several agents sharing one editor; see docs/agent-coordination.md)
   Rebuild ONLY via Restart-Editor.ps1 -- it self-locks; never bounce the editor by hand.
@@ -1373,6 +1472,15 @@ SUSTAINED INPUT (a single injected event CANNOT drive locomotion -- see below)
   input every frame INSIDE the engine, then releases. VR sticks are AXES, not buttons.
   Key names are exact FKeys from the engine's own registry (W, C, LeftControl, SpaceBar,
   Gamepad_LeftY, OculusTouch_Left_Thumbstick_Y). A refused hold presses NOTHING.
+  GAMEPAD BUTTONS (Gamepad_FaceButton_Bottom, Gamepad_LeftTrigger, DPad...): use
+  `input hold <GamepadKey>` -- it takes the VIEWPORT route and reaches Enhanced Input.
+  `rc InjectGamepad` routes BUTTONS through Slate BY DESIGN, because a face/DPad press is
+  also how UMG focus navigation is driven -- so a button injected that way reaches gameplay
+  input only while the PIE viewport holds Slate focus, and looks like a dead feature when it
+  does not. Sticks and keyboard keys are unaffected: both already take the viewport route.
+  Reaching for `rc InjectGamepad` to drive gameplay, failing, and concluding "uap cannot
+  reach Enhanced Input" has already cost another project several sessions -- it was the
+  wrong verb, not a missing capability.
 
 SAMPLING + LOGS (sub-second truth; a ~1s exec round-trip cannot see judder or a 0.6s wind-up)
   uap sample start <object> <property> --seconds N   per-frame series + delta stats
@@ -1595,6 +1703,17 @@ def build_parser() -> argparse.ArgumentParser:
                     help="'vr' uses the editor's VR Preview -- the HMD code path (OpenXR input, "
                          "IsHeadMountedDisplayEnabled branches) that flat PIE never takes. "
                          "Needs a connected headset; fails with a reason if there is none.")
+    ps.add_argument("--no-wait", action="store_true",
+                    help="return as soon as the session is QUEUED instead of waiting for the "
+                         "play world. Fire-and-forget: the world does not exist when it returns, "
+                         "so follow it with `uap pie wait <seconds>` before reading anything and "
+                         "NEVER end a turn on it. Only for a caller that genuinely has other work "
+                         "to do while PIE comes up.")
+    ps.add_argument("--timeout", type=float, default=None,
+                    help="max seconds to wait for the play world to be LIVE (default 60, "
+                         "$UAP_PIE_START_TIMEOUT). A normal start is 1-5s. On timeout the verb "
+                         "FAILS and says the session may still be queued, rather than acking a "
+                         "start that has not happened.")
     ps.set_defaults(func=_pie)
     pst = pie.add_parser("stop", parents=[proj])
     pst.add_argument("--timeout", type=float, default=None,
