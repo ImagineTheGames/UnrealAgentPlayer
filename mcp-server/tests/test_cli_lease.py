@@ -1,6 +1,19 @@
+import json
+
+import pytest
+
 from unreal_agent_player.cli import main
 from unreal_agent_player import cli as cli_mod
+from unreal_agent_player.errors import AgentError, ErrorCode
 import unreal_agent_player.coordination as co
+
+
+@pytest.fixture(autouse=True)
+def _no_live_editor(monkeypatch):
+    """`lease release` now asks the editor whether PIE is still live before it frees the lease.
+    Pin an unreachable RC port so the test suite can never touch a real editor on this machine
+    (and so the check fails fast into its documented fail-open path)."""
+    monkeypatch.setenv("UAP_RC_PORT", "1")
 
 
 def test_cli_lease_persists_across_calls(tmp_path, monkeypatch):
@@ -136,3 +149,87 @@ def test_abandoned_pie_lease_ages_out_and_unblocks_others(tmp_path, monkeypatch)
     monkeypatch.setattr(co, "_now", lambda: t0 + 601)
     assert main(["exec", "print(1)", "--project", "demo"]) == 0
     assert ran["n"] == 1
+
+
+# ---- release must not hand a LIVE PIE session to the next agent ----
+# A stop that lies is recoverable if the caller checks. A `lease release` that succeeds on that
+# lie is not: by then the next agent already holds the lease and is driving an editor still in
+# PIE, and nothing in the system will ever tell either of them.
+
+def _rc_table(monkeypatch, table):
+    seen = []
+
+    def fake(func, params, project=None):
+        seen.append(func)
+        if func not in table:
+            raise AgentError(ErrorCode.UE_UNREACHABLE,
+                             'Remote Control preset call returned 404: "Unable to resolve the '
+                             'preset field."', recoverable=False)
+        val = table[func]
+        return val() if callable(val) else val
+
+    monkeypatch.setattr(cli_mod, "_rc_call", fake)
+    return seen
+
+
+def test_release_refuses_while_pie_is_still_in_progress(tmp_path, monkeypatch, capsys):
+    monkeypatch.setenv("UAP_REPORTS_DIR", str(tmp_path))
+    monkeypatch.delenv("UAP_AGENT_ID", raising=False)
+    _rc_table(monkeypatch, {"IsPIEInProgress": True})
+    assert main(["lease", "acquire", "exclusive", "--reason", "pie", "--agent", "A",
+                 "--project", "demo", "--wait", "0"]) == 0
+    assert main(["lease", "release", "--agent", "A", "--project", "demo"]) == 1
+    body = json.loads(capsys.readouterr().out.strip().splitlines()[-1])
+    assert body["ok"] is False and body["pie_live"] is True
+    assert "uap pie stop" in body["error"]
+    # ...and the lease is genuinely still held, so nobody else can take it.
+    assert co._load("demo")["exclusive"]["agent"] == "A"
+
+
+def test_release_proceeds_once_pie_is_gone(tmp_path, monkeypatch):
+    monkeypatch.setenv("UAP_REPORTS_DIR", str(tmp_path))
+    monkeypatch.delenv("UAP_AGENT_ID", raising=False)
+    _rc_table(monkeypatch, {"IsPIEInProgress": False})
+    assert main(["lease", "acquire", "exclusive", "--agent", "A",
+                 "--project", "demo", "--wait", "0"]) == 0
+    assert main(["lease", "release", "--agent", "A", "--project", "demo"]) == 0
+    assert co._load("demo")["exclusive"] is None
+
+
+def test_release_falls_back_to_the_older_verb_on_a_behind_plugin(tmp_path, monkeypatch, capsys):
+    """A plugin copy without IsPIEInProgress still answers IsInPIE -- weaker, but a `true` there
+    is more than enough to refuse."""
+    monkeypatch.setenv("UAP_REPORTS_DIR", str(tmp_path))
+    monkeypatch.delenv("UAP_AGENT_ID", raising=False)
+    seen = _rc_table(monkeypatch, {"IsInPIE": True})     # IsPIEInProgress 404s
+    assert main(["lease", "acquire", "exclusive", "--agent", "A",
+                 "--project", "demo", "--wait", "0"]) == 0
+    assert main(["lease", "release", "--agent", "A", "--project", "demo"]) == 1
+    assert seen == ["IsPIEInProgress", "IsInPIE"]
+    assert json.loads(capsys.readouterr().out.strip().splitlines()[-1])["checked_with"] == "IsInPIE"
+
+
+def test_release_force_hands_over_a_live_session_deliberately(tmp_path, monkeypatch):
+    monkeypatch.setenv("UAP_REPORTS_DIR", str(tmp_path))
+    monkeypatch.delenv("UAP_AGENT_ID", raising=False)
+    seen = _rc_table(monkeypatch, {"IsPIEInProgress": True})
+    assert main(["lease", "acquire", "exclusive", "--agent", "A",
+                 "--project", "demo", "--wait", "0"]) == 0
+    assert main(["lease", "release", "--agent", "A", "--project", "demo", "--force"]) == 0
+    assert co._load("demo")["exclusive"] is None
+    assert seen == [], "--force must not even ask the editor"
+
+
+def test_release_is_fail_open_when_the_editor_cannot_be_reached(tmp_path, monkeypatch):
+    """A dead editor has no PIE session. An unreachable RC must never wedge the lease."""
+    monkeypatch.setenv("UAP_REPORTS_DIR", str(tmp_path))
+    monkeypatch.delenv("UAP_AGENT_ID", raising=False)
+
+    def dead(func, params, project=None):
+        raise AgentError(ErrorCode.UE_UNREACHABLE, "Could not reach Remote Control at :30010")
+
+    monkeypatch.setattr(cli_mod, "_rc_call", dead)
+    assert main(["lease", "acquire", "exclusive", "--agent", "A",
+                 "--project", "demo", "--wait", "0"]) == 0
+    assert main(["lease", "release", "--agent", "A", "--project", "demo"]) == 0
+    assert co._load("demo")["exclusive"] is None

@@ -81,3 +81,33 @@ def test_docs_no_stale_slate_input_claim():
         text = (REPO / rel).read_text(encoding="utf-8")
         assert "ProcessKeyDownEvent" not in text, rel
         assert "in-process via Slate" not in text, rel
+
+
+def test_layer_mismatch_section_is_titled_for_five_and_says_the_headline_once():
+    """Three of the five traps are one risk -- input you injected silently never arriving. The
+    PBW director asked for that stated plainly and prominently rather than inferred across five
+    entries, because it is the single biggest way this tooling produces a confident wrong answer.
+    Pinned so a later edit cannot quietly drop it (or leave the title saying four)."""
+    text = _read("agentplayertest.md")
+    assert "## Layer mismatches -- five traps" in text
+    assert "four traps" not in text
+    assert "Three of these five are the same headline risk" in text
+    assert "input you injected silently never arrives" in text
+
+
+def test_the_fifth_trap_is_its_own_mechanism_not_a_footnote_of_the_second():
+    """#2 is the wrong LAYER, #5 is the right layer with the wrong USER. Conflating them costs
+    the fix, so the entry must carry the engine citation and the distinction."""
+    text = _read("agentplayertest.md")
+    assert "### 5. Injected input aimed at the WRONG SLATE USER" in text
+    assert "AnalogCursor.cpp:192" in text
+    assert "Distinct from #2" in text
+    assert "--user" in text
+
+
+def test_agents_snippet_carries_the_fifth_trap_and_the_headline():
+    text = _read("AGENTS-snippet.md")
+    assert "Five tooling traps" in text
+    assert "THREE OF THE FIVE ARE THE SAME HEADLINE" in text
+    assert "WRONG SLATE USER" in text
+    assert "AnalogCursor.cpp:192" in text

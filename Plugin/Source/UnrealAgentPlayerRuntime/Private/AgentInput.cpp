@@ -3,6 +3,7 @@
 #include "UnrealAgentPlayerRuntimeModule.h"
 #include "AgentWorld.h"
 #include "Framework/Application/SlateApplication.h"
+#include "Framework/Application/SlateUser.h"
 #include "GenericPlatform/GenericApplication.h"
 #include "Engine/GameViewportClient.h"
 #include "Engine/World.h"
@@ -22,6 +23,144 @@ TSharedPtr<SWidget> FAgentInput::FindPIEViewportWidget()
 {
     UGameViewportClient* GV = FAgentWorld::GetActiveGameViewport();
     return GV ? GV->GetGameViewportWidget() : nullptr;
+}
+
+namespace
+{
+    /**
+     * The refusal for "this event would be stamped with a Slate user index nothing is listening
+     * on". Three parts, per the house rule in agent-testing/agentplayertest.md ("Adding a verb?
+     * What a good failure message contains"): name the mismatch, say why the plausible substitute
+     * is wrong, give the exact remedy.
+     *
+     * It exists because the alternative -- what this tool did before -- is a SILENT discard.
+     * Slate throws the event away before any handler runs and the call still reports success, so
+     * it reads as a broken feature: a stick drive against a Slate analog cursor produced
+     * pixel-identical before/after screenshots and an unchanged GetMousePosition(), and nearly
+     * became a bug filed against a fix that was working.
+     */
+    FString UAPUserIndexRefusal(int32 Requested)
+    {
+        return FString::Printf(
+            TEXT("Slate has no registered user %d, so an event stamped with that index is ")
+            TEXT("DISCARDED before any handler runs -- FAnalogCursor::IsRelevantInput() is ")
+            TEXT("GetOwnerUserIndex() == InputEvent.GetUserIndex() (engine AnalogCursor.cpp:192), ")
+            TEXT("and every Slate handler that filters by user does the same. Registered Slate ")
+            TEXT("users right now: %s. Do NOT just drop the user index and retry: with no index ")
+            TEXT("this call takes the game-viewport route, which never enters the Slate ")
+            TEXT("pre-processor chain at all, so an analog/virtual cursor still sees nothing and ")
+            TEXT("the call still reports ok. Re-run with --user <N> using an index from that list ")
+            TEXT("-- the one that OWNS the pre-processor you are driving (for a single local ")
+            TEXT("player that is 0)."),
+            Requested, *FAgentInput::DescribeSlateUsers());
+    }
+}
+
+FString FAgentInput::DescribeSlateUsers()
+{
+    if (!FSlateApplication::IsInitialized()) { return TEXT("(Slate is not initialised)"); }
+
+    TArray<FString> Parts;
+    FSlateApplication::Get().ForEachUser([&Parts](FSlateUser& User)
+    {
+        FString Focus = TEXT("no focus");
+        if (TSharedPtr<SWidget> Focused = User.GetFocusedWidget())
+        {
+            Focus = FString::Printf(TEXT("focus: %s"), *Focused->GetType().ToString());
+        }
+        Parts.Add(FString::Printf(TEXT("%d (%s)"), User.GetUserIndex(), *Focus));
+    }, /*bIncludeVirtualUsers*/ false);
+
+    return Parts.Num() > 0 ? FString::Join(Parts, TEXT(", ")) : TEXT("(none)");
+}
+
+bool FAgentInput::ResolveSlateUserParam(const FString& SlateUser, int32& OutResolved,
+                                        FString& OutError)
+{
+    OutResolved = INDEX_NONE;
+    if (SlateUser.IsEmpty()) { return true; }   // omitted == auto; see the header note
+
+    if (!SlateUser.IsNumeric())
+    {
+        OutError = FString::Printf(
+            TEXT("SlateUser must be a Slate user INDEX (e.g. \"0\") or empty for automatic ")
+            TEXT("resolution; got '%s'. It is not a player name, a controller id or a pawn -- ")
+            TEXT("it is the index Slate stamps on input events and that handlers filter on ")
+            TEXT("(FAnalogCursor::IsRelevantInput, engine AnalogCursor.cpp:192). Registered ")
+            TEXT("Slate users right now: %s."), *SlateUser, *DescribeSlateUsers());
+        return false;
+    }
+
+    const int32 Requested = FCString::Atoi(*SlateUser);
+    OutResolved = ResolveSlateUserIndex(Requested, OutError);
+    return OutResolved != INDEX_NONE;
+}
+
+int32 FAgentInput::ResolveSlateUserIndex(int32 RequestedIndex, FString& OutError)
+{
+    if (!FSlateApplication::IsInitialized())
+    {
+        OutError = TEXT("Slate is not initialised in this process, so there is no Slate user to "
+                        "stamp and no pre-processor chain to reach. A user index only exists on "
+                        "the Slate layer -- the game-viewport route cannot carry one, so there is "
+                        "no substitute here. Run this against a live editor / PIE session "
+                        "(uap pie start), not a headless commandlet.");
+        return INDEX_NONE;
+    }
+    FSlateApplication& App = FSlateApplication::Get();
+
+    if (RequestedIndex != INDEX_NONE)
+    {
+        // An index Slate has no user for cannot receive anything. Returning it anyway is
+        // exactly the silent discard this function exists to stop, so refuse instead.
+        if (RequestedIndex < 0 || !App.GetUser(RequestedIndex).IsValid())
+        {
+            OutError = UAPUserIndexRefusal(RequestedIndex);
+            return INDEX_NONE;
+        }
+        return RequestedIndex;
+    }
+
+    // Auto. First choice: the user whose FOCUS PATH contains the game viewport widget. That is
+    // the user whose input the game is actually routing, and it is the only one of the three
+    // that stays right under splitscreen / a second Slate user.
+    int32 Resolved = INDEX_NONE;
+    if (TSharedPtr<SWidget> Viewport = FindPIEViewportWidget())
+    {
+        TSharedPtr<const SWidget> ViewportConst = Viewport;
+        App.ForEachUser([&Resolved, &ViewportConst](FSlateUser& User)
+        {
+            if (Resolved == INDEX_NONE && User.IsWidgetInFocusPath(ViewportConst))
+            {
+                Resolved = User.GetUserIndex();
+            }
+        }, /*bIncludeVirtualUsers*/ false);
+    }
+
+    // Then the keyboard user (what UUAPAgentSubsystem::NavigateUI already uses), then whatever
+    // user index 0 is -- Slate's cursor user, guaranteed to exist while Slate is up. Every step
+    // is VALIDATED against GetUser() so a fallback can never hand back an index nothing owns.
+    if (Resolved == INDEX_NONE)
+    {
+        const int32 Keyboard = App.GetUserIndexForKeyboard();
+        if (Keyboard >= 0 && App.GetUser(Keyboard).IsValid()) { Resolved = Keyboard; }
+    }
+    if (Resolved == INDEX_NONE && App.GetUser((int32)0).IsValid())
+    {
+        Resolved = 0;   // FSlateApplication::CursorUserIndex
+    }
+
+    if (Resolved == INDEX_NONE)
+    {
+        OutError = FString::Printf(
+            TEXT("Slate is up but has NO registered users, so every Slate-layer event is ")
+            TEXT("discarded whatever index it carries -- there is no index that works. Do not ")
+            TEXT("retry on the viewport route instead: it cannot reach a Slate pre-processor at ")
+            TEXT("all, so it would report ok and change nothing. Start a play session first ")
+            TEXT("(uap pie start) and re-run. Registered Slate users: %s."),
+            *DescribeSlateUsers());
+    }
+    return Resolved;
 }
 
 FKey FAgentInput::MouseButtonToKey(EAgentMouseButton Btn)
@@ -142,21 +281,58 @@ bool FAgentInput::InjectAxisKey(FKey Key, float Value)
     return true;
 }
 
+bool FAgentInput::InjectAxisSlate(FKey Key, float Value, int32 UserIndex)
+{
+    // The OTHER analog route: into FSlateApplication, where the input pre-processor chain runs.
+    // This is the only route an FAnalogCursor / virtual cursor can see -- the viewport route
+    // above enters BELOW the pre-processors. Stamping the wrong user here is not a soft failure:
+    // the event is dropped before the pre-processor is asked, so resolve or refuse.
+    FString UserError;
+    const int32 User = ResolveSlateUserIndex(UserIndex, UserError);
+    if (User == INDEX_NONE)
+    {
+        UE_LOG(LogUAPRuntime, Error, TEXT("InjectAxis (Slate route, %s): %s"),
+               *Key.ToString(), *UserError);
+        return false;
+    }
 
-bool FAgentInput::InjectMouseMove(FVector2D Delta, bool bAbsolute)
+    FSlateApplication& App = FSlateApplication::Get();
+    FAnalogInputEvent Evt(Key, App.GetModifierKeys(), (uint32)User, /*bIsRepeat*/ false, 0, 0, Value);
+    // Discarding "handled" for the same reason InjectKey does: a pre-processor that returns
+    // false has still SEEN the event and let it fall through. What the caller needs is whether
+    // it was delivered to the right user, and by here it was.
+    App.ProcessAnalogInputEvent(Evt);
+    return true;
+}
+
+
+bool FAgentInput::InjectMouseMove(FVector2D Delta, bool bAbsolute, int32 UserIndex)
 {
     TSharedPtr<SWidget> Target = FindPIEViewportWidget();
     if (!Target.IsValid()) { return false; }
+
+    FString UserError;
+    const int32 User = ResolveSlateUserIndex(UserIndex, UserError);
+    if (User == INDEX_NONE)
+    {
+        UE_LOG(LogUAPRuntime, Error, TEXT("InjectMouseMove: %s"), *UserError);
+        return false;
+    }
     FSlateApplication& App = FSlateApplication::Get();
 
     FVector2D CursorPos = App.GetCursorPos();
     FVector2D NewPos = bAbsolute ? Delta : CursorPos + Delta;
 
+    // The 7-arg FPointerEvent ctor hardcodes the user index to 0 in the ENGINE
+    // (FInputEvent(InModifierKeys, 0, false) -- SlateCore Events.h:730), so "not passing a
+    // user" was never neutral: it silently meant user 0. The 8-arg overload takes one.
+    const TSet<FKey> NoButtons;   // named: FPointerEvent keeps a pointer to this (see below)
     FPointerEvent Evt(
-        /*PointerIndex*/ 0,
+        /*UserIndex*/ (uint32)User,
+        /*PointerIndex*/ 0u,
         /*ScreenSpacePosition*/ NewPos,
         /*LastScreenSpacePosition*/ CursorPos,
-        /*PressedButtons*/ TSet<FKey>(),
+        /*PressedButtons*/ NoButtons,
         /*EffectingButton*/ EKeys::Invalid,
         /*WheelDelta*/ 0.f,
         /*ModifierKeys*/ App.GetModifierKeys()
@@ -165,48 +341,76 @@ bool FAgentInput::InjectMouseMove(FVector2D Delta, bool bAbsolute)
     return App.ProcessMouseMoveEvent(Evt);
 }
 
-bool FAgentInput::InjectMouseButton(EAgentMouseButton Btn, bool bPressed)
+bool FAgentInput::InjectMouseButton(EAgentMouseButton Btn, bool bPressed, int32 UserIndex)
 {
     FKey Key = MouseButtonToKey(Btn);
     if (!Key.IsValid()) { return false; }
+
+    FString UserError;
+    const int32 User = ResolveSlateUserIndex(UserIndex, UserError);
+    if (User == INDEX_NONE)
+    {
+        UE_LOG(LogUAPRuntime, Error, TEXT("InjectMouseButton: %s"), *UserError);
+        return false;
+    }
     FSlateApplication& App = FSlateApplication::Get();
     FVector2D CursorPos = App.GetCursorPos();
 
+    // Named, not a temporary: FPointerEvent stores a POINTER to this set
+    // (PressedButtons(&InPressedButtons) -- SlateCore Events.h), so a temporary would dangle
+    // by the time the event is processed on the next line.
+    const TSet<FKey> Pressed{Key};
     FPointerEvent Evt(
-        0, CursorPos, CursorPos, TSet<FKey>{Key}, Key, 0.f, App.GetModifierKeys()
+        (uint32)User, /*PointerIndex*/ 0u, CursorPos, CursorPos,
+        Pressed, Key, 0.f, App.GetModifierKeys()
     );
     if (bPressed) { return App.ProcessMouseButtonDownEvent(nullptr, Evt); }
     return App.ProcessMouseButtonUpEvent(Evt);
 }
 
-bool FAgentInput::InjectAxis(FName AxisName, float Value)
+bool FAgentInput::InjectAxis(FName AxisName, float Value, int32 UserIndex)
 {
-    // UE 5.6 removed APlayerController::InputAxis. Route the sample through the game
-    // viewport (InjectAxisKey); fall back to the Slate analog path only when there is no
-    // game viewport at all (e.g. driving editor-only widgets).
+    // UE 5.6 removed APlayerController::InputAxis, so there are two routes and they reach
+    // DIFFERENT layers -- see InjectAxisKey (game viewport, below Slate) and InjectAxisSlate
+    // (into the pre-processor chain).
     FKey Key(AxisName);
     if (!Key.IsValid()) { return false; }
+
+    if (UserIndex != INDEX_NONE)
+    {
+        // An explicit user is an explicit LAYER: only the Slate route carries a user index.
+        // Deliberately NOT falling through to the viewport route on failure -- that route
+        // cannot reach the handler the caller named, so "succeeding" there would be a silent
+        // wrong answer wearing a success.
+        return InjectAxisSlate(Key, Value, UserIndex);
+    }
     if (InjectAxisKey(Key, Value)) { return true; }
-    FSlateApplication& App = FSlateApplication::Get();
-    FAnalogInputEvent Evt(Key, App.GetModifierKeys(), 0, false, 0, 0, Value);
-    return App.ProcessAnalogInputEvent(Evt);
+    return InjectAxisSlate(Key, Value, INDEX_NONE);
 }
 
-bool FAgentInput::InjectGamepad(EAgentGamepadButton Btn, bool bPressed, float AnalogValue)
+bool FAgentInput::InjectGamepad(EAgentGamepadButton Btn, bool bPressed, float AnalogValue,
+                                int32 UserIndex)
 {
     FKey Key = GamepadButtonToKey(Btn);
     if (!Key.IsValid()) { return false; }
 
     if (Btn >= EAgentGamepadButton::LeftStickX && Btn <= EAgentGamepadButton::RightStickY)
     {
-        // Sticks are analog: go through the viewport path (see InjectAxisKey).
-        return InjectAxis(Key.GetFName(), AnalogValue);
+        // Sticks are analog: see InjectAxis for which route each UserIndex selects.
+        return InjectAxis(Key.GetFName(), AnalogValue, UserIndex);
     }
     // Buttons stay on the Slate path deliberately: a gamepad face/DPad press is also how UMG
     // focus navigation is driven, and Slate is where that is handled. Use `uap input hold` /
     // InjectKey for a gamepad button that must reach gameplay input directly.
+    FString UserError;
+    const int32 User = ResolveSlateUserIndex(UserIndex, UserError);
+    if (User == INDEX_NONE)
+    {
+        UE_LOG(LogUAPRuntime, Error, TEXT("InjectGamepad (%s): %s"), *Key.ToString(), *UserError);
+        return false;
+    }
     FSlateApplication& App = FSlateApplication::Get();
-    FKeyEvent Evt(Key, App.GetModifierKeys(), 0, false, 0, 0);
+    FKeyEvent Evt(Key, App.GetModifierKeys(), (uint32)User, false, 0, 0);
     if (bPressed) { return App.ProcessKeyDownEvent(Evt); }
     return App.ProcessKeyUpEvent(Evt);
 }
@@ -223,14 +427,31 @@ namespace
         float  Value = 0.f;
         double EndRealTime = 0.0;
         bool   bStarted = false;   // digital: IE_Pressed sent once, then IE_Repeat
+        // Which ROUTE to re-assert on, and as whom. INDEX_NONE = game viewport (below Slate);
+        // >= 0 = the Slate route stamped for that user, the only one a pre-processor sees.
+        // Held on the entry so the release at the end goes back out the SAME way it went in:
+        // recentring an analog axis on the other route leaves the first one latched.
+        int32  SlateUserIndex = INDEX_NONE;
     };
 
     TArray<FUAPHeldInput> GHeldInputs;
     FTSTicker::FDelegateHandle GHoldTicker;
 
+    void UAPHoldInject(const FUAPHeldInput& H, float Value)
+    {
+        if (H.SlateUserIndex != INDEX_NONE)
+        {
+            FAgentInput::InjectAxisSlate(H.Key, Value, H.SlateUserIndex);
+        }
+        else
+        {
+            FAgentInput::InjectAxisKey(H.Key, Value);
+        }
+    }
+
     void UAPReleaseOne(const FUAPHeldInput& H)
     {
-        if (H.bAnalog) { FAgentInput::InjectAxisKey(H.Key, 0.f); }
+        if (H.bAnalog) { UAPHoldInject(H, 0.f); }
         else if (H.bStarted) { FAgentInput::InjectKey(H.Key, /*bPressed*/ false, /*bRepeat*/ false); }
     }
 
@@ -255,7 +476,7 @@ namespace
             }
             if (H.bAnalog)
             {
-                FAgentInput::InjectAxisKey(H.Key, H.Value);
+                UAPHoldInject(H, H.Value);
             }
             else
             {
@@ -369,6 +590,7 @@ bool FAgentInput::HoldKey(FKey Key, float Seconds)
     H.bAnalog = false;
     H.Value = 1.f;
     H.bStarted = true;
+    H.SlateUserIndex = INDEX_NONE;   // digital keys go out the viewport route only
     H.EndRealTime = FPlatformTime::Seconds() + Seconds;
     UAPEnsureHoldTicker();
 
@@ -382,7 +604,7 @@ bool FAgentInput::HoldKey(FKey Key, float Seconds)
     return true;
 }
 
-bool FAgentInput::HoldAxis(FKey Key, float Value, float Seconds)
+bool FAgentInput::HoldAxis(FKey Key, float Value, float Seconds, int32 SlateUserIndex)
 {
     if (!Key.IsValid() || Seconds <= 0.f || !HasLiveViewport()) { return false; }
 
@@ -390,10 +612,14 @@ bool FAgentInput::HoldAxis(FKey Key, float Value, float Seconds)
     H.bAnalog = true;
     H.Value = Value;
     H.bStarted = true;
+    H.SlateUserIndex = SlateUserIndex;
     H.EndRealTime = FPlatformTime::Seconds() + Seconds;
     UAPEnsureHoldTicker();
 
-    if (!InjectAxisKey(Key, Value))
+    const bool bInjected = (SlateUserIndex != INDEX_NONE)
+        ? InjectAxisSlate(Key, Value, SlateUserIndex)
+        : InjectAxisKey(Key, Value);
+    if (!bInjected)
     {
         ReleaseHeld(Key);
         return false;
@@ -418,10 +644,12 @@ FString FAgentInput::HoldKeyJson(const FString& KeyName, float Seconds)
     O->SetStringField(TEXT("key"), Key.ToString());
     O->SetNumberField(TEXT("seconds"), Seconds);
     O->SetBoolField(TEXT("pressed"), true);
+    O->SetStringField(TEXT("route"), TEXT("viewport"));
     return UAPJson(O);
 }
 
-FString FAgentInput::HoldAxisJson(const FString& AxisKeyName, float Value, float Seconds)
+FString FAgentInput::HoldAxisJson(const FString& AxisKeyName, float Value, float Seconds,
+                                  const FString& SlateUser)
 {
     FKey Key;
     FString Error;
@@ -433,7 +661,20 @@ FString FAgentInput::HoldAxisJson(const FString& AxisKeyName, float Value, float
             TEXT("keys look like Gamepad_LeftY or OculusTouch_Left_Thumbstick_Y."), *AxisKeyName));
     }
 
-    if (!HoldAxis(Key, Value, Seconds))
+    // Resolve the Slate user BEFORE anything is injected, like every other refusal reason here:
+    // a refused call must have zero side effects. This is also the one refusal that would
+    // otherwise not exist at all -- Slate discards a mis-stamped event in silence, so without
+    // this check the caller gets ok:true and no movement, which reads as a broken feature.
+    int32 SlateUserIdx = INDEX_NONE;
+    {
+        FString UserError;
+        if (!ResolveSlateUserParam(SlateUser, SlateUserIdx, UserError))
+        {
+            return UAPRefuse(AxisKeyName, UserError);
+        }
+    }
+
+    if (!HoldAxis(Key, Value, Seconds, SlateUserIdx))
     {
         return UAPRefuse(AxisKeyName, TEXT("the game viewport rejected the axis sample (input "
                                            "became unavailable between validation and injection)"));
@@ -445,6 +686,11 @@ FString FAgentInput::HoldAxisJson(const FString& AxisKeyName, float Value, float
     O->SetNumberField(TEXT("value"), Value);
     O->SetNumberField(TEXT("seconds"), Seconds);
     O->SetBoolField(TEXT("pressed"), true);
+    // Which LAYER this hold is actually driving. Reported always, not only on request: the
+    // difference between these two is invisible from outside and is what made the original
+    // defect look like a product bug.
+    O->SetStringField(TEXT("route"), SlateUserIdx != INDEX_NONE ? TEXT("slate") : TEXT("viewport"));
+    if (SlateUserIdx != INDEX_NONE) { O->SetNumberField(TEXT("user_index"), SlateUserIdx); }
     return UAPJson(O);
 }
 
@@ -531,6 +777,7 @@ void FAgentInput::GetHeld(TArray<FAgentHeldInputInfo>& Out)
         Info.bAnalog = H.bAnalog;
         Info.Value = H.Value;
         Info.RemainingSeconds = (float)FMath::Max(0.0, H.EndRealTime - Now);
+        Info.SlateUserIndex = H.SlateUserIndex;
         Out.Add(Info);
     }
 }
@@ -549,6 +796,15 @@ FString FAgentInput::GetHeldJson()
         O->SetBoolField(TEXT("analog"), H.bAnalog);
         O->SetNumberField(TEXT("value"), H.Value);
         O->SetNumberField(TEXT("remaining_seconds"), H.RemainingSeconds);
+        // Which layer this hold is being re-asserted on. A Slate pre-processor (analog or
+        // virtual cursor) only ever sees route "slate"; "viewport" reaching nothing is the
+        // shape of the original silent defect, and this is how you see it without guessing.
+        O->SetStringField(TEXT("route"),
+                          H.SlateUserIndex != INDEX_NONE ? TEXT("slate") : TEXT("viewport"));
+        if (H.SlateUserIndex != INDEX_NONE)
+        {
+            O->SetNumberField(TEXT("user_index"), H.SlateUserIndex);
+        }
         // Engine ground truth alongside the registry's view: if these ever disagree, the
         // registry has lost track of a key and `input release` (no key) is the recovery.
         O->SetBoolField(TEXT("down"), FAgentInput::IsKeyDown(FKey(*H.Key)));

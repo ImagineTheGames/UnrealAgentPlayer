@@ -61,15 +61,21 @@ async def report_finish(*, rc: Any = None, py_exec: Any = None,
 
     # Clean up the editor: a finished test must not leave PIE running forever. Stop PIE if it
     # is still live (best-effort; a failure here must never block rendering the report).
+    # `pie_stopped` is a claim the next agent acts on, so it means the teardown was OBSERVED --
+    # this used to set it from the stop request alone, which could report a stop that never
+    # happened (known-issues #25).
     pie_stopped = False
+    pie_stop_error = None
     if rc is not None and py_exec is not None:
         try:
             from unreal_agent_player.tools import pie as _pie
             st = await _pie.pie_status(rc=rc, py_exec=py_exec)
             if st.get("phase") not in (None, "NotPlaying"):
-                await _pie.pie_stop(rc=rc, py_exec=py_exec)
-                s.add_note("PIE auto-stopped on report finish.")
-                pie_stopped = True
+                res = await _pie.pie_stop(rc=rc, py_exec=py_exec)
+                pie_stopped = bool(res.get("stopped"))
+                pie_stop_error = None if pie_stopped else res.get("error")
+                s.add_note("PIE auto-stopped on report finish (teardown confirmed)." if pie_stopped
+                           else f"PIE stop NOT confirmed on report finish: {pie_stop_error}")
         except Exception:
             pass  # editor gone / RC unreachable -- still render the report
 
@@ -83,5 +89,8 @@ async def report_finish(*, rc: Any = None, py_exec: Any = None,
         return ok_response({"run_dir": str(s.run_dir), "html": None,
                             "warning": f"render/open failed: {exc}"})
     sess.clear_active()
-    return ok_response({"run_dir": str(s.run_dir), "html": str(html_path), "opened": opened,
-                        "pie_stopped": pie_stopped})
+    out = {"run_dir": str(s.run_dir), "html": str(html_path), "opened": opened,
+           "pie_stopped": pie_stopped}
+    if pie_stop_error:
+        out["pie_stop_error"] = pie_stop_error
+    return ok_response(out)

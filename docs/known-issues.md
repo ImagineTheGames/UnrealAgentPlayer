@@ -513,31 +513,211 @@ Fixed, and this is the rule for anyone adding a plugin verb:
 
 Guarded verbs -- everything added after the initial plugin release: `StartPIEMode`, `HoldKey`,
 `HoldAxis`, `ReleaseHeldInput`, `GetHeldInput`, `StartPropertySample`, `ReadPropertySample`,
-`ListTestHelpersJson`, `DumpViewportUI`, `SelectTab`, `NavigateUI`, `CaptureViewportWithUI`.
+`ListTestHelpersJson`, `DumpViewportUI`, `SelectTab`, `NavigateUI`, `CaptureViewportWithUI`,
+`StopPIEEx`, `IsPIEInProgress`.
 
 CLI-only -- live on pull, no plugin rebuild needed. What a behind project still needs the rebuild
 for is unchanged: `pie start --mode vr`, `input hold/axis/release/status`, `sample`, and helper
 names (`helpers` / `rc ListTestHelpers`). Flat `pie start`, `log`, `read-ui`, `click`, `tab`, `nav`
 and `screenshot` keep working against an older copy.
 
-## 24. Three tooling traps that silently produce a WRONG answer -- GUIDANCE
+## 24. Five tooling traps that silently produce a WRONG answer -- GUIDANCE
 
-Found the hard way on 2026-08-28 by two sessions on two different projects. Each one produced a
+Found the hard way on 2026-08-28 by sessions on three different projects. Each one produced a
 false conclusion before it was caught. They are **not flaky tools -- they are layer mismatches**:
-the test operates at a different layer than the thing being tested (below Slate, outside the
-focused window, outside the game window). All three fail silently and look like product bugs.
+the test operates at a different layer than the thing being tested (below Slate, aimed at the
+wrong Slate user, outside the focused window, outside the game window, before the work has
+happened). All five fail silently and look like product bugs.
 
-1. An unfocused editor throttles to exactly 3.0 fps, voiding every timing measurement.
-2. `InjectKey` never reaches Slate input pre-processors or focus handlers.
+**Three of the five are one risk: input you injected silently never arrives.** That is the
+headline risk of this tooling, and the kit docs now say it once at the top of the section rather
+than leaving it to be inferred across five entries.
+
+1. An unfocused editor throttles to exactly 3.0 fps, voiding every timing measurement -- and it
+   is the same condition under which anything routed by Slate focus goes nowhere.
+2. `InjectKey` never reaches Slate input pre-processors or focus handlers -- WRONG LAYER.
 3. `uap screenshot` captures only the editor viewport, not a separate Standalone window.
+4. An operation that acks a QUEUED request rather than a completed one -- the async-boundary
+   version of the same mismatch, and the one you are most likely to hit in your own code. The
+   tell: **a call that returns success faster than the work could plausibly have finished acked a
+   queue, not a result.** Worked example: #25 above, `uap pie stop`.
+5. Injected input stamped for the WRONG SLATE USER -- right layer, discarded anyway. Distinct
+   mechanism from 2, same silent shape. Worked example: #26 below.
 
-State queries are unaffected by all three. Full write-up, with the failure mode and the
+State queries are unaffected by 1, 2, 3 and 5. Full write-up, with the failure mode and the
 do-instead for each, is in the kit docs that ship INTO each project:
 `agent-testing/agentplayertest.md` ("Layer mismatches") and `agent-testing/AGENTS-snippet.md`.
 
+## 25. `uap pie stop` reported success while PIE kept running -- FIXED
+
+Found live on Project Broken Wings, 2026-08-28 (ClickUp 86ak7k8a8). `uap pie stop` answered
+`{"ok": true, "result": true}` almost immediately -- **and PIE was still running**. Confirmed by
+the OS window title on the editor's own PID (`ProjectBrokenWings Preview [NetMode: Standalone 0]`
+after the "successful" stop), not by inference; a SECOND `pie stop` genuinely tore it down, after
+which the title reverted and the log showed `Shutting down PIE online subsystems`.
+
+**Root cause is an async boundary in the engine, and it is exact.** A PIE start is QUEUED work:
+`GEditor->RequestPlaySession()` only sets `PlaySessionRequest`, and the editor tick creates the
+play world one or more frames later (`StartQueuedPlaySessionRequest`). The stop is the mirror
+image, with a gate:
+
+```cpp
+// UEditorEngine::RequestEndPlayMap  (PlayLevel.cpp)
+if (PlayWorld) { bRequestEndPlayMapQueued = true; }        // <- no PlayWorld: does NOTHING
+// UEditorEngine::Tick               (EditorEngine.cpp)
+const bool bEndPlayMapThisFrame = PlayWorld && bRequestEndPlayMapQueued;
+```
+
+So a stop that lands between "start queued" and "play world created" is a complete no-op, and the
+queued start then brings PIE up AFTER the stop reported success. The editor log showed `Creating
+play world package` ~4 seconds after the stop call. `StopPIE()` returned `true` regardless -- it
+was reporting that the REQUEST was made, never that PIE had ended.
+
+Worse than it looks: an `ok:true` from a stop that did not stop is a **silent false signal**, and
+the lease system is built on it. An agent that trusts the stop releases its lease and moves on
+believing the editor is free, while a live PIE session is still running; the next agent takes the
+lease and drives an editor mid-session. Nothing ever tells either of them.
+
+Fixed in two halves. Neither is sufficient alone -- the first without the second still returns
+before teardown finishes; the second without the first can only observe the race, not prevent it:
+
+1. **Serialise (plugin).** `StopPIEEx()` cancels a QUEUED play-session request
+   (`GEditor->CancelRequestPlaySession()`) before asking for end-play, so the stop consumes the
+   pending start instead of racing it. It returns
+   `{"ok","was_playing","cancelled_queued_start","in_progress"}`. `StopPIE()` (bool) now runs the
+   same code. It deliberately does NOT wait in-engine: teardown happens on the editor tick, so
+   blocking there would block the very tick that performs it.
+2. **Confirm (CLI).** `uap pie stop` polls the new `IsPIEInProgress()` -- live **or** queued,
+   `UEditorEngine::IsPlaySessionInProgress()` -- until it reads false, then returns
+   `{"ok":true,"stopped":true,"waited_seconds":N}`. On timeout (default 30s, `--timeout` /
+   ``) it returns `ok:false` saying the editor is NOT free -- never a bare ack
+   of the queued RC call.
+
+`IsInPIE()` is NOT sufficient to confirm a stop: it wraps `IsPlayingSessionInEditor()`, which is
+false while a start is queued -- exactly the window the bug lives in. Against an older plugin copy
+the CLI falls back to `StopPIE` + `IsInPIE` (same question, weaker guarantee) and labels the result
+`degraded` with a settle window instead of pretending the check is exact.
+
+The MCP-server twin (`tools/pie.py`) had the same shape twice over and was fixed the same way: it
+called `LevelEditorSubsystem.editor_request_end_play()` directly -- the raw call that no-ops when
+there is no play world -- and then reported the phase read taken immediately afterwards. It now
+goes through the plugin's `stop_pie()` (so it gets the queued-start cancel) and polls `GetPIEPhase`
+until `NotPlaying`, and its `pie_start` labels itself `queued/confirmed` like the CLI's.
+
+Three callers changed with it:
+
+- **`uap report finish`** was `IsInPIE -> StopPIE -> pie_stopped = True` -- it reported a stop it
+  never verified. It now uses the confirmed stop; `pie_stopped` means the teardown was observed,
+  and a stop that did not take surfaces as `pie_stop_error` plus a note in the report. The MCP
+  `report_finish` had the identical bug and got the identical fix.
+- **`uap lease release`** now REFUSES while PIE is still in progress. This is the dangerous one: a
+  stop that lies is recoverable if the caller checks, but a release granted on that lie is not --
+  by then the next agent already holds the lease and is driving a live session. Stop PIE first, or
+  pass `--force` to hand over a live session deliberately. Fail-open when the editor is
+  unreachable (a dead editor has no PIE session), and it degrades to `IsInPIE` on an older plugin.
+
+`uap pie start` has the mirror shape and was left ALONE on purpose: it acks a queued start, which
+is correct for a verb whose caller may want to do other work while PIE comes up, and agents rely on
+it returning at once. `uap pie wait <seconds>` is the confirmation half and was already the
+documented next step. What changed is that the ack now says what it is -- `queued: true,
+confirmed: false`, plus the verb that confirms it -- so it cannot be read as "the world exists".
+(`pie wait` correctly keeps polling `IsInPIE`: it asks whether the world is LIVE, and a queued
+session is precisely what it must wait through.)
+
+The plugin half changes C++, so a project only gets the serialisation after a **rebuild**
+(`Restart-Editor.ps1`) and a re-sync of its vendored plugin copy. The CLI half -- confirmation,
+the lease guard, the honest `report finish` -- is live on pull and works against an older plugin at
+the reduced guarantee described above.
+
+## 26. Injected analog input was DISCARDED for a wrong Slate user index -- FIXED
+
+Found live by the Project Broken Wings director, source-cited on both sides (ClickUp 86ak7kay9).
+Driving an analog stick through `uap` produced **zero** cursor movement on a Slate analog cursor:
+crosshair pixel-identical in the before/after screenshots, `GetMousePosition()` unchanged at
+(960,540), no error and no warning. It looked exactly like the feature under test was broken, and
+was nearly filed as a bug against a fix that was working.
+
+Root cause, in our code:
+
+```cpp
+// AgentInput.cpp -- InjectAxis / InjectGamepad, before
+FAnalogInputEvent Evt(Key, App.GetModifierKeys(), 0, false, 0, 0, Value);   // user index 0
+FKeyEvent         Evt(Key, App.GetModifierKeys(), 0, false, 0, 0);          // user index 0
+```
+
+and Slate's own filter on the other side:
+
+```cpp
+bool FAnalogCursor::IsRelevantInput(const FInputEvent& InputEvent) const
+{
+    return GetOwnerUserIndex() == InputEvent.GetUserIndex();   // AnalogCursor.cpp:192
+}
+```
+
+Every Slate-path injection hardcoded user index **0** instead of matching the cursor's actual
+owning Slate user, so the event was discarded before the cursor ever ran. `InjectMouseMove` /
+`InjectMouseButton` were worse than they looked: the 7-argument `FPointerEvent` constructor
+hardcodes the user index to 0 *inside SlateCore* (`FInputEvent(InModifierKeys, 0, false)`,
+Events.h:730), so "not passing a user" was never neutral.
+
+**This is a different mechanism from #24.2.** That one is a LAYER mismatch -- `InjectKey` enters
+below the Slate pre-processor chain, so no pre-processor of any user sees it. This is the RIGHT
+layer with the WRONG USER: the chain runs and the handler declines the event. Treating them as
+the same trap costs you the fix.
+
+Fixed:
+
+1. **Resolve, do not assume.** `FAgentInput::ResolveSlateUserIndex` picks the user whose FOCUS
+   PATH contains the game viewport widget (`FSlateUser::IsWidgetInFocusPath` -- that is the user
+   whose input the game is actually routing), then `GetUserIndexForKeyboard()`, then Slate's
+   cursor user, validating each candidate against `GetUser()` so a fallback can never hand back
+   an index nothing owns. Every Slate-path inject in the plugin now goes through it, including
+   `NavigateUI`, which had its own second-best rule.
+2. **An explicit target, because resolution cannot cover the real case.** Slate's pre-processor
+   registry is private and has no public enumeration, so we cannot ask "which user owns this
+   analog cursor" -- only the caller knows. `uap input axis <Key> <v> --user <N>` targets one
+   Slate user; `InjectAxis` / `InjectGamepad` take a `SlateUser` parameter. An explicit user is
+   an explicit LAYER: only the Slate route carries a user index, so `--user` selects it and
+   deliberately does NOT fall through to the viewport route.
+3. **The failure is LOUD.** A `--user` Slate has no registered user for is REFUSED with the
+   registered indices listed, with all three parts of the house rule (#17 / "Adding a verb?"):
+   it names the mismatch and cites `AnalogCursor.cpp:192`, it says why the obvious retry (drop
+   the flag) is wrong -- that route never enters the pre-processor chain at all and answers `ok`
+   -- and it gives the exact remedy. A silent discard is worse than a missing verb: a missing
+   verb 404s and somebody notices.
+4. **The route is reportable.** `input axis` and `input status` now carry
+   `route: slate|viewport` (plus `user_index`), so which layer a hold is driving is readable
+   instead of assumed. A hold releases on the same route it started on -- recentring an axis on
+   the other route would leave the first one latched.
+
+Audit of the other injection paths, per the same ticket:
+
+- `InjectMouseMove` / `InjectMouseButton` -- same defect via the engine's 7-arg `FPointerEvent`
+  ctor. **Fixed** (8-arg overload + resolved index). Both also built their `PressedButtons` set
+  as a temporary while `FPointerEvent` stores a POINTER to it; hoisted to a named local.
+- `InjectKey` / `InjectAxisKey` (game-viewport route) -- **no Slate user index exists here**, so
+  nothing to fix. They do hardcode `GetDefaultInputDevice()`, which is the analogous assumption
+  one layer down: a second local player's device would need
+  `IPlatformInputDeviceMapper` lookup. Left alone -- the route targets the active game viewport
+  and its first local player by construction, which is what every current verb wants.
+- `IsKeyDown` uses `GetFirstPlayerController()`; `AgentSampler` and `AgentUIReader` do the same.
+  Player 0 only. Left alone, flagged here.
+- The hold registry is keyed on `FKey` alone, so the same axis held for two different Slate users
+  would collide on one entry. It now stores the route with the entry; multi-user holds of the
+  same key are still not supported and would need a composite key.
+- `InjectXRButton` routes to `InjectKey` (viewport) -- unaffected. `InjectXRControllerPose` does
+  not go through Slate at all.
+- Editor-side `NavigateUI` already used `GetUserIndexForKeyboard()` rather than a literal 0; it
+  now shares the one resolver so there is a single rule instead of two.
+
+Changes C++, so a project needs a **plugin rebuild** (`Restart-Editor.ps1`) and a re-sync of its
+vendored plugin copy. The CLI half (`--user`, the relayed refusal, `route` in the output) is live
+on pull; `--user` against a plugin that predates the parameter is the only combination that needs
+the rebuild.
+
 ## Status
 
-Items 1-9, 11, 13-23 resolved (1 and 5 doc fixes; 2, 3, 4, 7, 8, 9, 14 code changes; 6 reporting;
+Items 1-9, 11, 13-23, 26 resolved (1 and 5 doc fixes; 2, 3, 4, 7, 8, 9, 14 code changes; 6 reporting;
 11 config pin; 13 coordination lease; 15-22 from the 2026-08-27 verification session). Items 10 and
 12 are guidance -- both are engine-side crashes surfaced through `exec` (a DataTable exporter bug;
 game-thread re-entrancy during PIE transitions).
@@ -553,3 +733,10 @@ it needs a **plugin rebuild** (via `Restart-Editor.ps1`) and a re-sync of the pl
 into the game depot (P4 CL 1734). Its `log since` half is CLI-only and live on pull.
 
 Item 23 is CLI-only (covered by unit tests; live on pull, no rebuild) and item 24 is guidance.
+
+Item 25 is FIXED but NOT yet re-verified live -- it was written while both editors on the machine
+were in use by other sessions. Its CLI half (confirmation, the `lease release` guard, the honest
+`report finish`) is live on pull and covered by unit tests. Its plugin half (`StopPIEEx`,
+`IsPIEInProgress`, the queued-start cancel) changes C++, so it needs a **plugin rebuild** via
+`Restart-Editor.ps1` plus a re-sync of the vendored plugin copy. Live verification recipe is in
+"Verifying the PIE-stop fix" in `docs/agent-testing.md`.

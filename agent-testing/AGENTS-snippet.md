@@ -37,12 +37,14 @@ and renders an HTML report.
   catalog + recipes -- don't reverse-engineer by dumping `dir()` on the subsystem.
 - For a UI screenshot use `uap screenshot <abs.png>` (composites 3D + UMG + CommonUI + Slate).
   Do NOT use HighResShot or the MCP screenshot tool -- those capture the 3D scene only, no UI.
-- **Three tooling traps that silently give a WRONG answer.** They are not flaky tools, they are
+- **Five tooling traps that silently give a WRONG answer.** They are not flaky tools, they are
   LAYER MISMATCHES -- the test runs at a different layer than the thing being tested (below Slate,
-  outside the focused window, outside the game window). All three look like product bugs. **State
-  queries are unaffected by all three** -- prefer reading engine state over simulating input and
-  inferring from what you see. Full write-up: the "Layer mismatches" section of
-  `.claude/commands/agentplayertest.md`.
+  aimed at the wrong Slate user, outside the focused window, outside the game window, or before the
+  work has happened). All five look like product bugs. **THREE OF THE FIVE ARE THE SAME HEADLINE
+  RISK: input you injected silently never arrives** -- wrong layer, right layer/wrong user, or a
+  throttled unfocused editor. **State queries are unaffected by all but the queued-ack one** --
+  prefer reading engine state over simulating input and inferring from what you see. Full
+  write-up: the "Layer mismatches" section of `.claude/commands/agentplayertest.md`.
   - **An unfocused editor throttles to exactly 3.0 fps**, so any timing measured then is void (a
     chase watched at 3 fps looked like broken AI and produced a ticket that was not real). Force
     PIE window focus, then CONFIRM the rate in-engine (`WorldDeltaSeconds`, or the `hz` a sampler
@@ -55,9 +57,28 @@ and renders an HTML report.
     routed through Enhanced Input (menus, bound actions). It fails at ONE layer. For cursor, focus
     or pre-processor work use real OS input (`keybd_event`) to the PIE window, or query state
     instead (`GetDesiredFocusTarget()`, `HasFocusedDescendants`).
+  - **Injected input aimed at the WRONG SLATE USER is discarded -- right layer, wrong user.**
+    Slate stamps a USER index on every event and handlers filter on it
+    (`FAnalogCursor::IsRelevantInput` is `GetOwnerUserIndex() == InputEvent.GetUserIndex()`,
+    engine `AnalogCursor.cpp:192`), so a stick drive against an analog/virtual cursor moved it
+    zero pixels while reporting success -- and nearly became a bug filed against a working fix.
+    This is NOT the trap above: that one is the wrong LAYER, this is the right layer with the
+    wrong USER. Use `uap input axis <Key> <v> --user <N>` to drive the SLATE route as that user;
+    without `--user` the sample goes to the game viewport, BELOW the pre-processor chain, so
+    dropping the flag and retrying gets you `ok` and no movement. Results carry
+    `route: slate|viewport` (+ `user_index`); a `--user` nobody is registered on is refused with
+    the valid indices listed, not discarded.
   - **`uap screenshot` captures only the EDITOR viewport.** A separate Standalone PIE window is not
     captured -- you get a plausible-looking image of the wrong thing. Use an OS `PrintWindow`
     capture of that window, which also works while the game is PAUSED.
+  - **An operation that acks a QUEUED request, not a completed one.** The tell: *a call that
+    returns success faster than the work could plausibly have finished acked a queue, not a
+    result.* `uap pie stop` used to answer ok:true while PIE kept running -- the stop landed
+    before the queued start had created the play world, so it did nothing and PIE came up ~4s
+    later. Poll the authoritative completion signal (and check it can actually SEE the state you
+    care about), bounded, failing loudly on timeout. `pie stop` now waits and confirms; `pie
+    start` still returns at once by design and says so (`queued:true, confirmed:false`) -- follow
+    it with `uap pie wait <sec>`.
 - **"this editor's plugin has no `<Verb>` ... sync and rebuild `<project>`" is a TOOLING version
   gap**, not a broken editor and not a product bug: the `uap` CLI is shared by every project while
   each project vendors its own plugin copy. Flat `uap pie start` degrades to the legacy verb on its

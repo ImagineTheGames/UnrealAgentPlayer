@@ -166,24 +166,31 @@ def _report_finish(args) -> int:
     if s is None:
         return 2
 
-    # Clean up the editor: a finished test must not leave PIE running forever. Stop PIE if
-    # it is still live (idempotent, best-effort -- a failure here must never block rendering
-    # the report). Targets the report's own project so we stop the right editor. Opt out with
-    # --keep-pie for the rare case you want to keep inspecting the running game after finish.
+    # Clean up the editor: a finished test must not leave PIE running forever. Stop PIE if it is
+    # still live (idempotent, best-effort -- a failure here must never block rendering the report).
+    # Targets the report's own project so we stop the right editor. Opt out with --keep-pie for the
+    # rare case you want to keep inspecting the running game after finish.
+    #
+    # Goes through the CONFIRMED stop: this used to be `IsInPIE -> StopPIE -> pie_stopped = True`,
+    # which reported a stop it never verified. `pie_stopped` now means the teardown was observed,
+    # and a stop that did not take says so loudly instead of leaving the next agent a live session.
     pie_stopped = False
+    pie_stop_error = None
     if not getattr(args, "keep_pie", False):
         proj = getattr(s, "project", None) or None
         try:
-            if bool(_rc_call("IsInPIE", {}, proj)):
-                _rc_call("StopPIE", {}, proj)
-                pie_stopped = True
+            res = _pie_stop(proj, _pie_stop_timeout())
+            pie_stopped = bool(res.get("stopped"))
+            pie_stop_error = None if pie_stopped else res.get("error")
         except Exception:
             pass  # editor gone / RC unreachable -- nothing to stop, still render the report
-        if pie_stopped:
-            try:
-                s.add_note("PIE auto-stopped on report finish.")
-            except Exception:
-                pass
+        try:
+            if pie_stopped:
+                s.add_note("PIE auto-stopped on report finish (teardown confirmed).")
+            elif pie_stop_error:
+                s.add_note(f"PIE stop NOT confirmed on report finish: {pie_stop_error}")
+        except Exception:
+            pass
 
     s.finish(args.verdict, args.summary)
     html_path = s.run_dir / "index.html"
@@ -201,6 +208,8 @@ def _report_finish(args) -> int:
             pass
     out = {"ok": True, "html": str(html_path), "verdict": s.status,
            "downgraded": s.status != args.verdict, "pie_stopped": pie_stopped}
+    if pie_stop_error:
+        out["pie_stop_error"] = pie_stop_error
     if not s.env:
         out["warning"] = ("no diagnostics in report (env empty) -- run `uap report diag` "
                           "after `report start` to capture editor version/level/PIE state")
@@ -550,18 +559,168 @@ def _pie_start(mode: str, project: "str | None") -> dict:
     return out
 
 
+# --- PIE stop: CONFIRMED, not merely acked ------------------------------------------------
+# `uap pie stop` used to answer {"ok":true,"result":true} the instant RemoteControl returned --
+# and PIE went on running. A PIE start is QUEUED work: GEditor->RequestPlaySession only sets
+# PlaySessionRequest, and the editor tick creates the play world one or more frames later. The
+# engine's end-play request is a NO-OP unless that play world already exists
+# (`if (PlayWorld) { bRequestEndPlayMapQueued = true; }`), so a stop landing in the gap did
+# nothing at all -- observed live: the stop "succeeded", then `Creating play world package`
+# appeared ~4s LATER and the session ran on. A second stop genuinely tore it down.
+#
+# That ok:true is a silent false signal, and the lease system is built on top of it: an agent
+# that believes the stop releases its lease and hands the next agent an editor still in PIE.
+#
+# Two halves, neither optional:
+#   1. SERIALISE (plugin, StopPIEEx): cancel a queued play-session request before asking for
+#      end-play, so the stop consumes the pending start instead of racing it.
+#   2. CONFIRM (here): do not return until IsPIEInProgress() -- live OR queued -- reads false,
+#      within a bounded timeout; on timeout say ok:false and that the editor is NOT free.
+# (1) without (2) still returns before teardown finishes; (2) without (1) can only observe the
+# race, not prevent it.
+_PIE_STOP_POLL_SECONDS = 0.5
+
+
+def _float_env(name: str, default: float) -> float:
+    raw = os.environ.get(name)
+    if raw is None or raw.strip() == "":
+        return default
+    try:
+        return max(0.0, float(raw))
+    except ValueError:
+        return default
+
+
+def _pie_stop_timeout() -> float:
+    """Seconds to wait for teardown to complete. $UAP_PIE_STOP_TIMEOUT overrides. Bounded, so a
+    wedged teardown becomes a clear ok:false rather than a hang."""
+    return _float_env("UAP_PIE_STOP_TIMEOUT", 30.0)
+
+
+def _pie_stop_settle() -> float:
+    """DEGRADED path only (see _pie_stop): how long IsInPIE must read false CONTINUOUSLY before
+    a stop is believed. IsInPIE cannot see a queued start, so a single false reading is exactly
+    the false signal we are fixing; the window is a heuristic, not a proof, and is reported as
+    such. $UAP_PIE_STOP_SETTLE overrides."""
+    return _float_env("UAP_PIE_STOP_SETTLE", 5.0)
+
+
+def _pie_in_progress(project: "str | None", *, degraded: bool) -> bool:
+    """True while a play session is live OR queued.
+
+    `degraded` selects the older, WEAKER verb. IsInPIE only sees a live play world, so it reads
+    false while a start is queued -- the exact window this bug lives in. It is used only when the
+    plugin copy predates IsPIEInProgress, and every result built on it is labelled degraded.
+    """
+    return bool(_rc_call("IsInPIE" if degraded else "IsPIEInProgress", {}, project))
+
+
+_DEGRADED_NOTE = (
+    "this editor's plugin predates StopPIEEx/IsPIEInProgress: the stop could not cancel a QUEUED "
+    "start, and the confirmation polled IsInPIE, which cannot see one. Confirmed by a settle "
+    "window instead of a proof -- sync and rebuild this project for the exact check."
+)
+
+
+def _pie_stop(project: "str | None", timeout: float) -> dict:
+    """Stop PIE and do not return ok:true until the world is actually gone."""
+    t0 = time.monotonic()
+    degraded = False
+    try:
+        raw = _rc_call("StopPIEEx", {}, project)
+        res = json.loads(raw) if isinstance(raw, str) else (raw or {})
+    except AgentError as exc:
+        if not _is_missing_verb(exc):
+            raise                      # the verb exists and genuinely failed -- never mask it
+        # Skew: an older plugin copy has only the bool StopPIE. Same question ("stop PIE"), weaker
+        # guarantee -- it cannot cancel a queued start -- so fall back and SAY the result is weaker
+        # rather than passing a heuristic off as the exact check.
+        degraded = True
+        res = {"ok": bool(_rc_call("StopPIE", {}, project)), "via": "StopPIE"}
+
+    out: dict = {"ok": True, "result": bool(res.get("ok", False)), "stopped": False,
+                 "was_playing": res.get("was_playing"),
+                 "cancelled_queued_start": res.get("cancelled_queued_start"),
+                 "confirmed_with": "IsInPIE" if degraded else "IsPIEInProgress"}
+    if res.get("via"):
+        out["via"] = res["via"]
+    if degraded:
+        out["degraded"] = True
+        out["note"] = _DEGRADED_NOTE
+    if not res.get("ok", False):
+        out["ok"] = False
+        out["error"] = res.get("error", "the stop request was refused (no editor world?)")
+        return out
+
+    # Clamped to the timeout so a short --timeout cannot make the settle window itself the reason
+    # the stop "fails" while PIE is in fact gone.
+    settle = min(_pie_stop_settle(), max(0.0, timeout)) if degraded else 0.0
+    deadline = t0 + max(0.0, timeout)
+    clear_since: "float | None" = None
+    restops = 0
+    while True:
+        live = _pie_in_progress(project, degraded=degraded)
+        now = time.monotonic()
+        if live:
+            if clear_since is not None:
+                # It read clear and then came back: a queued start we could not cancel has just
+                # created the play world. Stop THAT session too. Degraded path only -- against a
+                # current plugin the queued request was cancelled, so this cannot happen.
+                _rc_call("StopPIE", {}, project)
+                restops += 1
+            clear_since = None
+        else:
+            if clear_since is None:
+                clear_since = now
+            if now - clear_since >= settle:
+                out["stopped"] = True
+                break
+        if now >= deadline:
+            out["ok"] = False
+            out["error"] = (
+                f"PIE still in progress {round(now - t0, 1)}s after the stop request -- the editor "
+                "is NOT free. Do NOT release the editor lease or hand it to another agent. Retry "
+                "`uap pie stop`, or stop it in the editor by hand."
+            )
+            break
+        time.sleep(_PIE_STOP_POLL_SECONDS)
+    out["waited_seconds"] = round(time.monotonic() - t0, 2)
+    if restops:
+        out["restops"] = restops
+    return out
+
+
 def _pie(args) -> int:
-    """Start/stop PIE via the plugin's version-correct RC verbs (StartPIE/StopPIE/IsInPIE),
-    so agents never touch the raw, version-fragile engine subsystem."""
+    """Start/stop PIE via the plugin's version-correct RC verbs, so agents never touch the raw,
+    version-fragile engine subsystem.
+
+    `start` and `stop` are deliberately ASYMMETRIC, and that is not an oversight:
+      * `stop` blocks until teardown is confirmed. It is the handover point -- the lease, the next
+        agent and `report finish` all act on "the editor is free", so it must not ack a queue.
+      * `start` returns as soon as the session is QUEUED, because a caller may legitimately want to
+        do other work while PIE comes up (and because agents already rely on it returning at once).
+        It labels itself `queued: true, confirmed: false` and points at `uap pie wait <seconds>`,
+        which is the confirmation half. Nothing may treat a start ack as "the world exists".
+    """
     sub = args.pie_cmd
     t0 = time.monotonic()
     body: dict = {"ok": True}
     try:
         if sub == "start":
             body.update(_pie_start(getattr(args, "mode", "flat") or "flat", args.project))
+            if body.get("ok"):
+                # An ack of QUEUED work, said out loud. See the docstring above.
+                body["queued"] = True
+                body["confirmed"] = False
+                body["next"] = "uap pie wait <seconds>   # blocks until the game world is live"
         elif sub == "stop":
-            body["result"] = _rc_call("StopPIE", {}, args.project)
+            timeout = getattr(args, "timeout", None)
+            body.update(_pie_stop(args.project,
+                                  _pie_stop_timeout() if timeout is None else timeout))
         elif sub == "wait":
+            # IsInPIE (live play world), NOT IsPIEInProgress: `wait` asks whether the world is
+            # LIVE, and a queued-but-not-yet-created session is precisely what it must keep
+            # waiting through. This is the one place the narrower verb is the right question.
             deadline = time.monotonic() + args.seconds
             playing = bool(_rc_call("IsInPIE", {}, args.project))
             while not playing and time.monotonic() < deadline:
@@ -603,9 +762,13 @@ def _input(args) -> int:
             body.update(_rc_json("HoldKey", {"KeyName": args.key, "Seconds": args.seconds},
                                  args.project, needs=_NEEDS_HOLD))
         elif sub == "axis":
-            body.update(_rc_json("HoldAxis", {"AxisKeyName": args.key, "Value": args.value,
-                                              "Seconds": args.seconds}, args.project,
-                                 needs=_NEEDS_HOLD))
+            # SlateUser goes on the wire ONLY when --user was given. Two reasons: an older
+            # plugin copy has no such parameter, and "" is what the plugin reads as "resolve
+            # it yourself / keep the game-viewport route", which is the historical behaviour.
+            params = {"AxisKeyName": args.key, "Value": args.value, "Seconds": args.seconds}
+            if args.user is not None:
+                params["SlateUser"] = str(args.user)
+            body.update(_rc_json("HoldAxis", params, args.project, needs=_NEEDS_HOLD))
         elif sub == "release":
             body.update(_rc_json("ReleaseHeldInput", {"KeyName": args.key or ""}, args.project,
                                  needs=_NEEDS_HOLD))
@@ -620,7 +783,7 @@ def _input(args) -> int:
     except (AgentError, json.JSONDecodeError) as exc:
         body = _err(exc)
     _capture(f"input:{sub}", {k: v for k, v in vars(args).items()
-                              if k in ("key", "value", "seconds")},
+                              if k in ("key", "value", "seconds", "user")},
              body, int((time.monotonic() - t0) * 1000))
     _emit(body)
     # .get: the body is merged from the plugin's envelope, so never assume the key is there.
@@ -983,15 +1146,22 @@ PLAY-IN-EDITOR
                                   so an HMD-only bug looks absent there. Needs a connected headset,
                                   and a plugin copy new enough to have StartPIEMode -- it REFUSES
                                   on an older one rather than quietly giving you flat PIE.
-  uap pie wait <seconds>          block until the game world is live
-  uap pie stop
+  uap pie wait <seconds>          block until the game world is live. REQUIRED after `pie start`:
+                                  start only QUEUES the session (it answers queued:true,
+                                  confirmed:false) -- the world does not exist yet when it returns.
+  uap pie stop [--timeout 30]     stop PIE and WAIT until the teardown is confirmed. ok:true means
+                                  the world is gone; on timeout it FAILS and says the editor is
+                                  not free. Never treat a stop as done without ok:true+stopped:true.
 
 MULTI-AGENT COORDINATION (several agents sharing one editor; see docs/agent-coordination.md)
   Rebuild ONLY via Restart-Editor.ps1 -- it self-locks; never bounce the editor by hand.
   Editor-touching verbs auto-wait through another agent's rebuild (block then resume, not fail).
   uap lease status                          who holds the editor + why
   uap lease acquire exclusive --reason pie --agent <tok> [--wait 900]   # hold PIE/level across calls
-  uap lease release --agent <tok>           # ...then release (pass the SAME token every call)
+  uap lease release --agent <tok>           # ...then release (pass the SAME token every call).
+                                            REFUSES while PIE is still in progress -- stop PIE
+                                            first (`uap pie stop`), or --force to hand over a
+                                            live session on purpose.
 
 DRIVE + OBSERVE
   uap rc <Func> [key=value ...]   call a plugin UFUNCTION (one-shot input injection lives here)
@@ -1006,6 +1176,10 @@ DRIVE + OBSERVE
 SUSTAINED INPUT (a single injected event CANNOT drive locomotion -- see below)
   uap input hold <Key> --seconds N     hold a digital key; returns at once, held in-engine
   uap input axis <AxisKey> <v> --seconds N   drive an analog axis -- THE VR LOCOMOTION VERB
+  uap input axis <AxisKey> <v> --user N      ...on the SLATE route as Slate user N, which is
+                                       the only route an analog/virtual cursor or any
+                                       RegisterInputPreProcessor handler can see. Without it
+                                       the sample goes to the game viewport, BELOW Slate
   uap input release                    RECOVERY: release every hold AND flush any key the
                                        engine still has down (clears a stuck key without a
                                        PIE restart). Run it if input starts behaving oddly.
@@ -1045,6 +1219,14 @@ RECIPES
     uap rc CallTestHelper Name=... JsonArgs={}      # runs while the key is still held
   VR locomotion -- push the left stick forward for 3s (thumbstick is an AXIS):
     uap input axis OculusTouch_Left_Thumbstick_Y 1.0 --seconds 3
+
+  Drive a SLATE analog/virtual cursor (a pre-processor, not gameplay input). Without --user
+  the sample takes the viewport route, below Slate, and the cursor never moves -- with no
+  error, which reads as a broken cursor. The result says which route it took:
+
+    uap input axis Gamepad_LeftX 1.0 --seconds 2 --user 0
+    uap input status               # route: slate / user_index: 0 while it is held
+
   VR controller button:
     uap rc InjectXRButton Hand=Right ButtonKeyName=OculusTouch_Right_Trigger_Click bPressed=true
   Prove something is smooth (or juddering) at frame rate:
@@ -1087,6 +1269,25 @@ _REBUILD_GUARDED = {"status", "rc", "exec", "exec-file", "pie",
 _LEASE_GUARDED = _REBUILD_GUARDED - {"status"}
 
 
+def _pie_state_for_lease(project: "str | None") -> "tuple[bool | None, str]":
+    """Best-effort "is this editor still in PIE", for the release guard.
+
+    Returns (in_progress, how). `None` means the question could not be asked at all (editor down /
+    RC unreachable) -- a dead editor has no PIE session, so the caller proceeds. Prefers the exact
+    verb and degrades to IsInPIE on an older plugin copy; either answer is enough to refuse.
+    """
+    for func in ("IsPIEInProgress", "IsInPIE"):
+        try:
+            return bool(_rc_call(func, {}, project)), func
+        except AgentError as exc:
+            if _is_missing_verb(exc):
+                continue        # older plugin copy: try the narrower verb
+            return None, "unreachable"
+        except Exception:
+            return None, "unreachable"
+    return None, "unreachable"
+
+
 def _lease(args) -> int:
     """Multi-agent coordination lease for a shared editor. See docs/agent-coordination.md."""
     proj = getattr(args, "project", "") or _env_project()
@@ -1095,7 +1296,24 @@ def _lease(args) -> int:
         res = _coord.acquire(proj, args.mode, reason=args.reason, agent=args.agent,
                              pid=args.pid, wait=args.wait, ttl=args.ttl)
     elif cmd == "release":
-        res = _coord.release(proj, agent=args.agent)
+        # Releasing says "the editor is free"; the next agent takes the lease on that word alone.
+        # A release granted while PIE is still live is therefore worse than a stop that lies: by
+        # the time anyone notices, a DIFFERENT agent is already driving an editor mid-session, and
+        # nothing in the system will ever tell either of them. So check, and refuse.
+        # Fail-open on an unreachable editor (nothing to protect) and --force for a deliberate
+        # handover of a live session.
+        live, how = (None, "skipped (--force)") if args.force else _pie_state_for_lease(proj)
+        if live:
+            res = {"ok": False, "released": False, "pie_live": True, "checked_with": how,
+                   "agent": args.agent or _coord.default_agent_id(),
+                   "error": ("refusing to release the editor lease: PIE is still in progress, so "
+                             "the editor is NOT free. Run `uap pie stop` (it now waits for the "
+                             "teardown and fails if it does not happen), then release. Pass "
+                             "--force only if you deliberately mean to hand over a live session.")}
+        else:
+            res = _coord.release(proj, agent=args.agent)
+            res["pie_live"] = live
+            res["checked_with"] = how
     elif cmd == "heartbeat":
         res = _coord.heartbeat(proj, agent=args.agent)
     else:  # status
@@ -1197,7 +1415,12 @@ def build_parser() -> argparse.ArgumentParser:
                          "IsHeadMountedDisplayEnabled branches) that flat PIE never takes. "
                          "Needs a connected headset; fails with a reason if there is none.")
     ps.set_defaults(func=_pie)
-    pie.add_parser("stop", parents=[proj]).set_defaults(func=_pie)
+    pst = pie.add_parser("stop", parents=[proj])
+    pst.add_argument("--timeout", type=float, default=None,
+                     help="max seconds to wait for teardown to be CONFIRMED (default 30, "
+                          "$UAP_PIE_STOP_TIMEOUT). On timeout the verb fails rather than "
+                          "acking a stop that did not happen.")
+    pst.set_defaults(func=_pie)
     pw = pie.add_parser("wait", parents=[proj])
     pw.add_argument("seconds", type=float, help="max seconds to wait for PIE to be live")
     pw.set_defaults(func=_pie)
@@ -1236,6 +1459,14 @@ def build_parser() -> argparse.ArgumentParser:
     ia.add_argument("value", type=float, help="-1.0 .. 1.0")
     ia.add_argument("--seconds", type=float, default=1.0)
     ia.add_argument("--wait", action="store_true", help="block until the hold expires")
+    # Slate DISCARDS an input event whose user index does not match the handler's owning user
+    # (FAnalogCursor::IsRelevantInput -- engine AnalogCursor.cpp:192). Without --user the sample
+    # takes the game-viewport route, which never enters the Slate pre-processor chain at all, so
+    # an analog/virtual cursor sees nothing either way. --user picks the Slate route AND the user.
+    ia.add_argument("--user", type=int, default=None, metavar="N",
+                    help="drive the SLATE route as Slate user N (what an analog/virtual cursor "
+                         "or any input pre-processor sees). Omit for the game-viewport route "
+                         "(gameplay/Enhanced Input). Refuses loudly if Slate has no user N")
     ia.set_defaults(func=_input)
     ir = inps.add_parser("release", parents=[proj], help="end a hold early (default: all holds)")
     ir.add_argument("key", nargs="?", default="", help="FKey name; omit to release everything")
@@ -1318,7 +1549,12 @@ def build_parser() -> argparse.ArgumentParser:
                     help="max seconds to block before returning busy (default 900)")
     la.add_argument("--ttl", type=int, default=None)
     la.set_defaults(func=_lease)
-    lzs.add_parser("release", parents=[proj]).set_defaults(func=_lease)
+    lzr = lzs.add_parser("release", parents=[proj])
+    lzr.add_argument("--force", action="store_true",
+                     help="release even though PIE is still in progress. Without it, release "
+                          "REFUSES while the editor is mid-session -- handing a live PIE to the "
+                          "next agent is the failure the lease exists to prevent.")
+    lzr.set_defaults(func=_lease)
     lzs.add_parser("heartbeat", parents=[proj]).set_defaults(func=_lease)
     lzs.add_parser("status", parents=[proj]).set_defaults(func=_lease)
     return p

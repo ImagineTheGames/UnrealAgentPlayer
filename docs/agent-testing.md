@@ -33,8 +33,15 @@ bone delta, log line) settle a question -- never a screenshot alone.
   state) AND perf (frame_ms / draw_ms / gpu_ms / fps, from the plugin's GetStatGroupText) into the
   report via `exec` (reads the right editor even if another squats the RC port). Run it while PIE
   is live for the game's frame rate.
-- `uap pie start [--mode flat|vr]` / `uap pie wait <sec>` / `uap pie stop` -- start / await / stop
-  Play-In-Editor (wraps the version-correct engine call; agents never touch the raw subsystem).
+- `uap pie start [--mode flat|vr]` / `uap pie wait <sec>` / `uap pie stop [--timeout 30]` --
+  start / await / stop Play-In-Editor (wraps the version-correct engine call; agents never touch
+  the raw subsystem). **`start` and `stop` are deliberately asymmetric.** `start` only QUEUES the
+  session and returns at once (`queued:true, confirmed:false`) -- the play world does not exist
+  yet, so `pie wait <sec>` is the confirmation half and is not optional. `stop` BLOCKS until the
+  teardown is confirmed (it polls `IsPIEInProgress`, i.e. live **or** queued) and returns
+  `ok:false` on timeout saying the editor is not free, because `stop` is the handover point: the
+  lease, the next agent and `report finish` all act on "the editor is free". `ok:true` +
+  `stopped:true` is the only "PIE is gone". See known-issues #25.
   `--mode vr` starts the editor's **VR Preview** instead: the HMD code path (OpenXR input, every
   `IsHeadMountedDisplayEnabled()` branch) that flat PIE never takes. Requires a connected headset
   and fails with a reason if there is none -- it never silently falls back to flat. It also needs a
@@ -81,3 +88,39 @@ bake a preset:
    `uap rc CallTestHelper Name=... JsonArgs={}` (see `docs/writing-test-helpers.md`).
 
 The preset stays in your project; the plugin only ships the generic command.
+
+## Verifying the PIE-stop fix (known-issues #25)
+
+`uap pie stop` used to answer `ok:true` while PIE kept running. The fix has two halves and they
+are verified separately, because the plugin half needs a rebuild and the CLI half does not.
+
+**Prerequisite for the full check:** the project's vendored plugin copy must be synced and rebuilt
+(`Restart-Editor.ps1`) so the editor exports `StopPIEEx` and `IsPIEInProgress`. Without it the CLI
+still confirms the stop, but at the reduced guarantee it labels `degraded: true`.
+
+1. **Preflight.** `uap status` -> `rc_reachable:true`. Confirm the plugin is new enough:
+   `uap rc IsPIEInProgress` must return `{"ok": true, "result": false}` on an idle editor -- a 404
+   / "this editor's plugin has no ..." means the rebuild has not landed.
+2. **The original race, on purpose.** Start PIE and stop it IMMEDIATELY, with no wait in between:
+   `uap pie start` then, as the very next command, `uap pie stop`.
+   * Expected now: the stop reports `cancelled_queued_start: true` (it consumed the queued start
+     rather than racing it) and `stopped: true`.
+   * The bug: `{"ok": true, "result": true}` returned in well under a second, followed ~4s later by
+     `Creating play world package` in the log and a live PIE window.
+3. **Check the editor, not the JSON.** Two independent reads, because the whole point is that the
+   verb's own answer was the thing lying:
+   * the OS window title on the editor's PID -- `<Project> Preview [NetMode: ...]` means PIE is
+     LIVE; `<Project> - Unreal Editor` means it is gone;
+   * `uap log tail --grep "Shutting down PIE online subsystems"` (and `--grep "Creating play world
+     package"` for anything that came up after your stop).
+4. **The normal path.** `uap pie start` -> `uap pie wait 12` -> `uap pie stop`. The stop should
+   report `was_playing: true`, `stopped: true`, and a `waited_seconds` that is non-zero: teardown
+   takes at least a tick, so an instant return is itself the symptom.
+5. **The timeout path** (optional, needs a wedged teardown; skip if you cannot produce one). With
+   `--timeout 2` against a session that will not tear down, the verb must exit non-zero with
+   `stopped: false` and an error saying the editor is NOT free -- never `ok:true`.
+6. **The lease guard.** While PIE is live:
+   `uap lease acquire exclusive --reason pie --agent verify` then
+   `uap lease release --agent verify` -> must REFUSE with `pie_live: true` and exit 1, and
+   `uap lease status` must still show `verify` holding it. Stop PIE, release again -> succeeds.
+   (`--force` releases anyway; use it only to hand over a live session deliberately.)

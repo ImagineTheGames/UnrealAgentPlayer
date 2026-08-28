@@ -270,13 +270,90 @@ FString UUAPAgentSubsystem::StartPIEMode(FString Mode)
     return MakeResult(true, Wanted, TEXT(""));
 }
 
+namespace
+{
+    // The actual stop, shared by StopPIE (legacy bool) and StopPIEEx (JSON envelope).
+    //
+    // A PIE START IS QUEUED, NOT IMMEDIATE. RequestPlaySession only sets GEditor's
+    // PlaySessionRequest; the editor tick creates the play world one or more frames later
+    // (StartQueuedPlaySessionRequest). RequestEndPlayMap, meanwhile, is a NO-OP unless PlayWorld
+    // ALREADY exists -- `if (PlayWorld) { bRequestEndPlayMapQueued = true; }` -- and the tick's
+    // teardown is likewise gated on `PlayWorld && bRequestEndPlayMapQueued`.
+    //
+    // So a stop landing in the gap between "start queued" and "play world created" did literally
+    // nothing, and the queued start then brought PIE up AFTER the stop had reported success.
+    // Cancelling the pending request SERIALISES the stop against the engine's own queued work
+    // instead of racing it -- that is the fix, not the caller's polling.
+    bool UAPRequestStopPIE(bool& bOutWasPlaying, bool& bOutCancelledQueuedStart,
+                           bool& bOutInProgress, FString& OutError)
+    {
+        bOutWasPlaying = false;
+        bOutCancelledQueuedStart = false;
+        bOutInProgress = false;
+        OutError.Reset();
+
+        if (!GEditor) { OutError = TEXT("no GEditor"); return false; }
+
+        ULevelEditorSubsystem* LES = GEditor->GetEditorSubsystem<ULevelEditorSubsystem>();
+        if (!LES)
+        {
+            bOutInProgress = GEditor->IsPlaySessionInProgress();
+            OutError = TEXT("no LevelEditorSubsystem");
+            return false;
+        }
+
+        // Read "is it playing" BEFORE cancelling: CancelRequestPlaySession also resets
+        // PlayInEditorSessionInfo, which is what IsInPlayInEditor() reads. The engine normally
+        // keeps queued and live mutually exclusive (StartQueuedPlaySessionRequest resets the
+        // request), but if they ever overlapped, cancelling first would make a LIVE session look
+        // stopped and we would skip the end-play request entirely.
+        bOutWasPlaying = LES->IsInPlayInEditor();
+
+        bOutCancelledQueuedStart = GEditor->IsPlaySessionRequestQueued();
+        if (bOutCancelledQueuedStart)
+        {
+            GEditor->CancelRequestPlaySession();
+        }
+
+        if (bOutWasPlaying)
+        {
+            // RequestEndPlayMap is gated on PlayWorld, not on the session info the cancel above
+            // may have cleared, so this still lands.
+            LES->EditorRequestEndPlay();
+        }
+
+        // Teardown still happens on a later editor tick, so we cannot report "PIE is gone" here
+        // -- and must not pretend to: blocking would block the very tick that performs it.
+        // `in_progress` is the honest answer (live OR queued); the CALLER polls IsPIEInProgress()
+        // until it reads false. See `uap pie stop`.
+        bOutInProgress = GEditor->IsPlaySessionInProgress();
+        return true;
+    }
+}
+
 bool UUAPAgentSubsystem::StopPIE()
 {
-    if (!GEditor) { return false; }
-    ULevelEditorSubsystem* LES = GEditor->GetEditorSubsystem<ULevelEditorSubsystem>();
-    if (!LES) { return false; }
-    LES->EditorRequestEndPlay();
-    return true;
+    bool bWasPlaying = false, bCancelled = false, bInProgress = false;
+    FString Error;
+    return UAPRequestStopPIE(bWasPlaying, bCancelled, bInProgress, Error);
+}
+
+FString UUAPAgentSubsystem::StopPIEEx()
+{
+    bool bWasPlaying = false, bCancelled = false, bInProgress = false;
+    FString Error;
+    const bool bOk = UAPRequestStopPIE(bWasPlaying, bCancelled, bInProgress, Error);
+
+    TSharedRef<FJsonObject> O = MakeShared<FJsonObject>();
+    O->SetBoolField(TEXT("ok"), bOk);
+    O->SetBoolField(TEXT("was_playing"), bWasPlaying);
+    O->SetBoolField(TEXT("cancelled_queued_start"), bCancelled);
+    O->SetBoolField(TEXT("in_progress"), bInProgress);
+    if (!Error.IsEmpty()) { O->SetStringField(TEXT("error"), Error); }
+    FString Out;
+    TSharedRef<TJsonWriter<>> W = TJsonWriterFactory<>::Create(&Out);
+    FJsonSerializer::Serialize(O, W);
+    return Out;
 }
 
 bool UUAPAgentSubsystem::IsInPIE() const
@@ -284,6 +361,16 @@ bool UUAPAgentSubsystem::IsInPIE() const
     if (!GEditor) { return false; }
     ULevelEditorSubsystem* LES = GEditor->GetEditorSubsystem<ULevelEditorSubsystem>();
     return LES ? LES->IsInPlayInEditor() : false;
+}
+
+bool UUAPAgentSubsystem::IsPIEInProgress() const
+{
+    // Live OR queued -- UEditorEngine::IsPlaySessionInProgress() is
+    // IsPlayingSessionInEditor() || IsPlaySessionRequestQueued(). IsInPIE() sees only the first
+    // half, so it reads FALSE during the window in which a start has been requested but the play
+    // world does not exist yet: polling IsInPIE() to confirm a teardown confirms nothing in
+    // exactly the case that matters. This is the authoritative "PIE is live or about to be".
+    return GEditor ? GEditor->IsPlaySessionInProgress() : false;
 }
 
 int64 UUAPAgentSubsystem::GetLogCursor() const
@@ -345,14 +432,30 @@ bool UUAPAgentSubsystem::InjectMouseButton(EAgentMouseButton Button, bool bPress
     return FAgentInput::InjectMouseButton(Button, bPressed);
 }
 
-bool UUAPAgentSubsystem::InjectAxis(FString AxisName, float Value)
+bool UUAPAgentSubsystem::InjectAxis(FString AxisName, float Value, FString SlateUser)
 {
-    return FAgentInput::InjectAxis(FName(*AxisName), Value);
+    int32 User = INDEX_NONE;
+    FString UserError;
+    if (!FAgentInput::ResolveSlateUserParam(SlateUser, User, UserError))
+    {
+        // bool cannot carry a reason, so the reason goes to the log where `uap log since`
+        // will find it. Silence here is what made the original defect unfileable.
+        UE_LOG(LogUAP, Error, TEXT("InjectAxis: %s"), *UserError);
+        return false;
+    }
+    return FAgentInput::InjectAxis(FName(*AxisName), Value, User);
 }
 
-bool UUAPAgentSubsystem::InjectGamepad(EAgentGamepadButton Button, bool bPressed, float AnalogValue)
+bool UUAPAgentSubsystem::InjectGamepad(EAgentGamepadButton Button, bool bPressed, float AnalogValue, FString SlateUser)
 {
-    return FAgentInput::InjectGamepad(Button, bPressed, AnalogValue);
+    int32 User = INDEX_NONE;
+    FString UserError;
+    if (!FAgentInput::ResolveSlateUserParam(SlateUser, User, UserError))
+    {
+        UE_LOG(LogUAP, Error, TEXT("InjectGamepad: %s"), *UserError);
+        return false;
+    }
+    return FAgentInput::InjectGamepad(Button, bPressed, AnalogValue, User);
 }
 
 bool UUAPAgentSubsystem::InjectXRButton(EAgentXRHand Hand, FString ButtonKeyName, bool bPressed)
@@ -374,9 +477,10 @@ FString UUAPAgentSubsystem::HoldKey(FString KeyName, float Seconds)
     return FAgentInput::HoldKeyJson(KeyName, Seconds);
 }
 
-FString UUAPAgentSubsystem::HoldAxis(FString AxisKeyName, float Value, float Seconds)
+FString UUAPAgentSubsystem::HoldAxis(FString AxisKeyName, float Value, float Seconds,
+                                     FString SlateUser)
 {
-    return FAgentInput::HoldAxisJson(AxisKeyName, Value, Seconds);
+    return FAgentInput::HoldAxisJson(AxisKeyName, Value, Seconds, SlateUser);
 }
 
 FString UUAPAgentSubsystem::ReleaseHeldInput(FString KeyName)
@@ -475,10 +579,20 @@ bool UUAPAgentSubsystem::NavigateUI(FString Direction)
 
     // Drive Slate's focus navigation (the path menus use), NOT the game-input viewport path:
     // ProcessKeyDownEvent lets Slate translate arrow/Enter/Escape into UI navigation/activation.
+    // One resolver for every Slate-path injection in this plugin. This used to call
+    // GetUserIndexForKeyboard() directly, which is only the SECOND choice: the user whose focus
+    // path holds the game viewport is the one the game is actually routing.
+    FString UserError;
+    const int32 User = FAgentInput::ResolveSlateUserIndex(INDEX_NONE, UserError);
+    if (User == INDEX_NONE)
+    {
+        UE_LOG(LogUAP, Error, TEXT("NavigateUI: %s"), *UserError);
+        return false;
+    }
     FSlateApplication& App = FSlateApplication::Get();
-    FKeyEvent KeyDown(Key, App.GetModifierKeys(), App.GetUserIndexForKeyboard(), /*bIsRepeat*/ false, 0, 0);
+    FKeyEvent KeyDown(Key, App.GetModifierKeys(), (uint32)User, /*bIsRepeat*/ false, 0, 0);
     const bool bHandled = App.ProcessKeyDownEvent(KeyDown);
-    FKeyEvent KeyUp(Key, App.GetModifierKeys(), App.GetUserIndexForKeyboard(), false, 0, 0);
+    FKeyEvent KeyUp(Key, App.GetModifierKeys(), (uint32)User, false, 0, 0);
     App.ProcessKeyUpEvent(KeyUp);
     return bHandled;
 }

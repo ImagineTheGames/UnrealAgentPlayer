@@ -85,11 +85,35 @@ So the plugin holds the input **in-engine**, re-asserting it once per frame on t
 | UFUNCTION | CLI | Inputs | Notes |
 | --- | --- | --- | --- |
 | `HoldKey` | `uap input hold <Key> --seconds N` | `KeyName`, `Seconds` | Press now, `IE_Repeat` every frame, auto-release. |
-| `HoldAxis` | `uap input axis <AxisKey> <v> --seconds N` | `AxisKeyName`, `Value`, `Seconds` | **The VR locomotion verb** — e.g. `OculusTouch_Left_Thumbstick_Y 1.0`. |
+| `HoldAxis` | `uap input axis <AxisKey> <v> --seconds N [--user N]` | `AxisKeyName`, `Value`, `Seconds`, `SlateUser` | **The VR locomotion verb** — e.g. `OculusTouch_Left_Thumbstick_Y 1.0`. |
 | `ReleaseHeldInput` | `uap input release [<Key>]` | `KeyName` (empty = **recovery**) | See below. |
-| `GetHeldInput` | `uap input status` | — | `{"held":[{key, analog, value, remaining_seconds, down}]}` |
+| `GetHeldInput` | `uap input status` | — | `{"held":[{key, analog, value, remaining_seconds, down, route, user_index}]}` |
 
 All four return a JSON envelope so a refusal can say *why*. Key names are exact FKeys resolved against **the engine's own registry** (`FKey::IsValid`) — `W`, `C`, `LeftControl`, `SpaceBar`, `Gamepad_LeftY`, `OculusTouch_Left_Thumbstick_Y` all work; there is no hand-maintained allow-list to drift out of date.
+
+### Which ROUTE an analog sample takes, and as which Slate user
+
+There are two analog routes and they reach different layers. Without `--user`, `input axis` goes
+through the **game viewport** (gameplay / Enhanced Input) -- below Slate, so nothing registered
+via `RegisterInputPreProcessor` sees it. With `--user N` it goes through **Slate**, stamped for
+Slate user N, which is the only route an analog or virtual cursor can see.
+
+The user index is not cosmetic: Slate DISCARDS an event whose user index does not match the
+handler's owner -- `FAnalogCursor::IsRelevantInput()` is `GetOwnerUserIndex() ==
+InputEvent.GetUserIndex()` (engine `AnalogCursor.cpp:192`). Stamping a wrong one loses the event
+with no error at all, which reads as a broken feature; that cost a live investigation
+(known-issues #26). So:
+
+- omitted `SlateUser` = resolve automatically (focused game-viewport user, then keyboard user,
+  then the cursor user) and keep the historical viewport routing;
+- `--user N` targets one user, and is REFUSED with the registered indices listed if Slate has no
+  such user -- never discarded;
+- every result carries `route: slate|viewport` (plus `user_index`), and `input status` reports it
+  per hold, so which layer you are driving is readable rather than assumed.
+
+`InjectAxis` and `InjectGamepad` take the same `SlateUser` parameter. It is a **string** because
+RemoteControl builds the argument struct zero-initialised: an omitted `int32` would arrive as `0`,
+a valid index, and would silently move every existing call onto the Slate route.
 
 `uap input hold/axis` returns **immediately** by default — the hold continues in-engine, which is the point: you read game state *while* it is held. Pass `--wait` to block until it expires.
 
@@ -326,7 +350,7 @@ Launch and drive standalone `-game` processes independently from the editor, eac
 
 The C++ functions on `UAPAgentSubsystem`, callable directly over Remote Control:
 
-`GetPluginVersion` · `ExecuteConsoleCommand` · `GetRemoteControlPort` · `FocusEditorWindow` · `GetPIEPhase` · `GetPIEElapsedSeconds` · `StartPIE` · `StartPIEMode` · `StopPIE` · `IsInPIE` · `GetLogCursor` · `GetLogsSince` · `InjectKey` · `InjectMouseMove` · `InjectMouseButton` · `InjectAxis` · `InjectGamepad` · `InjectXRButton` · `InjectXRControllerPose` · `ClearXRControllerOverride` · `HoldKey` · `HoldAxis` · `ReleaseHeldInput` · `GetHeldInput` · `ListTestHelpers` · `ListTestHelpersJson` · `CallTestHelper` · `StartPropertySample` · `ReadPropertySample` · `StopPropertySample` · `GetStatGroupText` · `DumpViewportUI` · `SelectTab` · `NavigateUI` · `CaptureViewportWithUI`
+`GetPluginVersion` · `ExecuteConsoleCommand` · `GetRemoteControlPort` · `FocusEditorWindow` · `GetPIEPhase` · `GetPIEElapsedSeconds` · `StartPIE` · `StartPIEMode` · `StopPIE` · `StopPIEEx` · `IsInPIE` · `IsPIEInProgress` · `GetLogCursor` · `GetLogsSince` · `InjectKey` · `InjectMouseMove` · `InjectMouseButton` · `InjectAxis` · `InjectGamepad` · `InjectXRButton` · `InjectXRControllerPose` · `ClearXRControllerOverride` · `HoldKey` · `HoldAxis` · `ReleaseHeldInput` · `GetHeldInput` · `ListTestHelpers` · `ListTestHelpersJson` · `CallTestHelper` · `StartPropertySample` · `ReadPropertySample` · `StopPropertySample` · `GetStatGroupText` · `DumpViewportUI` · `SelectTab` · `NavigateUI` · `CaptureViewportWithUI`
 
 The same surface (minus the editor-only PIE and focus verbs) exists on `UAPAgentRuntimeSubsystem` for standalone `-game` processes.
 
@@ -340,6 +364,7 @@ A verb the plugin does not export is not a preset field, so RemoteControl answer
 
 - Never call a new verb bare from the CLI. Route it through `_rc_require(func, params, project, needs)` (or `_rc_json(..., needs=...)`), which reports "this editor's plugin has no `<Verb>` ... sync and rebuild `<project>`".
 - Fall back to an older verb **only** when it answers the same question (flat `pie start` -> `StartPIE`; `helpers` -> `ListTestHelpers`). Never fall back to a verb that answers a *different* question -- that is why `--mode vr` refuses.
+- Prefer an EXTRA verb over a changed signature. `StopPIEEx` was added beside `StopPIE` rather than widening it, so its mere presence tells the CLI which guarantee this editor can offer -- an older copy 404s and the CLI degrades honestly instead of guessing.
 - Only a 404 is skew. A verb that exists and fails answers HTTP 200 with its own result, so a real failure is never masked by a fallback.
 
 See known-issues #23.

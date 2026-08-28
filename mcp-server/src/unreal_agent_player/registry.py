@@ -67,7 +67,10 @@ def register_all(
         ),
         Tool(
             name="pie_start",
-            description="Start Play-In-Editor. Optional map_path and start_location. Returns phase + elapsed.",
+            description=("QUEUE a Play-In-Editor session. Optional map_path and start_location. "
+                         "Returns queued:true, confirmed:false + phase/elapsed -- the play world "
+                         "does not exist yet, so poll pie_status for phase Playing before reading "
+                         "game state or capturing a frame."),
             inputSchema={
                 "type": "object",
                 "properties": {
@@ -78,7 +81,11 @@ def register_all(
                 "additionalProperties": False,
             },
         ),
-        Tool(name="pie_stop",   description="Stop PIE.",   inputSchema={"type": "object", "properties": {}, "additionalProperties": False}),
+        Tool(name="pie_stop",
+             description=("Stop PIE and WAIT until the teardown is confirmed. ok:true + "
+                          "stopped:true is the only 'PIE is gone'; on timeout it returns ok:false "
+                          "saying the editor is not free, never a bare ack of the request."),
+             inputSchema={"type": "object", "properties": {}, "additionalProperties": False}),
         Tool(name="pie_pause",  description="Pause PIE.",  inputSchema={"type": "object", "properties": {}, "additionalProperties": False}),
         Tool(name="pie_resume", description="Resume PIE.", inputSchema={"type": "object", "properties": {}, "additionalProperties": False}),
         Tool(name="pie_status", description="Current PIE phase + elapsed seconds.", inputSchema={"type": "object", "properties": {}, "additionalProperties": False}),

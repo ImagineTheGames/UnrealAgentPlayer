@@ -114,14 +114,30 @@ bool UUAPAgentRuntimeSubsystem::InjectMouseButton(EAgentMouseButton Button, bool
     return FAgentInput::InjectMouseButton(Button, bPressed);
 }
 
-bool UUAPAgentRuntimeSubsystem::InjectAxis(FString AxisName, float Value)
+bool UUAPAgentRuntimeSubsystem::InjectAxis(FString AxisName, float Value, FString SlateUser)
 {
-    return FAgentInput::InjectAxis(FName(*AxisName), Value);
+    int32 User = INDEX_NONE;
+    FString UserError;
+    if (!FAgentInput::ResolveSlateUserParam(SlateUser, User, UserError))
+    {
+        // bool cannot carry a reason, so the reason goes to the log where `uap log since`
+        // will find it. Silence here is what made the original defect unfileable.
+        UE_LOG(LogUAPRuntime, Error, TEXT("InjectAxis: %s"), *UserError);
+        return false;
+    }
+    return FAgentInput::InjectAxis(FName(*AxisName), Value, User);
 }
 
-bool UUAPAgentRuntimeSubsystem::InjectGamepad(EAgentGamepadButton Button, bool bPressed, float AnalogValue)
+bool UUAPAgentRuntimeSubsystem::InjectGamepad(EAgentGamepadButton Button, bool bPressed, float AnalogValue, FString SlateUser)
 {
-    return FAgentInput::InjectGamepad(Button, bPressed, AnalogValue);
+    int32 User = INDEX_NONE;
+    FString UserError;
+    if (!FAgentInput::ResolveSlateUserParam(SlateUser, User, UserError))
+    {
+        UE_LOG(LogUAPRuntime, Error, TEXT("InjectGamepad: %s"), *UserError);
+        return false;
+    }
+    return FAgentInput::InjectGamepad(Button, bPressed, AnalogValue, User);
 }
 
 bool UUAPAgentRuntimeSubsystem::InjectXRButton(EAgentXRHand Hand, FString ButtonKeyName, bool bPressed)
@@ -142,9 +158,10 @@ FString UUAPAgentRuntimeSubsystem::HoldKey(FString KeyName, float Seconds)
     return FAgentInput::HoldKeyJson(KeyName, Seconds);
 }
 
-FString UUAPAgentRuntimeSubsystem::HoldAxis(FString AxisKeyName, float Value, float Seconds)
+FString UUAPAgentRuntimeSubsystem::HoldAxis(FString AxisKeyName, float Value, float Seconds,
+                                            FString SlateUser)
 {
-    return FAgentInput::HoldAxisJson(AxisKeyName, Value, Seconds);
+    return FAgentInput::HoldAxisJson(AxisKeyName, Value, Seconds, SlateUser);
 }
 
 FString UUAPAgentRuntimeSubsystem::ReleaseHeldInput(FString KeyName)
