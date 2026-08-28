@@ -37,7 +37,11 @@ bone delta, log line) settle a question -- never a screenshot alone.
   Play-In-Editor (wraps the version-correct engine call; agents never touch the raw subsystem).
   `--mode vr` starts the editor's **VR Preview** instead: the HMD code path (OpenXR input, every
   `IsHeadMountedDisplayEnabled()` branch) that flat PIE never takes. Requires a connected headset
-  and fails with a reason if there is none -- it never silently falls back to flat.
+  and fails with a reason if there is none -- it never silently falls back to flat. It also needs a
+  plugin copy new enough to export `StartPIEMode`, and refuses (rather than downgrading to flat) on
+  an older one; **flat** `pie start` falls back to the legacy `StartPIE` by itself. Every project
+  vendors its own plugin copy while sharing this one CLI, so that skew is normal -- see
+  "CLI/plugin version skew" in `capabilities.md` and known-issues #23 before adding a new verb.
 - `uap exec "<python>"` -- arbitrary `import unreal; ...` in the editor.
 - `uap rc <FunctionName> [key=value ...]` -- call a UAP_Preset UFUNCTION (use `uap exec` for nested args).
 - `uap read-ui` -- dump viewport UMG text. `uap screenshot <file> [--caption ...]` -- capture

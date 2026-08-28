@@ -320,13 +320,66 @@ def _rc_call(func: str, params: dict, project: "str | None" = None):
         raise
 
 
-def _rc_json(func: str, params: dict, project: "str | None" = None) -> dict:
+# --- CLI / plugin version skew ----------------------------------------------------------
+# Every project vendors its OWN copy of the uap plugin, but they all share THIS CLI (each
+# project's uap.ps1 resolves this one repo). The CLI therefore updates the moment it is
+# pulled, while a project's plugin copy only catches up when that project syncs and
+# REBUILDS -- so CLI/plugin skew is permanent and expected, not a transient state.
+#
+# A verb the plugin does not export is not a preset field, and RemoteControl answers
+# 404 "Unable to resolve the preset field", which reads like a broken editor rather than a
+# tooling version gap (that cost a teammate an afternoon on `pie start`). Rule for anyone
+# adding a plugin verb: never call it bare from here. Either route it through _rc_require,
+# saying what the verb is FOR, or -- when an OLDER verb does the same job honestly -- fall
+# back to that verb. Never fall back to a verb that answers a DIFFERENT question.
+
+
+def _is_missing_verb(exc: Exception) -> bool:
+    """True when RemoteControl could not RESOLVE the function -- i.e. this editor's plugin
+    copy predates the verb. That is the ONLY case in which a fallback may fire.
+
+    A verb that exists and fails answers HTTP 200 carrying its own result (a JSON envelope,
+    or false), so a real failure never reaches here and can never be masked by a fallback.
+    We key on the 404 STATUS rather than on RemoteControl's wording: the preset-call endpoint
+    404s only when the preset or the field is unresolvable, never because the UFUNCTION
+    itself refused.
+    """
+    return isinstance(exc, AgentError) and "returned 404" in str(exc)
+
+
+def _skew_error(func: str, project: "str | None", needs: str) -> AgentError:
+    """The refusal for "this editor's plugin is too old to serve that request". Same shape as
+    the ListTestHelpersJson message below: name the missing verb, say what is lost, and give
+    the one action that fixes it."""
+    return AgentError(
+        ErrorCode.UE_OBJECT_NOT_FOUND,
+        f"this editor's plugin has no {func} ({needs}). The CLI is shared by every project "
+        f"while each project vendors its own plugin copy, so this one is behind the CLI: "
+        f"sync and rebuild {project or 'that project'} (Restart-Editor.ps1) to get the verb.",
+        recoverable=False,
+    )
+
+
+def _rc_require(func: str, params: dict, project: "str | None", needs: str):
+    """_rc_call for a verb an older plugin copy may not have: turns RemoteControl's raw 404
+    into the version-skew refusal above. Every other failure passes through untouched."""
+    try:
+        return _rc_call(func, params, project)
+    except AgentError as exc:
+        if _is_missing_verb(exc):
+            raise _skew_error(func, project, needs) from None
+        raise
+
+
+def _rc_json(func: str, params: dict, project: "str | None" = None,
+             *, needs: "str | None" = None) -> dict:
     """Call a UFUNCTION that returns a JSON string and decode it to a dict.
 
     Plugin verbs that can fail for more than one reason return a JSON envelope so the refusal
-    carries its own explanation; the CLI relays that verbatim rather than guessing.
+    carries its own explanation; the CLI relays that verbatim rather than guessing. Pass
+    `needs` for a verb older plugin copies lack, so a 404 is named as skew instead of leaking.
     """
-    raw = _rc_call(func, params, project)
+    raw = _rc_require(func, params, project, needs) if needs else _rc_call(func, params, project)
     if isinstance(raw, str):
         return json.loads(raw)
     return raw if isinstance(raw, dict) else {"ok": False, "error": f"{func}: unexpected result {raw!r}"}
@@ -456,6 +509,47 @@ def _exec_file(args) -> int:
     return _exec(argparse.Namespace(code=code, project=args.project))
 
 
+def _pie_start(mode: str, project: "str | None") -> dict:
+    """Start PIE in `mode`, tolerating a plugin copy that predates StartPIEMode -- for FLAT
+    only.
+
+    --mode vr uses the editor's VR Preview, i.e. the HMD code path: OpenXR input and every
+    IsHeadMountedDisplayEnabled() branch. Flat PIE takes neither, so an HMD-only bug is
+    invisible there. StartPIEMode refuses "vr" with a concrete reason when no headset is
+    connected rather than silently starting flat PIE.
+
+    StartPIEMode is newer than StartPIE, so a project whose vendored plugin has not been
+    rebuilt 404s on it. For flat that is pure skew -- the old StartPIE verb starts exactly the
+    same session -- so fall back and say so. For vr there is nothing honest to fall back to:
+    StartPIE can only start FLAT PIE, and quietly giving flat when vr was asked for is the
+    precise failure StartPIEMode exists to prevent, so refuse with the rebuild instruction.
+    """
+    try:
+        raw = _rc_call("StartPIEMode", {"Mode": mode}, project)
+    except AgentError as exc:
+        if not _is_missing_verb(exc):
+            raise                      # the verb exists and genuinely failed -- never mask it
+        if mode == "vr":
+            raise _skew_error(
+                "StartPIEMode", project,
+                "VR Preview needs it; the legacy StartPIE verb can only start FLAT PIE, and "
+                "starting flat when you asked for vr would hide every HMD-only bug",
+            ) from None
+        started = bool(_rc_call("StartPIE", {}, project))
+        out = {"ok": started, "mode": "flat", "via": "StartPIE",
+               "note": ("this editor's plugin predates StartPIEMode; started flat PIE with the "
+                        "legacy StartPIE verb. Sync and rebuild "
+                        f"{project or 'that project'} for `--mode vr`.")}
+        if not started:
+            out["error"] = "StartPIE returned false (no editor world?)"
+        return out
+    res = json.loads(raw) if isinstance(raw, str) else (raw or {})
+    out = {"ok": bool(res.get("ok", False)), "mode": res.get("mode", mode), "result": res}
+    if not out["ok"]:
+        out["error"] = res.get("error", "StartPIEMode failed")
+    return out
+
+
 def _pie(args) -> int:
     """Start/stop PIE via the plugin's version-correct RC verbs (StartPIE/StopPIE/IsInPIE),
     so agents never touch the raw, version-fragile engine subsystem."""
@@ -464,18 +558,7 @@ def _pie(args) -> int:
     body: dict = {"ok": True}
     try:
         if sub == "start":
-            # --mode vr uses the editor's VR Preview, i.e. the HMD code path: OpenXR input
-            # and every IsHeadMountedDisplayEnabled() branch. Flat PIE takes neither, so an
-            # HMD-only bug is invisible there. StartPIEMode refuses "vr" with a concrete
-            # reason when no headset is connected rather than silently starting flat PIE.
-            mode = getattr(args, "mode", "flat") or "flat"
-            raw = _rc_call("StartPIEMode", {"Mode": mode}, args.project)
-            res = json.loads(raw) if isinstance(raw, str) else (raw or {})
-            body["mode"] = res.get("mode", mode)
-            body["result"] = res
-            body["ok"] = bool(res.get("ok", False))
-            if not body["ok"]:
-                body["error"] = res.get("error", "StartPIEMode failed")
+            body.update(_pie_start(getattr(args, "mode", "flat") or "flat", args.project))
         elif sub == "stop":
             body["result"] = _rc_call("StopPIE", {}, args.project)
         elif sub == "wait":
@@ -495,6 +578,14 @@ def _pie(args) -> int:
     return 0 if body["ok"] else 1
 
 
+# What each newer verb is FOR, quoted back to the caller when the plugin lacks it. No older
+# verb does any of these jobs, so the answer is always "rebuild", never a fallback: a single
+# InjectKey is not a hold, and an exec round-trip cannot sample per frame.
+_NEEDS_HOLD = "sustained in-engine input; a single injected event is not a hold"
+_NEEDS_SAMPLE = "per-frame property sampling; an exec round-trip cannot see a sub-second window"
+_NEEDS_LOG = "reading the editor log ring buffer through the plugin"
+
+
 def _input(args) -> int:
     """Sustained input. A single injected event cannot drive locomotion: the CLI round-trip is
     ~1s and a latched key is silently dropped by any FlushPressedKeys, so the plugin re-asserts
@@ -510,14 +601,16 @@ def _input(args) -> int:
         # that does not exist. Pass the plugin's own message through.
         if sub == "hold":
             body.update(_rc_json("HoldKey", {"KeyName": args.key, "Seconds": args.seconds},
-                                 args.project))
+                                 args.project, needs=_NEEDS_HOLD))
         elif sub == "axis":
             body.update(_rc_json("HoldAxis", {"AxisKeyName": args.key, "Value": args.value,
-                                              "Seconds": args.seconds}, args.project))
+                                              "Seconds": args.seconds}, args.project,
+                                 needs=_NEEDS_HOLD))
         elif sub == "release":
-            body.update(_rc_json("ReleaseHeldInput", {"KeyName": args.key or ""}, args.project))
+            body.update(_rc_json("ReleaseHeldInput", {"KeyName": args.key or ""}, args.project,
+                                 needs=_NEEDS_HOLD))
         else:  # status
-            body.update(_rc_json("GetHeldInput", {}, args.project))
+            body.update(_rc_json("GetHeldInput", {}, args.project, needs=_NEEDS_HOLD))
 
         # Non-blocking by default: the hold runs IN-ENGINE, so the point is to sample game
         # state while it is still held. --wait blocks until it expires instead.
@@ -573,10 +666,10 @@ def _sample(args) -> int:
     t0 = time.monotonic()
     body: dict = {"ok": True, "object": args.object, "property": args.property}
     try:
-        raw = _rc_call("StartPropertySample",
-                       {"ObjectPath": args.object, "PropertyPath": args.property,
-                        "Seconds": args.seconds, "MaxSamples": args.max_samples},
-                       args.project)
+        raw = _rc_require("StartPropertySample",
+                          {"ObjectPath": args.object, "PropertyPath": args.property,
+                           "Seconds": args.seconds, "MaxSamples": args.max_samples},
+                          args.project, _NEEDS_SAMPLE)
         start = json.loads(raw) if isinstance(raw, str) else (raw or {})
         if not start.get("ok"):
             body = {"ok": False, "error": start.get("error", "StartPropertySample failed"),
@@ -586,7 +679,7 @@ def _sample(args) -> int:
             body["hint"] = "sampling in-engine; read it with `uap sample read`"
         else:
             time.sleep(args.seconds + 0.25)
-            raw = _rc_call("ReadPropertySample", {}, args.project)
+            raw = _rc_require("ReadPropertySample", {}, args.project, _NEEDS_SAMPLE)
             body.update(json.loads(raw) if isinstance(raw, str) else (raw or {}))
             body["stats"] = _sample_stats(body.get("samples") or [])
             if args.summary:
@@ -603,7 +696,7 @@ def _sample_read(args) -> int:
     t0 = time.monotonic()
     body: dict = {"ok": True}
     try:
-        raw = _rc_call("ReadPropertySample", {}, args.project)
+        raw = _rc_require("ReadPropertySample", {}, args.project, _NEEDS_SAMPLE)
         body.update(json.loads(raw) if isinstance(raw, str) else (raw or {}))
         body["stats"] = _sample_stats(body.get("samples") or [])
         if args.summary:
@@ -627,20 +720,20 @@ def _log(args) -> int:
     body: dict = {"ok": True}
     try:
         if sub == "cursor":
-            body["cursor"] = int(_rc_call("GetLogCursor", {}, args.project) or 0)
+            body["cursor"] = int(_rc_require("GetLogCursor", {}, args.project, _NEEDS_LOG) or 0)
         else:
             # `log since <cursor>` and `log since --since <cursor>` both work: the docs and
             # every natural reading use the positional form, so rejecting it was a trap.
             positional = getattr(args, "cursor", None)
             after = positional if positional is not None else args.since
             if sub == "tail":
-                current = int(_rc_call("GetLogCursor", {}, args.project) or 0)
+                current = int(_rc_require("GetLogCursor", {}, args.project, _NEEDS_LOG) or 0)
                 after = max(0, current - args.lines)
-            raw = _rc_call("GetLogsSince",
-                           {"AfterCursor": after, "MaxLines": args.lines,
-                            "CategoryFilter": args.category,
-                            "MinVerbosity": args.verbosity},
-                           args.project)
+            raw = _rc_require("GetLogsSince",
+                              {"AfterCursor": after, "MaxLines": args.lines,
+                               "CategoryFilter": args.category,
+                               "MinVerbosity": args.verbosity},
+                              args.project, _NEEDS_LOG)
             parsed = json.loads(raw) if isinstance(raw, str) else (raw or {})
             lines = parsed.get("lines") or []
             if args.grep:
@@ -671,9 +764,12 @@ def _helpers_payload(project: "str | None") -> list:
     """
     try:
         raw = _rc_call("ListTestHelpersJson", {}, project)
-    except AgentError:
+    except AgentError as exc:
         # Plugin predates the JSON twin (CLI pulled, editor not rebuilt yet). Fall back so the
-        # verb still runs, and say plainly why the fields are missing.
+        # verb still runs, and say plainly why the fields are missing. Only on an unresolvable
+        # verb: an unreachable editor has to stay an unreachable editor, not "old plugin".
+        if not _is_missing_verb(exc):
+            raise
         legacy = _rc_call("ListTestHelpers", {}, project)
         raise AgentError(
             ErrorCode.UE_OBJECT_NOT_FOUND,
@@ -712,6 +808,9 @@ def _helpers(args) -> int:
     return 0 if body["ok"] else 1
 
 
+_NEEDS_UI = "reading/driving on-screen UI (read-ui, click, tab, nav)"
+
+
 def _find_clickable(elements: list, label: str) -> "dict | None":
     """Choose the on-screen element to click for a label: exact (case-insensitive) match
     first, then a substring match. Returns the element dict (with x/y) or None."""
@@ -731,7 +830,7 @@ def _click(args) -> int:
     t0 = time.monotonic()
     body: dict = {"ok": True, "label": args.label}
     try:
-        ui_raw = _rc_call("DumpViewportUI", {}, args.project)
+        ui_raw = _rc_require("DumpViewportUI", {}, args.project, _NEEDS_UI)
         ui = json.loads(ui_raw) if isinstance(ui_raw, str) else (ui_raw or {})
         elements = ui.get("texts") or []
         match = _find_clickable(elements, args.label)
@@ -757,7 +856,7 @@ def _tab(args) -> int:
     t0 = time.monotonic()
     body: dict = {"ok": True, "tab": args.tab_id}
     try:
-        ok = bool(_rc_call("SelectTab", {"TabId": args.tab_id}, args.project))
+        ok = bool(_rc_require("SelectTab", {"TabId": args.tab_id}, args.project, _NEEDS_UI))
         body["ok"] = ok
         if not ok:
             body["error"] = (f"no tab '{args.tab_id}' on a live CommonUI tab list "
@@ -775,7 +874,8 @@ def _nav(args) -> int:
     t0 = time.monotonic()
     body: dict = {"ok": True, "direction": args.direction}
     try:
-        body["handled"] = bool(_rc_call("NavigateUI", {"Direction": args.direction}, args.project))
+        body["handled"] = bool(_rc_require("NavigateUI", {"Direction": args.direction},
+                                           args.project, _NEEDS_UI))
     except AgentError as exc:
         body = _err(exc)
     _capture("nav", {"direction": args.direction}, body, int((time.monotonic() - t0) * 1000))
@@ -787,7 +887,7 @@ def _read_ui(args) -> int:
     t0 = time.monotonic()
     body: dict = {"ok": True}
     try:
-        body["ui"] = _rc_call("DumpViewportUI", {}, args.project)
+        body["ui"] = _rc_require("DumpViewportUI", {}, args.project, _NEEDS_UI)
     except AgentError as exc:
         body = _err(exc)
     _capture("read-ui", {}, body, int((time.monotonic() - t0) * 1000))
@@ -812,7 +912,8 @@ def _screenshot_body(file: str, exists: bool) -> dict:
 def _screenshot(args) -> int:
     t0 = time.monotonic()
     try:
-        _rc_call("CaptureViewportWithUI", {"Filename": args.file}, args.project)
+        _rc_require("CaptureViewportWithUI", {"Filename": args.file}, args.project,
+                    "capturing the viewport WITH its UMG/Slate UI")
         deadline = time.monotonic() + 8.0
         while time.monotonic() < deadline and not os.path.exists(args.file):
             time.sleep(0.25)
@@ -853,6 +954,11 @@ COMMON MISTAKES (don't)
     lease); never kill/msbuild the editor by hand. `uap` editor ops auto-WAIT through another agent's
     rebuild (they block then resume -- a slow call is not an error). Hold PIE/level across calls with
     `uap lease acquire exclusive --reason pie --agent <tok>` ... `uap lease release --agent <tok>`.
+  * The CLI is SHARED by every project; each project vendors its OWN plugin copy, so a project
+    that has not synced+rebuilt is behind this CLI. A verb its plugin lacks now answers "this
+    editor's plugin has no <Verb> ... sync and rebuild <project>" -- that is a TOOLING version
+    gap, not a broken editor and not a product bug. Flat `pie start` degrades to the legacy
+    verb automatically; `--mode vr`, `input hold/axis`, `sample` and `helpers` cannot and say so.
   * `uap exec` runs IN-PROCESS: a bad call can HARD-CRASH the editor (taking RC + your run down).
     Known landmine: the engine's `DataTableFunctionLibrary.ExportDataTableToJSONString` check()-
     crashes on some row-struct shapes (JsonWriter assert "Stack.Top() == EJson::Object"). To read a
@@ -874,7 +980,9 @@ PLAY-IN-EDITOR
   uap pie start                   start PIE (version-correct; do NOT use PlayWorldEditorSubsystem)
   uap pie start --mode vr         start VR PREVIEW instead -- the HMD code path (OpenXR input,
                                   IsHeadMountedDisplayEnabled branches). Flat PIE takes neither,
-                                  so an HMD-only bug looks absent there. Needs a connected headset.
+                                  so an HMD-only bug looks absent there. Needs a connected headset,
+                                  and a plugin copy new enough to have StartPIEMode -- it REFUSES
+                                  on an older one rather than quietly giving you flat PIE.
   uap pie wait <seconds>          block until the game world is live
   uap pie stop
 

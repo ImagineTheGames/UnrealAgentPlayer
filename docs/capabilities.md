@@ -43,6 +43,8 @@ Use this first — it tells the agent whether the editor is up and which channel
 
 `uap pie start --mode vr` requests `EPlaySessionPreviewType::VRPreview`. It **requires a connected headset** and fails with a concrete reason when there is none (`no XR system loaded` / `no HMD connected`) rather than silently starting flat PIE — a silent fallback would make an HMD-only bug look absent.
 
+It also **requires a plugin copy new enough to export `StartPIEMode`**. Against an older copy the CLI refuses with "sync and rebuild <project>" rather than falling back to `StartPIE`, which can only start flat PIE. Flat `uap pie start` *does* fall back to `StartPIE` automatically, since that starts the identical session -- see "CLI/plugin version skew" below.
+
 State reads, `exec`, `read-ui` and screenshots behave the same in VR Preview as in flat PIE: they address the same PIE world and game viewport. The visible difference is the render path (stereo, spectator screen) and the input device set.
 
 ---
@@ -329,3 +331,15 @@ The C++ functions on `UAPAgentSubsystem`, callable directly over Remote Control:
 The same surface (minus the editor-only PIE and focus verbs) exists on `UAPAgentRuntimeSubsystem` for standalone `-game` processes.
 
 New tools can be added in the Python layer over `exec_python` and the existing UFUNCTIONs **without recompiling the engine**; only genuinely new in-process capabilities require a plugin change.
+
+### CLI/plugin version skew
+
+Every project vendors its **own copy** of the plugin, while all of them share **one** CLI (each project's `uap.ps1` resolves this repo). The CLI therefore updates the instant it is pulled; a plugin copy only catches up when that project syncs and **rebuilds**. Skew is permanent and expected.
+
+A verb the plugin does not export is not a preset field, so RemoteControl answers `404 "Unable to resolve the preset field."` -- which reads like a broken editor. Rules for anyone adding a verb here:
+
+- Never call a new verb bare from the CLI. Route it through `_rc_require(func, params, project, needs)` (or `_rc_json(..., needs=...)`), which reports "this editor's plugin has no `<Verb>` ... sync and rebuild `<project>`".
+- Fall back to an older verb **only** when it answers the same question (flat `pie start` -> `StartPIE`; `helpers` -> `ListTestHelpers`). Never fall back to a verb that answers a *different* question -- that is why `--mode vr` refuses.
+- Only a 404 is skew. A verb that exists and fails answers HTTP 200 with its own result, so a real failure is never masked by a fallback.
+
+See known-issues #23.

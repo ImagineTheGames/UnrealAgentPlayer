@@ -41,13 +41,83 @@ These are the errors agents make every time. Don't.
    (`report finish pass` with no verified shot auto-downgrades to FAIL. Opt out only for a
    genuinely headless check: `report start --no-require-screenshot`.)
 6. **Discover verbs with `uap help`** -- do not reverse-engineer by dumping `dir()` on the subsystem.
-7. **`uap exec` runs IN-PROCESS -- a bad call HARD-CRASHES the editor** (kills RC + your run, not
+7. **"this editor's plugin has no `<Verb>` ... sync and rebuild `<project>`" is a TOOLING version
+   gap, not a broken editor and not a product bug.** The `uap` CLI is shared by every project while
+   each project vendors its own plugin copy, so a project that has not synced+rebuilt is behind the
+   CLI. Flat `uap pie start` degrades to the legacy verb by itself; `--mode vr`, `uap input
+   hold/axis`, `uap sample` and helper NAMES cannot -- they need the rebuild (`Restart-Editor.ps1`
+   plus a re-sync of the vendored plugin copy). Never re-run it as if it were flaky.
+8. **`uap exec` runs IN-PROCESS -- a bad call HARD-CRASHES the editor** (kills RC + your run, not
    just your command). Known landmine: the engine's
    `DataTableFunctionLibrary.ExportDataTableToJSONString` `check()`-crashes on some row-struct
    shapes (`JsonWriter` assert `Stack.Top() == EJson::Object`). **To read a DataTable, iterate
    rows** (`get_editor_property('row_names')` / row handles + per-row property reads) -- **never**
    `ExportDataTableToJSONString`. Treat any whole-asset `...ToJSONString` exporter as unsafe, and
    prefer `blueprint-mcp` / asset-author tools for inspecting assets rather than runtime `exec`.
+
+## Layer mismatches -- three traps that silently give you a WRONG answer
+
+These are **not flaky tools -- they are layer mismatches**. Each one fails because the test is
+operating at a different layer than the thing being tested: below Slate, outside the focused
+window, outside the game window. Name the layer you are testing at and you can predict the NEXT
+trap instead of memorising three.
+
+All three fail **silently**, and all three look like product bugs rather than tooling limits --
+each has already produced a false conclusion (a filed AI-behaviour ticket that was not real; a
+"still broken" verdict on a fix that was working). **State queries are unaffected by all three**:
+when you can read engine state instead of simulating input and inferring from what you see, do that.
+
+### 1. An unfocused editor throttles to exactly 3.0 fps -- every timing number taken then is void
+
+- **Failure mode:** the editor is not the foreground window, so it runs at 3.0 fps and any
+  timing-based measurement is meaningless. Nothing warns you; the numbers just come back wrong.
+- **What it cost:** an AI chase observed at 3 fps looked like broken pursuit behaviour. A ticket
+  was filed off that observation and later closed as not-real.
+- **Blast radius:** anything measured in seconds or per-frame from OUTSIDE the engine -- "did it
+  reach me within 4s", "does it judder", any stopwatch wrapped around CLI calls.
+- **Do instead:** force PIE window focus, then **confirm the frame rate in-engine BEFORE recording
+  any number** -- read `WorldDeltaSeconds`, or check the `hz` a sampler window reports for itself.
+  `Slate.bAllowThrottling 0` alone is **NOT** sufficient; foreground focus is the actual gate.
+- **Immune:** `uap sample` and `uap input hold` / `uap input axis` run entirely in-engine and need
+  no CLI calls during the measurement window. A sampler that comes back at ~3 Hz is itself telling
+  you the editor was throttled.
+
+### 2. `InjectKey` never reaches Slate input pre-processors or focus handlers
+
+- **Failure mode:** you inject a key, nothing happens, and it looks exactly like the feature is
+  broken. No error, no warning -- the input simply never enters that layer.
+- **Why:** `InjectKey` enters BELOW the Slate pre-processor chain. Anything registered via
+  `RegisterInputPreProcessor`, and anything depending on Slate focus routing, never sees it.
+  Concrete example: `FPBWAnalogCursor : FAnalogCursor` registered as an `IInputProcessor` -- the
+  entire virtual cursor is invisible to injected input.
+- **Not a blanket limitation:** `InjectKey` works fine for gameplay input routed through Enhanced
+  Input -- driving menus, firing actions, triggering bound gameplay keys. It fails at ONE layer:
+  Slate pre-processors and Slate focus routing. If what you are testing is a bound gameplay action,
+  inject away; if it is cursor movement, focus, or anything registered as an input pre-processor,
+  injection will never reach it.
+- **Blast radius:** analog/virtual cursors, focus rings, CommonUI focus targets,
+  activatable-widget navigation, anything gated on `HasFocusedDescendants`.
+- **What it cost:** an agent testing the cursor with `InjectKey` would have reported "still broken"
+  on a fix that was actually working -- avoided only because the trap was already documented from
+  an earlier encounter. The cost was paid once; the note is what saved the second run.
+- **Do instead:** real OS input (`keybd_event`) to the PIE window, OR skip input simulation
+  entirely and query engine state -- for focus questions, reading `GetDesiredFocusTarget()` and
+  `HasFocusedDescendants` is more reliable than synthesising a keypress and inferring from what
+  you see.
+
+(Firsthand from the Project Broken Wings director, who hit it first: "we hit it, lost a cycle, and
+wrote it down -- no cleverness involved.")
+
+### 3. `uap screenshot` captures only the editor viewport
+
+- **Failure mode:** you screenshot to verify something in a separate **Standalone** PIE window and
+  get the editor viewport instead -- often a plausible-looking but WRONG image, which is worse than
+  a blank one, because you will believe it.
+- **Do instead:** an OS `PrintWindow` capture of the target window (find the window by title, then
+  `PrintWindow` it). Project Broken Wings keeps a `Tools/Capture-Window.ps1` for exactly this; the
+  technique is the portable part, not the script.
+- **Worth knowing:** `PrintWindow` also works while the game is **PAUSED**, which the viewport path
+  does not -- useful when you need to freeze a frame to inspect it.
 
 ## The bridge is the `uap` CLI
 

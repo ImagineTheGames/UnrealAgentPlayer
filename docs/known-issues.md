@@ -479,9 +479,65 @@ rebuild, and the copy vendored into the game depot (P4 CL 1734) must be re-synce
 Also fixed in the same pass: `uap help` documented `log since <cursor>` positionally while
 argparse only accepted `--since`. Both forms now work, and the docs use the positional one.
 
+## 23. A new plugin verb in the shared CLI 404'd every project that had not rebuilt -- FIXED
+
+Was: `uap pie start` called the NEW `StartPIEMode` verb (#20) unconditionally. Every project
+vendors its OWN copy of the plugin, but they all share ONE CLI -- each project's `uap.ps1` resolves
+the same repo -- so the CLI updates the moment it is pulled while a plugin copy only catches up
+when that project syncs and REBUILDS. A project whose copy predates the verb got:
+
+```
+Remote Control preset call returned 404: "Unable to resolve the preset field."
+```
+
+which reads like a broken editor rather than a tooling version gap, and cost a teammate on another
+project an afternoon (ClickUp 86ak7hk07). **CLI/plugin skew is permanent and expected, not a
+transient state**, and the CLI has to be written for it.
+
+Fixed, and this is the rule for anyone adding a plugin verb:
+
+1. **Never call a new verb bare.** Route it through `_rc_require(func, params, project, needs)`,
+   which turns RemoteControl's 404 into `this editor's plugin has no <Verb> (<what it is for>) ...
+   sync and rebuild <project> (Restart-Editor.ps1)`. `_rc_json(..., needs=...)` does the same for
+   the JSON-envelope verbs.
+2. **Fall back only to a verb that answers the SAME question.** Flat `pie start` falls back to the
+   legacy `StartPIE` -- an identical session -- and says in the result that it did (`via`, `note`).
+   `pie start --mode vr` REFUSES instead: `StartPIE` can only start FLAT PIE, and quietly giving
+   flat when `vr` was asked for hides exactly the HMD-only bugs `--mode vr` exists to find (#20).
+   `helpers` falls back to the legacy `ListTestHelpers` on the same terms (#17).
+3. **Skew is a 404; a failure is not.** `_is_missing_verb` keys on the 404 STATUS from the
+   preset-call endpoint, which can only mean "preset or field unresolvable". A verb that exists and
+   refuses answers HTTP 200 with its own envelope (or `false`), so a genuine failure never reaches
+   the fallback path and can never be masked by it. Tests pin both halves, plus the third case: a
+   transport failure (unreachable editor) must not be reported as an old plugin.
+
+Guarded verbs -- everything added after the initial plugin release: `StartPIEMode`, `HoldKey`,
+`HoldAxis`, `ReleaseHeldInput`, `GetHeldInput`, `StartPropertySample`, `ReadPropertySample`,
+`ListTestHelpersJson`, `DumpViewportUI`, `SelectTab`, `NavigateUI`, `CaptureViewportWithUI`.
+
+CLI-only -- live on pull, no plugin rebuild needed. What a behind project still needs the rebuild
+for is unchanged: `pie start --mode vr`, `input hold/axis/release/status`, `sample`, and helper
+names (`helpers` / `rc ListTestHelpers`). Flat `pie start`, `log`, `read-ui`, `click`, `tab`, `nav`
+and `screenshot` keep working against an older copy.
+
+## 24. Three tooling traps that silently produce a WRONG answer -- GUIDANCE
+
+Found the hard way on 2026-08-28 by two sessions on two different projects. Each one produced a
+false conclusion before it was caught. They are **not flaky tools -- they are layer mismatches**:
+the test operates at a different layer than the thing being tested (below Slate, outside the
+focused window, outside the game window). All three fail silently and look like product bugs.
+
+1. An unfocused editor throttles to exactly 3.0 fps, voiding every timing measurement.
+2. `InjectKey` never reaches Slate input pre-processors or focus handlers.
+3. `uap screenshot` captures only the editor viewport, not a separate Standalone window.
+
+State queries are unaffected by all three. Full write-up, with the failure mode and the
+do-instead for each, is in the kit docs that ship INTO each project:
+`agent-testing/agentplayertest.md` ("Layer mismatches") and `agent-testing/AGENTS-snippet.md`.
+
 ## Status
 
-Items 1-9, 11, 13-22 resolved (1 and 5 doc fixes; 2, 3, 4, 7, 8, 9, 14 code changes; 6 reporting;
+Items 1-9, 11, 13-23 resolved (1 and 5 doc fixes; 2, 3, 4, 7, 8, 9, 14 code changes; 6 reporting;
 11 config pin; 13 coordination lease; 15-22 from the 2026-08-27 verification session). Items 10 and
 12 are guidance -- both are engine-side crashes surfaced through `exec` (a DataTable exporter bug;
 game-thread re-entrancy during PIE transitions).
@@ -495,3 +551,5 @@ tests only -- a transport reset is not reproducible on demand.
 Item 22 was found by that same run and is FIXED but NOT yet re-verified live. It changes C++, so
 it needs a **plugin rebuild** (via `Restart-Editor.ps1`) and a re-sync of the plugin copy vendored
 into the game depot (P4 CL 1734). Its `log since` half is CLI-only and live on pull.
+
+Item 23 is CLI-only (covered by unit tests; live on pull, no rebuild) and item 24 is guidance.

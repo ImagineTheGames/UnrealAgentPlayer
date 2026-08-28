@@ -37,5 +37,31 @@ and renders an HTML report.
   catalog + recipes -- don't reverse-engineer by dumping `dir()` on the subsystem.
 - For a UI screenshot use `uap screenshot <abs.png>` (composites 3D + UMG + CommonUI + Slate).
   Do NOT use HighResShot or the MCP screenshot tool -- those capture the 3D scene only, no UI.
+- **Three tooling traps that silently give a WRONG answer.** They are not flaky tools, they are
+  LAYER MISMATCHES -- the test runs at a different layer than the thing being tested (below Slate,
+  outside the focused window, outside the game window). All three look like product bugs. **State
+  queries are unaffected by all three** -- prefer reading engine state over simulating input and
+  inferring from what you see. Full write-up: the "Layer mismatches" section of
+  `.claude/commands/agentplayertest.md`.
+  - **An unfocused editor throttles to exactly 3.0 fps**, so any timing measured then is void (a
+    chase watched at 3 fps looked like broken AI and produced a ticket that was not real). Force
+    PIE window focus, then CONFIRM the rate in-engine (`WorldDeltaSeconds`, or the `hz` a sampler
+    reports) BEFORE recording a number. `Slate.bAllowThrottling 0` alone is NOT enough -- foreground
+    focus is the gate. `uap sample` / `uap input hold` are immune: no CLI calls during the window.
+  - **`InjectKey` never reaches Slate input pre-processors or focus handlers.** It enters below the
+    pre-processor chain, so anything registered via `RegisterInputPreProcessor` (e.g. an analog or
+    virtual cursor) and anything routed by Slate focus never sees it -- silently, which looks
+    exactly like a broken feature. Not a blanket limitation: it works fine for gameplay input
+    routed through Enhanced Input (menus, bound actions). It fails at ONE layer. For cursor, focus
+    or pre-processor work use real OS input (`keybd_event`) to the PIE window, or query state
+    instead (`GetDesiredFocusTarget()`, `HasFocusedDescendants`).
+  - **`uap screenshot` captures only the EDITOR viewport.** A separate Standalone PIE window is not
+    captured -- you get a plausible-looking image of the wrong thing. Use an OS `PrintWindow`
+    capture of that window, which also works while the game is PAUSED.
+- **"this editor's plugin has no `<Verb>` ... sync and rebuild `<project>`" is a TOOLING version
+  gap**, not a broken editor and not a product bug: the `uap` CLI is shared by every project while
+  each project vendors its own plugin copy. Flat `uap pie start` degrades to the legacy verb on its
+  own; `pie start --mode vr`, `uap input hold/axis`, `uap sample` and helper NAMES need the plugin
+  rebuilt for this project. Do not retry it as if it were flaky.
 - Run the CLI via this project's `uap.ps1` so commands target THIS editor; calling it with no
   `--project` while another editor is open cross-targets the wrong one.

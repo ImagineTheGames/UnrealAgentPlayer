@@ -376,3 +376,101 @@ def test_transport_errors_surface_a_machine_readable_code(monkeypatch, capsys):
     assert body["code"] == "UE_CONNECTION_RESET"
     assert body["retryable"] is True
     assert body["retry_hint"] == "retry"
+
+
+# --- CLI/plugin version skew ------------------------------------------------------------
+# Every project vendors its own plugin copy while sharing ONE CLI, so a CLI that calls a new
+# verb unconditionally breaks every project that has not synced+rebuilt. These pin the two
+# halves of the contract: skew degrades or is named, a REAL failure is never masked.
+
+_RC_404 = 'Remote Control preset call returned 404: "Unable to resolve the preset field."'
+
+
+def _missing(*funcs):
+    """Table entry that 404s exactly like RemoteControl does for an unexported UFUNCTION."""
+    def raise_404(_params):
+        raise AgentError(ErrorCode.UE_UNREACHABLE, _RC_404, recoverable=False)
+    return {f: raise_404 for f in funcs}
+
+
+def test_pie_start_flat_falls_back_when_plugin_predates_start_pie_mode(monkeypatch, capsys):
+    """An older plugin copy has StartPIE but not StartPIEMode. Flat PIE is the SAME session
+    either way, so it must keep working instead of surfacing a raw 404."""
+    seen = _stub_rc(monkeypatch, {**_missing("StartPIEMode"), "StartPIE": True})
+    assert cli.main(["pie", "start"]) == 0
+    body = _out(capsys)
+    assert body["ok"] and body["mode"] == "flat" and body["via"] == "StartPIE"
+    assert [c[0] for c in seen] == ["StartPIEMode", "StartPIE"]
+    # The fallback must not be silent: say the plugin is behind and what to do about it.
+    assert "rebuild" in body["note"].lower()
+
+
+def test_pie_start_vr_refuses_instead_of_falling_back_to_flat(monkeypatch, capsys):
+    """Flat PIE is not a substitute for VR Preview -- it takes neither the OpenXR path nor any
+    IsHeadMountedDisplayEnabled() branch, so a silent downgrade hides exactly the bugs
+    --mode vr exists to find. StartPIE must never be called here."""
+    seen = _stub_rc(monkeypatch, _missing("StartPIEMode"))   # StartPIE would raise "unexpected"
+    assert cli.main(["pie", "start", "--mode", "vr", "--project", "PBW"]) == 1
+    body = _out(capsys)
+    assert [c[0] for c in seen] == ["StartPIEMode"]
+    assert "404" not in body["error"]
+    assert "StartPIEMode" in body["error"] and "rebuild PBW" in body["error"]
+    assert body["retryable"] is False
+
+
+def test_pie_start_real_failure_is_not_masked_by_the_fallback(monkeypatch, capsys):
+    """The verb EXISTS and refused (HTTP 200 + an ok:false envelope). That is a real error --
+    retrying it through the legacy verb would turn a refusal into a fake success."""
+    seen = _stub_rc(monkeypatch, {"StartPIEMode": json.dumps(
+        {"ok": False, "mode": "flat", "error": "no editor world"})})
+    assert cli.main(["pie", "start"]) == 1
+    assert [c[0] for c in seen] == ["StartPIEMode"]
+    assert _out(capsys)["error"] == "no editor world"
+
+
+def test_pie_start_transport_failure_is_not_mistaken_for_skew(monkeypatch, capsys):
+    """A dead editor is not an old plugin. Only an unresolvable-field 404 is skew."""
+    def dead(_params):
+        raise AgentError(ErrorCode.UE_UNREACHABLE, "Could not reach Remote Control at :30010")
+    seen = _stub_rc(monkeypatch, {"StartPIEMode": dead})
+    assert cli.main(["pie", "start"]) == 1
+    assert [c[0] for c in seen] == ["StartPIEMode"]
+    assert "Could not reach" in _out(capsys)["error"]
+
+
+@pytest.mark.parametrize("argv,func", [
+    (["input", "hold", "W", "--seconds", "1"], "HoldKey"),
+    (["input", "axis", "Gamepad_LeftX", "1.0", "--seconds", "1"], "HoldAxis"),
+    (["input", "release"], "ReleaseHeldInput"),
+    (["input", "status"], "GetHeldInput"),
+    (["sample", "start", "/Obj", "Velocity", "--seconds", "1"], "StartPropertySample"),
+    (["sample", "read"], "ReadPropertySample"),
+    (["log", "cursor"], "GetLogCursor"),
+    (["read-ui"], "DumpViewportUI"),
+    (["tab", "Settings"], "SelectTab"),
+    (["nav", "down"], "NavigateUI"),
+])
+def test_newer_verbs_name_the_skew_instead_of_leaking_a_404(argv, func, monkeypatch, capsys):
+    """No older verb answers these questions, so there is nothing to fall back to -- but the
+    CLI still must not hand back RemoteControl's 404, which reads as a broken editor."""
+    _stub_rc(monkeypatch, _missing(func))
+    assert cli.main(argv + ["--project", "PBW"]) == 1
+    err = _out(capsys)["error"]
+    assert func in err and "rebuild PBW" in err and "404" not in err
+
+
+def test_helpers_transport_failure_is_not_reported_as_an_old_plugin(monkeypatch, capsys):
+    """ListTestHelpersJson has a legacy twin, so it DOES fall back -- but only on a 404."""
+    def dead(_params):
+        raise AgentError(ErrorCode.UE_UNREACHABLE, "Could not reach Remote Control at :30010")
+    seen = _stub_rc(monkeypatch, {"ListTestHelpersJson": dead})
+    assert cli.main(["helpers"]) == 1
+    assert [c[0] for c in seen] == ["ListTestHelpersJson"]      # legacy twin not attempted
+    assert "Could not reach" in _out(capsys)["error"]
+
+
+def test_helpers_falls_back_and_explains_on_a_404(monkeypatch, capsys):
+    _stub_rc(monkeypatch, {**_missing("ListTestHelpersJson"), "ListTestHelpers": [{}, {}]})
+    assert cli.main(["helpers"]) == 1
+    err = _out(capsys)["error"]
+    assert "ListTestHelpersJson" in err and "Rebuild the plugin" in err
