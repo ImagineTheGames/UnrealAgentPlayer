@@ -27,6 +27,13 @@ default rule set, so the hook said "clean" and CI failed on the identical comman
 now pins `ruff==0.16.5` exactly. If you add a local gate, pin what it runs -- and if you bump the
 pin, run `ruff check src tests` before pushing, because the new version is allowed to disagree.
 
+Two more of the same shape were hiding behind that lint failure, both invisible locally.
+`mcp>=1.2.0` let CI resolve mcp 2.x, which renamed the 1.x `inputSchema` field every Tool in
+`registry.py` is built with - now bounded `<2`. And the installer tests run `pwsh` in CI but
+fall back to Windows PowerShell 5.1 on a machine without it; 5.1 accepts a bare backtick-u in
+a double-quoted string that pwsh 7.2+ rejects as a parse error, so a broken `Install-AgentTest.ps1`
+passed here and failed there. That fallback now warns instead of standing in silently.
+
 ## The shape of this repo, and why it bites
 
 A CLI change is live in every project the moment someone pulls. A plugin change reaches a
