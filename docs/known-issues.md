@@ -90,6 +90,16 @@ to record the game's frame rate. `report finish` warns when env is empty. Verifi
 perf populated (e.g. `frame_ms 333.33, draw_ms 5.57, gpu_ms 11.81, fps 3.0` -- the low fps was the
 editor's background-CPU throttle, captured truthfully).
 
+Follow-up (2026-08-28): captured truthfully was not enough. Agents kept reading that `fps 3.0` as a
+finding about the GAME -- one filed a bug ticket off timing measured in a throttled editor -- because
+at the moment they see the number they are not reading the docs. So every surface that reports a
+frame rate now explains itself: `report diag`, `perf_stat`, both perf baselines and `uap sample`
+(off the sampler's own `hz`) return `throttled: true` plus a `warning` when the rate is at or below
+5 fps, and the HTML report renders the same warning in Overview + Diagnostics so a human reading the
+run later cannot repeat the mistake second-hand. Threshold rationale and the exact text live in
+`mcp-server/src/unreal_agent_player/throttle.py`; the underlying trap is #1 in
+`agent-testing/agentplayertest.md`. CLI-side only -- no plugin rebuild needed.
+
 ## 7. Two editors could not both run RemoteControl (port 30010 collision) -- FIXED
 
 Was: RC HTTP is a single bind on port 30010 with no fallback. A second editor failed to bind

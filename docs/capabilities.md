@@ -197,6 +197,8 @@ One series at a time; a new `start` replaces the old. Windows are clamped to 60s
 | `perf_stat` | Parse `stat unit` / `stat fps` — frame, game, draw, GPU, and render-thread milliseconds. Draw/GPU/RT come from real engine timers (`GGPUFrameTime`, `GRenderThreadTime`), not estimates. |
 | `perf_trace_start` / `perf_trace_stop` | Start/stop an Unreal Insights trace. |
 
+Every frame-rate surface here (`perf_stat`, both baselines below, plus `uap report diag` and `uap sample` on the CLI) annotates its own result when the measured rate is at or below **5 fps** (`throttled: true` + a `warning`): that band is the editor's not-foreground throttle, which pins exactly 3.0 fps, and is not a measurement of the game. The warning says to focus the PIE window and re-measure, that timing already taken is void, and what to do when focus cannot be taken. It is derived from `fps` / `frame_ms`, so the HTML report shows it too. Background: trap #1 in `agent-testing/agentplayertest.md`.
+
 ### Perf regression baselines
 
 | Tool | Purpose |

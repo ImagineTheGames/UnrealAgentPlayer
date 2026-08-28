@@ -15,6 +15,7 @@ from unreal_agent_player.reporting.render import render
 from unreal_agent_player.transport import RemoteControlClient, PythonRemoteExecClient
 from unreal_agent_player.errors import AgentError, ErrorCode
 from unreal_agent_player import coordination as _coord
+from unreal_agent_player import throttle as _throttle
 
 
 def _load_active() -> "sess.ReportSession | None":
@@ -154,6 +155,12 @@ def _report_diag(args) -> int:
                 s.set_perf(perf)
             body["env"] = env
             body["perf"] = perf
+            # A ~3 fps reading is the editor's not-foreground throttle, not the game. Say so
+            # HERE, in the output the agent is reading. The HTML report says it too, but
+            # render.py re-derives it from these same numbers rather than us writing a note --
+            # so it also fires for reports captured before this existed, and the agent's own
+            # notes stay its own evidence instead of carrying a tool warning twice.
+            body.update(_throttle.throttle_annotation(perf))
     except AgentError as exc:
         body = _err(exc)
     _capture("report:diag", {"project": args.project}, body, 0)
@@ -845,6 +852,7 @@ def _sample(args) -> int:
             raw = _rc_require("ReadPropertySample", {}, args.project, _NEEDS_SAMPLE)
             body.update(json.loads(raw) if isinstance(raw, str) else (raw or {}))
             body["stats"] = _sample_stats(body.get("samples") or [])
+            body.update(_throttle.sampler_annotation(body["stats"].get("hz")))
             if args.summary:
                 body.pop("samples", None)
     except (AgentError, json.JSONDecodeError) as exc:
@@ -862,6 +870,7 @@ def _sample_read(args) -> int:
         raw = _rc_require("ReadPropertySample", {}, args.project, _NEEDS_SAMPLE)
         body.update(json.loads(raw) if isinstance(raw, str) else (raw or {}))
         body["stats"] = _sample_stats(body.get("samples") or [])
+        body.update(_throttle.sampler_annotation(body["stats"].get("hz")))
         if args.summary:
             body.pop("samples", None)
     except (AgentError, json.JSONDecodeError) as exc:
@@ -1113,6 +1122,13 @@ COMMON MISTAKES (don't)
     remote-exec runs on the GAME THREAD and re-enters the engine task graph, HARD-CRASHING the editor
     (`RecursionGuard`, TaskGraph.cpp). Wait for PIE via the OS window (title has the project + "Preview")
     + a short settle delay, THEN exec/inject. Do NOT poll get_game_world() in a loop during startup.
+  * A frame rate at or below 5 fps is NOT a game measurement -- the editor throttles to exactly
+    3.0 fps whenever it is not the foreground window, and every timing taken then is void. uap
+    now says so on the number itself (`throttled`/`warning` on report diag, perf stats, baselines
+    and sample). Focus the PIE window and re-measure. If focus cannot be taken (SetForegroundWindow
+    returns False / GetForegroundWindow is 0; `Slate.bAllowThrottling 0` does NOT lift it), report
+    the timing as unmeasurable instead of using it -- `uap sample` and `uap input hold`/`axis`
+    still measure correctly, since they run in-engine with no CLI calls during the window.
   * Multiple agents share ONE editor. Rebuild ONLY via Restart-Editor.ps1 (it takes the exclusive
     lease); never kill/msbuild the editor by hand. `uap` editor ops auto-WAIT through another agent's
     rebuild (they block then resume -- a slow call is not an error). Hold PIE/level across calls with
@@ -1131,6 +1147,12 @@ COMMON MISTAKES (don't)
 PREFLIGHT
   uap status                      liveness + plugin version + resolved RC port
   uap report diag                 capture editor/level/PIE + frame perf into the report
+                                  A rate <= 5 fps comes back `throttled:true` + a `warning`:
+                                  that is the editor's NOT-FOREGROUND throttle (it pins ~3.0
+                                  fps), not the game. Focus the PIE window and re-measure;
+                                  timing already taken is void. Same flag on `sample` (its own
+                                  `hz`) and in the HTML report. Never report a sub-5-fps number
+                                  as a performance finding -- it is a tooling state.
 
 REPORT (a verification is NOT done until `report finish` emits the HTML report; cite its path)
   uap report start "<question>" [--no-require-screenshot]   # screenshot REQUIRED for pass by default

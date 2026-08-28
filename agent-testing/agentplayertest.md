@@ -97,6 +97,17 @@ the one most likely to be in code you wrote yourself.
 - **Immune:** `uap sample` and `uap input hold` / `uap input axis` run entirely in-engine and need
   no CLI calls during the measurement window. A sampler that comes back at ~3 Hz is itself telling
   you the editor was throttled.
+- **The tool now tells you at the number:** any uap surface that reports a frame rate (`report
+  diag`, `perf_stat`, the perf baselines, and `sample` via its own `hz`) answers `throttled: true`
+  plus a one-paragraph `warning` when the rate is at or below **5 fps** -- the throttle pins
+  exactly 3.0, and nothing real lives under 5. The HTML report renders the same warning, so a
+  human reading "fps 3.0" later cannot draw the wrong conclusion second-hand either.
+- **If focus CANNOT be taken** -- `SetForegroundWindow` returns False with `GetForegroundWindow()`
+  reporting 0 because your shell has no foreground window on this station, and `AttachThreadInput`,
+  a synthetic ALT and `SetWindowPos` TOPMOST all fail the same way (`Slate.bAllowThrottling 0` does
+  not lift it either) -- then say so and **report every timing-based conclusion as unmeasurable**.
+  Do not quietly use the numbers anyway. Non-timing work continues normally: state reads are
+  unaffected, and `uap sample` / `uap input hold` still drive and measure correctly in-engine.
 
 ### 2. `InjectKey` never reaches Slate input pre-processors or focus handlers
 
@@ -360,6 +371,11 @@ State the concrete pass condition before running. A non-zero speed with a frozen
    via `exec`, so it reads the RIGHT editor even when another squats the RC port). Run it once
    after start, and again WHILE PIE is live (step 5) to record the game's frame rate rather than
    the idle editor's. The report nags at finish if env is empty.
+   **If the perf it returns carries `throttled: true`, read its `warning` and act on it before
+   anything else** -- a rate at or below 5 fps is the editor's not-foreground throttle (trap #1
+   below), not a performance finding, and every timing already taken is void. The same flag rides
+   on `uap sample` (from the sampler's own `hz`) and is rendered into the HTML report, so a
+   throttled run cannot be quietly summarised as a slow game.
 4. **Scene**: `uap exec` to `load_level('/Game/...')` if the question implies a specific map;
    else use the open level and `uap report note "using level X"`.
 5. **Start PIE**: `uap pie start`, then `uap pie wait 12` -- blocks until the game world is

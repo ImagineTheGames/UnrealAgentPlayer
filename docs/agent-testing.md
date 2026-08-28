@@ -32,7 +32,12 @@ bone delta, log line) settle a question -- never a screenshot alone.
 - `uap report diag --project <X>` -- capture editor diagnostics (env: plugin version, level, PIE
   state) AND perf (frame_ms / draw_ms / gpu_ms / fps, from the plugin's GetStatGroupText) into the
   report via `exec` (reads the right editor even if another squats the RC port). Run it while PIE
-  is live for the game's frame rate.
+  is live for the game's frame rate. **A rate at or below 5 fps is answered on the spot:** the
+  result gains `throttled: true` + a `warning` saying it is the editor's not-foreground throttle
+  (it pins ~3.0 fps), not the game, and the same explanation is rendered into the HTML report.
+  Same annotation on `perf_stat`, on both perf baselines, and on `uap sample` when the sampler's
+  own `hz` comes back at that rate. Do not report a sub-5-fps number as a performance finding --
+  see trap #1 in `agent-testing/agentplayertest.md`.
 - `uap pie start [--mode flat|vr]` / `uap pie wait <sec>` / `uap pie stop [--timeout 30]` --
   start / await / stop Play-In-Editor (wraps the version-correct engine call; agents never touch
   the raw subsystem). **`start` and `stop` are deliberately asymmetric.** `start` only QUEUES the

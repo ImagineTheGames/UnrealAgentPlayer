@@ -50,6 +50,10 @@ and renders an HTML report.
     PIE window focus, then CONFIRM the rate in-engine (`WorldDeltaSeconds`, or the `hz` a sampler
     reports) BEFORE recording a number. `Slate.bAllowThrottling 0` alone is NOT enough -- foreground
     focus is the gate. `uap sample` / `uap input hold` are immune: no CLI calls during the window.
+    uap now says this AT the number: any rate <= 5 fps comes back `throttled:true` + a `warning`
+    (report diag, perf stats, baselines, and `sample` via its own `hz`), and the HTML report
+    renders it too. If focus cannot be taken at all (SetForegroundWindow False /
+    GetForegroundWindow 0), report the timing as UNMEASURABLE rather than using it.
   - **`InjectKey` never reaches Slate input pre-processors or focus handlers.** It enters below the
     pre-processor chain, so anything registered via `RegisterInputPreProcessor` (e.g. an analog or
     virtual cursor) and anything routed by Slate focus never sees it -- silently, which looks

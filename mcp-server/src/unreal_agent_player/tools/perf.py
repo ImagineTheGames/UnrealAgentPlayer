@@ -6,6 +6,7 @@ import tempfile
 from typing import Any
 
 from unreal_agent_player.errors import AgentError, ErrorCode
+from unreal_agent_player.throttle import throttle_annotation
 from unreal_agent_player.transport import RemoteControlClient, SUBSYSTEM_OBJECT_PATH
 
 
@@ -39,7 +40,11 @@ async def perf_stat(
     )
     raw = str(resp.get("ReturnValue", ""))
     parsed = _parse_unit(raw) if stat_group == "unit" else _parse_fps(raw)
-    return {"ok": True, "parsed": parsed, "raw": raw}
+    # An implausibly low rate is the editor's not-foreground throttle, not the game's
+    # performance. Explain it on the result itself -- the caller is looking at the number,
+    # not at the docs. Annotations sit beside `parsed`, never inside it, so baseline
+    # comparison keeps seeing a dict of pure numbers.
+    return {"ok": True, "parsed": parsed, "raw": raw, **throttle_annotation(parsed)}
 
 
 _TRACE_PATH = os.path.join(tempfile.gettempdir(), "uap_trace.utrace")

@@ -4,6 +4,8 @@ import html as _html
 import json
 from typing import Any
 
+from unreal_agent_player.throttle import THROTTLE_NOTE, is_throttled
+
 _CSS = """
 *{box-sizing:border-box}body{margin:0;font:14px/1.5 system-ui,Segoe UI,sans-serif;background:#0f1115;color:#e6e6e6}
 .header{padding:20px 28px}.header.status-pass{background:#13351f;border-bottom:3px solid #2ecc71}
@@ -26,6 +28,7 @@ tr.err td{background:#2a1414}.badge{font-size:11px;padding:1px 6px;border-radius
 .lb{position:fixed;inset:0;background:rgba(0,0,0,.9);display:none;align-items:center;justify-content:center}
 .lb.show{display:flex}.lb img{max-width:92%;max-height:92%}
 .sub{margin:18px 0 6px;font-weight:600;color:#cfd6df}.mono{font-family:Consolas,monospace}
+.warn{margin:12px 0;padding:10px 14px;background:#33301a;border-left:4px solid #d4af37;border-radius:4px;color:#f0e2a8}.warn b{color:#ffd966}
 """
 
 _JS = """
@@ -41,8 +44,18 @@ def _e(s: Any) -> str:
     return _html.escape(str("" if s is None else s))
 
 
+def _throttle_banner(d: dict) -> str:
+    """A "fps 3.0" in a report gets read by a human days later, so the report has to carry
+    the explanation too -- not just the CLI output the agent saw. Derived from the numbers,
+    so reports written before this existed render the warning as well."""
+    if not is_throttled(d.get("perf")):
+        return ""
+    return ("<div class='warn'><b>Frame rate below 5 fps -- editor throttle, not the game.</b> "
+            + _e(THROTTLE_NOTE) + "</div>")
+
+
 def _overview(d: dict) -> str:
-    parts = [f"<p>{_e(d.get('summary'))}</p>"]
+    parts = [_throttle_banner(d), f"<p>{_e(d.get('summary'))}</p>"]
     for n in d.get("notes", []):
         parts.append(f"<p class='evi'>{_e(n.get('text'))}</p>")
     parts.append("<div class='sub'>Checks</div>")
@@ -89,6 +102,7 @@ def _diag(d: dict) -> str:
     if perf:
         parts.append("<div class='sub'>Perf</div><div class='mono'>"
                      + " &middot; ".join(f"{_e(k)}={_e(v)}" for k, v in perf.items()) + "</div>")
+        parts.append(_throttle_banner(d))
     logs = d.get("logs") or []
     if logs:
         parts.append(f"<div class='sub'>Log warnings/errors ({len(logs)})</div>")
