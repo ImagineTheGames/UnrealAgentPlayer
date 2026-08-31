@@ -122,6 +122,9 @@ the one most likely to be in code you wrote yourself.
   not lift it either) -- then say so and **report every timing-based conclusion as unmeasurable**.
   Do not quietly use the numbers anyway. Non-timing work continues normally: state reads are
   unaffected, and `uap sample` / `uap input hold` still drive and measure correctly in-engine.
+- **Taking focus from PowerShell:** an inline `Add-Type` P/Invoke passed through
+  `powershell.exe -Command` gets its quoting mangled. Write the P/Invoke to a scratch `.ps1` and
+  run it with `-File`.
 
 ### 2. `InjectKey` never reaches Slate input pre-processors or focus handlers
 
@@ -411,7 +414,10 @@ Verbs used in this flow:
 - `uap report assert "<label>" pass|fail "<evidence>"` -- record a pass/fail check.
 - `uap report note "<text>"` -- add a free-text note.
 - `uap report finish pass|fail "<summary>"` -- render + open `index.html`; prints the path.
-- `uap exec "<python>"` -- run `import unreal; ...` in the live editor.
+- `uap exec "<python>"` -- run `import unreal; ...` in the live editor. **Reading the live world:
+  use `UnrealEditorSubsystem.get_game_world()`, not `get_editor_world()`** -- the editor one
+  intermittently returns `None` while PIE is PAUSED, which is exactly when you are most likely to
+  be inspecting state. `get_game_world()` was reliable throughout.
 - `uap rc <FunctionName> [key=value ...]` -- call a UAP_Preset UFUNCTION (use `uap exec` for complex/nested args).
 - `uap pie start [--mode flat|vr] [--no-wait] [--timeout 60]` / `uap pie wait <sec>` /
   `uap pie stop [--timeout 30]` -- start / await / stop Play-In-Editor (version-correct; wraps the

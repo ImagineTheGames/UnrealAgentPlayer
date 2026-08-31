@@ -53,6 +53,26 @@ and **CLI/plugin skew is permanent and expected, not a transient state** (see
   version number anyone has to remember to bump. Nothing to do when you add a verb -- the
   header IS the declaration.
 
+## Merging a PR from a branch you are still pushing to
+
+Merging a PR does not close the branch, and everything pushed to that branch AFTER the merge
+commit is silently orphaned: it sits on the branch, outside `main`, with the PR showing as
+merged and nothing indicating anything is missing.
+
+Worse, **the CI trigger goes quiet.** With `ci-python` on `pull_request`, a merged PR means
+later pushes to that branch run no checks at all - and nothing says so. That is a gate that
+stopped applying without announcing it, which is the same failure family as everything in
+[docs/known-issues.md](docs/known-issues.md): a check that is not running looks identical to
+a check that is passing.
+
+This happened on 2026-08-28: PR #1 merged, three further commits landed on the branch - two
+docs commits that went through no CI at all, and the fix that unblocked another project's
+verification - and none of them reached `main` until someone thought to look.
+
+So: **after merging, either stop pushing to that branch or open the next PR immediately.**
+Before merging, check what has landed since the PR was opened (`git log --oneline
+origin/main..<branch>`), not just that the PR is green.
+
 ## Changing a signature
 
 **If you change a signature, say so where someone will read it BEFORE they rebuild -- not
