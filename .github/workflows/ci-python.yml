@@ -3,13 +3,7 @@ name: ci-python
 on:
   push:
     branches: [main]
-    paths:
-      - "mcp-server/**"
-      - ".github/workflows/ci-python.yml"
   pull_request:
-    paths:
-      - "mcp-server/**"
-      - ".github/workflows/ci-python.yml"
 
 jobs:
   test:
