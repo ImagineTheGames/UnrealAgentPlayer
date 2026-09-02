@@ -176,15 +176,49 @@ class PythonRemoteExecClient:
     CONNECTION_RETRIES = 3
     RETRY_BACKOFF = (0.25, 0.75)
 
+    # Identifies the node that answers: which project, whether it is the EDITOR or a `-game`
+    # standalone client, its pid, and its command line. The project alone is not an identity --
+    # `launch_2p_standalone.ps1` starts `UnrealEditor.exe -game` clients of the SAME project,
+    # which answer this same discovery and report the same project file path.
+    NODE_PROBE = """import unreal, json, os
+try:
+    _editor = unreal.get_editor_subsystem(unreal.UnrealEditorSubsystem) is not None
+except Exception:
+    _editor = False
+try:
+    _cmdline = unreal.SystemLibrary.get_command_line()
+except Exception:
+    _cmdline = ''
+print('UAPNODE:' + json.dumps({'project': unreal.Paths.get_project_file_path(),
+                              'role': 'editor' if _editor else 'game',
+                              'pid': os.getpid(),
+                              'cmdline': _cmdline[:400]}))
+"""
+
     def __init__(self, discovery_timeout: float = 3.0, exec_timeout: float = 30.0,
-                 command_ip: str = "127.0.0.1", node_project_substr: str | None = None):
+                 command_ip: str = "127.0.0.1", node_project_substr: str | None = None,
+                 node_instance: str | None = None):
         self._discovery_timeout = discovery_timeout
         self._exec_timeout = exec_timeout
         self._command_ip = command_ip
         # When several editors answer (e.g. two projects open at once), pick the one
-        # whose project file path contains this substring. None = first responder.
+        # whose project file path contains this substring. None = any project.
         self._node_project_substr = node_project_substr
+        # WHICH INSTANCE of that project. Every verb in this package assumes the editor, so
+        # "editor" is the default and the only implicit target: a `-game` standalone client of
+        # the same project is a different process with no editor world, and answering from it
+        # is a wrong answer, not a degraded one. Other selectors: "pid:<n>", or a substring
+        # matched against the node's command line (e.g. "Context_2").
+        self._node_instance = (node_instance or "editor").strip()
         self._node_id = uuid.uuid4().hex
+        # What the last selection actually resolved to, and everything discovery saw, so a
+        # caller can SAY which process answered instead of inferring it from the answer.
+        self.last_target: dict[str, Any] | None = None
+        self._last_candidates: list[dict[str, Any]] = []
+        # The node an EARLIER attempt in this call ran on. A retry that can no longer find it
+        # means the target process ended mid-exec -- a different fact from "nothing matched",
+        # and the one the caller needs, because every reading taken after it is void.
+        self._prior_target: dict[str, Any] | None = None
 
     # --- message helpers ---
 
@@ -226,9 +260,12 @@ class PythonRemoteExecClient:
                     exec_mode: str = "ExecuteFile") -> dict[str, Any]:
         """Run Python in the editor and return {result, success, output:[...]}.
 
-        If multiple editors answer (e.g. two projects open at once) and
-        node_project_substr is set, the editor whose project file path contains
-        that substring is chosen; otherwise the first responder is used.
+        The target is the EDITOR of the project named by node_project_substr, unless
+        node_instance says otherwise. Both halves matter: the project picks between two open
+        projects, node_instance picks between the editor and a `-game` standalone client of
+        that same project. Neither ever falls back to "whatever answered" -- a wrong process
+        answers plausibly (a `-game` client returns None for every editor subsystem) and that
+        reads as a broken feature rather than a wrong target.
 
         A dropped connection mid-exec (WinError 10054 and friends) is retried with a
         small bounded backoff: the editor sometimes resets the command socket while
@@ -261,10 +298,10 @@ class PythonRemoteExecClient:
             ) from exc
         dest = (self.MULTICAST_GROUP, self.MULTICAST_PORT)
         try:
-            # When a project filter is set, the target editor's PONG can be slow/dropped on a
-            # given round. Re-discover a few times rather than failing -- and NEVER fall back to
-            # a non-matching editor (see _select_node).
-            attempts = 3 if self._node_project_substr else 1
+            # The target's PONG can be slow/dropped on a given round, so re-discover a few
+            # times rather than failing -- and NEVER fall back to a node that does not match
+            # (see _select_node).
+            attempts = 3
             nodes: list[str] = []
             target: str | None = None
             for _ in range(attempts):
@@ -281,11 +318,7 @@ class PythonRemoteExecClient:
                     retry_hint="Project Settings > Python > Enable Remote Execution, then restart the editor",
                 )
             if target is None:
-                raise AgentError(
-                    ErrorCode.UE_REMOTE_EXEC_OFF,
-                    f"{len(nodes)} editor(s) answered but none matched project "
-                    f"'{self._node_project_substr}'. Is that editor running?",
-                )
+                raise self._no_match_error(nodes)
             result = self._run_on_node(mcast, dest, target, code, unattended, exec_mode)
             if result is None:
                 raise AgentError(ErrorCode.UE_REMOTE_EXEC_OFF,
@@ -297,10 +330,11 @@ class PythonRemoteExecClient:
     # --- internals ---
 
     def _discover_nodes(self, mcast: socket.socket, dest: tuple[str, int]) -> list[str]:
-        # With a project filter set we must catch ALL responders (so _select_node can pick the
-        # right project), but we don't want to burn the full timeout every call. After the first
-        # PONG, wait a short settle window for other editors, then stop. With no filter, the
-        # first responder is enough.
+        # ALWAYS catch every responder, so _select_node can pick the right one -- and, when
+        # nothing matches, NAME the ones that answered. "First responder wins" used to be the
+        # no-filter shortcut; it is gone, because the first responder is as likely to be a
+        # `-game` standalone client as the editor. We do not burn the full timeout: after the
+        # first PONG, wait a short settle window for the others, then stop.
         deadline = time.monotonic() + self._discovery_timeout
         settle = 0.8
         next_ping = 0.0
@@ -330,33 +364,151 @@ class PythonRemoteExecClient:
                     seen.append(src)
                     if first_at is None:
                         first_at = time.monotonic()
-                    if not self._node_project_substr:
-                        break  # no filter: first responder is enough
-            if (self._node_project_substr and seen and first_at is not None
-                    and (time.monotonic() - first_at) >= settle):
+            if seen and first_at is not None and (time.monotonic() - first_at) >= settle:
                 break
         return seen
 
+    def list_nodes(self) -> list[dict[str, Any]]:
+        """Every Unreal node answering discovery right now, with its identity.
+
+        Unfiltered on purpose: this is the verb you run when a call went to the wrong place,
+        so it has to show the ones that would NOT be selected too.
+        """
+        mcast = self._make_multicast_socket()
+        dest = (self.MULTICAST_GROUP, self.MULTICAST_PORT)
+        try:
+            out: list[dict[str, Any]] = []
+            for n in self._discover_nodes(mcast, dest):
+                out.append(self._probe_node(mcast, dest, n)
+                           or {"node": n, "project": None, "role": "unknown", "pid": None,
+                               "cmdline": "", "probe_failed": True})
+            return out
+        finally:
+            mcast.close()
+
     def _select_node(self, mcast: socket.socket, dest: tuple[str, int],
                      nodes: list[str]) -> str | None:
-        if not self._node_project_substr:
-            return nodes[0]
-        # A project filter is set: NEVER fall back to a non-matching editor -- not even when
-        # it is the only one that answered this discovery round. (Doing so cross-targeted the
-        # wrong editor when the intended one's UDP PONG was simply slow/dropped, e.g. starting
-        # PIE in the wrong project.) Verify each node's project and return ONLY a real match.
+        """The one node matching BOTH the project filter and the instance selector, or None.
+
+        NEVER falls back to a non-matching node -- not even when it is the only one that
+        answered this discovery round. Two separate incidents came from a fallback here: the
+        intended editor's PONG was slow and PIE started in the WRONG PROJECT; and later, with
+        the project pinned, `exec` landed on a `-game` standalone client of the SAME project
+        and answered `None` for every editor subsystem, which read as a broken editor.
+
+        Every node is probed for its identity (project, role, pid, command line) so a refusal
+        can NAME what it found instead of saying "nothing matched".
+        """
+        if self.last_target is not None:
+            self._prior_target = self.last_target
+        self.last_target = None
+        self._last_candidates = []
         for n in nodes:
-            res = self._run_on_node(
-                mcast, dest, n,
-                "import unreal\nprint(unreal.Paths.get_project_file_path())",
-                True, "ExecuteFile")
-            text = ""
-            if res:
-                text = str(res.get("result") or "") + " ".join(
-                    o.get("output", "") for o in res.get("output", []))
-            if self._node_project_substr.lower() in text.lower():
-                return n
+            info = self._probe_node(mcast, dest, n)
+            if info is None:
+                # A node that will not describe itself is not a node we will silently talk to.
+                info = {"node": n, "project": None, "role": "unknown", "pid": None,
+                        "cmdline": "", "probe_failed": True}
+            self._last_candidates.append(info)
+        for info in self._last_candidates:
+            if info.get("probe_failed"):
+                continue
+            if not self._matches_project(info) or not self._matches_instance(info):
+                continue
+            self.last_target = info
+            return str(info["node"])
         return None
+
+    def _probe_node(self, mcast: socket.socket, dest: tuple[str, int],
+                    node: str) -> dict[str, Any] | None:
+        res = self._run_on_node(mcast, dest, node, self.NODE_PROBE, True, "ExecuteFile")
+        if not res:
+            return None
+        lines = [o.get("output", "") for o in (res.get("output") or [])]
+        lines.append(str(res.get("result") or ""))
+        for line in lines:
+            if "UAPNODE:" not in line:
+                continue
+            try:
+                info = json.loads(line.split("UAPNODE:", 1)[1].strip())
+            except json.JSONDecodeError:
+                continue
+            if isinstance(info, dict):
+                info["node"] = node
+                info.setdefault("role", "unknown")
+                return info
+        return None
+
+    def _matches_project(self, info: dict[str, Any]) -> bool:
+        if not self._node_project_substr:
+            return True
+        return self._node_project_substr.lower() in str(info.get("project") or "").lower()
+
+    def _matches_instance(self, info: dict[str, Any]) -> bool:
+        sel = self._node_instance
+        if sel.lower() == "editor":
+            return info.get("role") == "editor"
+        if sel.lower().startswith("pid:"):
+            try:
+                return int(sel.split(":", 1)[1]) == int(info.get("pid"))
+            except (TypeError, ValueError):
+                return False
+        hay = f"{info.get('cmdline') or ''} {info.get('project') or ''}".lower()
+        return sel.lower() in hay
+
+    @staticmethod
+    def describe_node(info: dict[str, Any]) -> str:
+        project = str(info.get("project") or "?").replace("\\", "/").rsplit("/", 1)[-1]
+        cmdline = " ".join(str(info.get("cmdline") or "").split())
+        if len(cmdline) > 140:
+            cmdline = cmdline[:140] + "..."
+        text = f"pid {info.get('pid')} role={info.get('role')} project={project}"
+        if info.get("probe_failed"):
+            text += " (did not answer the identity probe)"
+        return f"{text} cmdline={cmdline!r}" if cmdline else text
+
+    def _no_match_error(self, nodes: list[str]) -> AgentError:
+        """The refusal for "something answered, but not the thing you asked for".
+
+        Names every process that DID answer. The failure this replaces returned a confident
+        empty answer from the wrong process; a refusal that cannot say what it found is only
+        marginally better, because the reader still has to guess.
+        """
+        seen = self._last_candidates or [{"node": n, "role": "unknown"} for n in nodes]
+        listing = "; ".join(self.describe_node(i) for i in seen)
+        prior = self._prior_target
+        if prior and not any(i.get("pid") == prior.get("pid") for i in seen):
+            # It was there, we ran on it, and now it is not. Say THAT.
+            return AgentError(
+                ErrorCode.UE_WRONG_INSTANCE,
+                f"The process this call was running on has gone: "
+                f"{self.describe_node(prior)}. It stopped answering mid-exec, so anything the "
+                f"call had already done there is unfinished and any reading taken after it is "
+                f"not evidence. Still answering: {listing or '(nothing)'}.",
+                recoverable=False,
+            )
+        want = (f"project '{self._node_project_substr}'"
+                if self._node_project_substr else "any project")
+        if self._node_instance.lower() == "editor":
+            same_project = [i for i in seen
+                            if self._matches_project(i) and not i.get("probe_failed")]
+            if same_project and all(i.get("role") != "editor" for i in same_project):
+                return AgentError(
+                    ErrorCode.UE_WRONG_INSTANCE,
+                    f"No EDITOR answered for {want}, but {len(same_project)} non-editor "
+                    f"instance(s) of it did: {listing}. A `-game` standalone client has no "
+                    f"editor world and no editor subsystems, so running this against it would "
+                    f"return None for everything rather than fail. Start the editor, or target "
+                    f"the client deliberately with --instance (e.g. --instance Context_2 or "
+                    f"--instance pid:{same_project[0].get('pid')}).",
+                    recoverable=False,
+                )
+        return AgentError(
+            ErrorCode.UE_WRONG_INSTANCE,
+            f"{len(nodes)} Unreal node(s) answered but none matched {want} + "
+            f"instance '{self._node_instance}'. Answered: {listing}.",
+            recoverable=False,
+        )
 
     def _run_on_node(self, mcast: socket.socket, dest: tuple[str, int], node: str,
                      code: str, unattended: bool, exec_mode: str) -> dict[str, Any] | None:

@@ -97,3 +97,4 @@ def test_retry_reapplies_the_project_filter():
     assert client._node_project_substr == "SchoolsOut"
     # _select_node never falls back to a non-matching editor, on any attempt.
     assert client._select_node(None, None, []) is None
+    assert client.last_target is None

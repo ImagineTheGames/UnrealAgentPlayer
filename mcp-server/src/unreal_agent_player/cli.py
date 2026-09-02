@@ -638,8 +638,9 @@ def _exec(args) -> int:
     code = args.code
     t0 = time.monotonic()
     body: dict = {"ok": True}
+    client = PythonRemoteExecClient(node_project_substr=args.project,
+                                    node_instance=getattr(args, "instance", None))
     try:
-        client = PythonRemoteExecClient(node_project_substr=args.project)
         res = client.exec_python(code)
         body["result"] = res.get("result")
         body["output"] = [o.get("output", "") for o in (res.get("output") or [])]
@@ -648,7 +649,52 @@ def _exec(args) -> int:
             body["error"] = "exec returned success=false; see output"
     except AgentError as exc:
         body = _err(exc)
+    # Always say WHICH process answered. The failure this exists for was an exec that landed on
+    # a `-game` standalone client of the same project and answered `None` for every editor
+    # subsystem; the reader had no way to tell that from a real editor answering `None`.
+    if _target_of(client) is not None:
+        body["target"] = _target_of(client)
     _capture("exec", {"code": code[:200]}, body, int((time.monotonic() - t0) * 1000))
+    _emit(body)
+    return 0 if body["ok"] else 1
+
+
+def _target_of(client: PythonRemoteExecClient) -> dict | None:
+    """The {pid, role, project} of the node an exec ran on, trimmed for the response."""
+    info = getattr(client, "last_target", None)
+    if not info:
+        return None
+    return {"pid": info.get("pid"), "role": info.get("role"), "project": info.get("project")}
+
+
+def _instances(args) -> int:
+    """Every Unreal process answering Python remote-exec discovery, and which one a bare
+    command would select. Run this when an answer looks like it came from the wrong place."""
+    t0 = time.monotonic()
+    body: dict = {"ok": True}
+    try:
+        client = PythonRemoteExecClient(node_project_substr=args.project)
+        nodes = client.list_nodes()
+        rows = []
+        for info in nodes:
+            rows.append({
+                "pid": info.get("pid"),
+                "role": info.get("role"),
+                "project": info.get("project"),
+                "cmdline": info.get("cmdline"),
+                "selected_by_default": (client._matches_project(info)
+                                        and info.get("role") == "editor"),
+                "describe": PythonRemoteExecClient.describe_node(info),
+            })
+        body["instances"] = rows
+        body["project_filter"] = args.project or None
+        if not any(r["selected_by_default"] for r in rows):
+            body["note"] = ("no EDITOR matches the project filter, so editor verbs will refuse "
+                            "rather than answer from one of these. Use --instance pid:<n> or "
+                            "--instance <cmdline-substring> to target one deliberately.")
+    except AgentError as exc:
+        body = _err(exc)
+    _capture("instances", {"project": args.project}, body, int((time.monotonic() - t0) * 1000))
     _emit(body)
     return 0 if body["ok"] else 1
 
@@ -656,7 +702,8 @@ def _exec(args) -> int:
 def _exec_file(args) -> int:
     with open(args.path, encoding="utf-8") as f:
         code = f.read()
-    return _exec(argparse.Namespace(code=code, project=args.project))
+    return _exec(argparse.Namespace(code=code, project=args.project,
+                                    instance=getattr(args, "instance", None)))
 
 
 def _pie_start(mode: str, project: str | None) -> dict:
@@ -1534,8 +1581,14 @@ RECIPES
   Read game-truth (preferred over screenshots): uap rc CallTestHelper Name=... JsonArgs={}
     list helpers: uap helpers --names
 
-FLAGS: --project <name> and --agent <token> are accepted by EVERY verb (ignored by the ones
-that don't touch the editor), so you can pass the same pair on every call in a run.
+FLAGS: --project <name>, --instance <sel> and --agent <token> are accepted by EVERY verb
+(ignored by the ones that don't touch the editor), so you can pass the same set on every call.
+  --project picks the PROJECT; --instance picks WHICH PROCESS of it. Every verb targets that
+  project's EDITOR by default. A `-game` standalone client (launch_2p_standalone.ps1) answers
+  the same discovery under the same project name, so it used to be selectable by accident --
+  it answered `None` for every editor subsystem, which reads as a broken editor. It is now
+  refused by name unless you ask for it: --instance Context_2 / --instance pid:53164.
+  `uap instances` lists every process that answers and says which one verbs will select.
 
 MORE: docs/agent-testing.md (usage), docs/capabilities.md (every tool), docs/known-issues.md.
 Per-verb flags: uap <verb> --help
@@ -1642,6 +1695,15 @@ def build_parser() -> argparse.ArgumentParser:
     proj.add_argument("--project", default=_env_project(),
                       help="editor to target (default $UAP_PROJECT); RC port resolved per "
                            "project. Ignored by verbs that do not touch the editor.")
+    # --project picks the PROJECT. It does not pick the INSTANCE: a `-game` standalone client
+    # (what launch_2p_standalone.ps1 starts) reports the same project file path as the editor
+    # and answers the same discovery, so pinning the project alone let `exec` land on a client
+    # and answer None for every editor subsystem. The default is now the editor, always;
+    # this flag is how you ask for something else on purpose.
+    proj.add_argument("--instance", default=os.environ.get("UAP_INSTANCE") or None,
+                      help="which instance of that project: 'editor' (default), 'pid:<n>', or "
+                           "a substring of the process command line (e.g. Context_2). "
+                           "`uap instances` lists what is answering.")
     common = proj
 
     sub.add_parser("help", parents=[common],
@@ -1691,6 +1753,10 @@ def build_parser() -> argparse.ArgumentParser:
                      help="key=value pairs (e.g. Command=stat fps KeyName=E bPressed=true) "
                           "or a single JSON object")
     rcp.set_defaults(func=_rc)
+    inst = sub.add_parser("instances", parents=[proj],
+                          help="list every Unreal process answering remote-exec discovery "
+                               "(editor vs -game client), and which one verbs will target")
+    inst.set_defaults(func=_instances)
     ex = sub.add_parser("exec", parents=[proj])
     ex.add_argument("code")
     ex.set_defaults(func=_exec)

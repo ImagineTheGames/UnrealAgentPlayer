@@ -925,6 +925,90 @@ were in use by other sessions. Its CLI half (confirmation, the `lease release` g
 `Restart-Editor.ps1` plus a re-sync of the vendored plugin copy. Live verification recipe is in
 "Verifying the PIE-stop fix" in `docs/agent-testing.md`.
 
+## 30. `--project` could not tell the editor from a `-game` client of the SAME project -- FIXED
+
+Was: node selection for Python remote-exec matched on `unreal.Paths.get_project_file_path()`
+containing `--project`. That is a PROJECT identity, not a PROCESS identity.
+`launch_2p_standalone.ps1` starts `UnrealEditor.exe -game` clients of the project under test;
+those clients answer the same multicast discovery and report the same project file path, so the
+project filter matched them just as well as the editor. Whichever answered first won.
+
+Why it was expensive rather than merely wrong: a `-game` process has no editor world and no
+editor subsystems, so `unreal.get_editor_subsystem(...)` returns `None` instead of raising. The
+call came back `ok`, carrying `None`, and read as a transient editor glitch. On 2026-09-02 a
+two-client hub-occupancy verification was worked around on that basis and a reading taken
+afterwards was silently invalidated. Evidence is in the client's own log
+(`Saved/Logs/Standalone_Context_2.log`): the selection probe's
+`../../../../SchoolsOutVR/SchoolsOut.uproject`, then `es: None` / `gw: None`.
+
+Fixed, in three parts:
+
+1. **The editor is the only implicit target.** Discovery now probes every node that answers for
+   its identity -- project, role (`editor` / `game`), pid, command line -- and selects only a
+   node whose role is `editor`. This needs no change at any call site: every verb in the CLI
+   already meant the editor. "First responder wins" is gone from the no-`--project` path too;
+   the first responder is as likely to be a client as the editor.
+2. **The wrong target is loud and NAMED.** When nothing matches, the refusal is
+   `UE_WRONG_INSTANCE` listing every process that did answer (`pid 53164 role=game
+   project=SchoolsOut.uproject cmdline='... -game -DevAuthToolName=Context_2 ...'`) and the flag
+   that would target it on purpose. A node that will not identify itself is never selected
+   either. There is no path left on which a non-editor returns a confident empty answer.
+3. **`--instance` and `uap instances`** for the case where you DO mean the client:
+   `--instance pid:53164`, `--instance Context_2` (substring of the command line), or the
+   default `editor`. `uap instances` lists every answering process and marks which one verbs
+   will select. `uap exec` now also stamps `target: {pid, role, project}` on its response, so
+   "which process answered this" is readable from the answer instead of inferred.
+
+Cost: one extra remote-exec round trip per call to identify the node. With `--project` set --
+the normal path through every project's `uap.ps1` -- that probe already happened, so the normal
+path is unchanged.
+
+CLI-only. No plugin change, no rebuild, no change under `Plugin/Source/`. Covered by
+`tests/test_instance_targeting.py`.
+
+## 31. An editor-only Python call KILLS a `-game` client outright -- GUIDANCE (+ guard rail)
+
+Not a `uap` defect, but the thing that made #30 expensive, and worth knowing before anyone
+deliberately targets a client with `--instance`.
+
+**`unreal.EditorLevelLibrary.get_editor_world()` executed inside a `UnrealEditor.exe -game`
+process ends that process immediately.** No crash report, no assertion, no clean-shutdown
+line -- the log simply stops at the deprecation warning the call emits before it runs.
+`GEditor` is null outside the editor and the call dereferences it.
+
+Isolated live on 2026-09-02 against a throwaway `-game` client, one statement at a time:
+
+| Statement run in a `-game` client | Result |
+|---|---|
+| `print('alive')` | returns, process survives |
+| `unreal.get_editor_subsystem(unreal.UnrealEditorSubsystem)` | returns `None`, process survives |
+| `unreal.SystemLibrary.execute_console_command(None, ...)` | runs, process survives |
+| `unreal.EditorLevelLibrary.get_editor_world()` | **process gone, no crash dump** |
+
+The same call against the editor is harmless -- it is the supported use.
+
+So `uap exec` cannot itself kill the thing under test; the CODE it carries can, if that code
+assumes an editor and the target is not one. That is exactly what happened on 2026-09-02: the
+targeting defect (#30) put an editor-shaped script into a `-game` client, and the third
+statement of that script took the client down mid-test. The reading taken 13s later was
+therefore taken against a process that no longer existed.
+
+Two things follow, both now in place:
+
+1. #30's editor-only default removes the accidental case entirely -- an editor-shaped script
+   can no longer land in a `-game` client without `--instance` being passed on purpose.
+2. When the target DOES die mid-exec, the transport now says so by name -- "The process this
+   call was running on has gone: pid 53164 role=game ... any reading taken after it is not
+   evidence" -- rather than reporting it as "nothing matched", which is the same class of
+   confidently-wrong answer #30 was about. Covered by
+   `tests/test_instance_targeting.py::test_a_target_that_dies_mid_exec_is_reported_as_gone`.
+
+When you genuinely need state out of a `-game` client, use runtime APIs: `os.getpid()`,
+`unreal.SystemLibrary.get_command_line()`, and
+`unreal.SystemLibrary.execute_console_command(None, "<cmd>")` (console commands registered as
+`FAutoConsoleCommand` dispatch fine with a null world). Anything under `unreal.EditorLevel*`,
+`unreal.EditorAsset*` or `get_editor_subsystem(...)` is either useless or fatal there.
+
 Items 27, 28 and 29 are CLI-only -- live on pull, **no plugin rebuild and no change under
 `Plugin/Source/`**. (Item 29 also changes the MCP server's `pie_start`.) Item 28's contract preflight was verified live on 2026-08-28 against a
 freshly rebuilt School's Out editor: `uap status` returned
