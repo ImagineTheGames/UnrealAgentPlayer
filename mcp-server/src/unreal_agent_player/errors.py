@@ -9,6 +9,7 @@ class ErrorCode(str, Enum):
     UE_REMOTE_CONTROL_OFF = "UE_REMOTE_CONTROL_OFF"
     UE_REMOTE_EXEC_OFF = "UE_REMOTE_EXEC_OFF"
     UE_CONNECTION_RESET = "UE_CONNECTION_RESET"
+    UE_WRONG_INSTANCE = "UE_WRONG_INSTANCE"
     UE_OBJECT_NOT_FOUND = "UE_OBJECT_NOT_FOUND"
     PIE_WRONG_PHASE = "PIE_WRONG_PHASE"
     PIE_TIMEOUT = "PIE_TIMEOUT"
@@ -32,7 +33,7 @@ class ErrorCode(str, Enum):
     @classmethod
     def domain_of(cls, code: ErrorCode) -> str:
         transport = {cls.UE_UNREACHABLE, cls.UE_REMOTE_CONTROL_OFF, cls.UE_REMOTE_EXEC_OFF,
-                     cls.UE_CONNECTION_RESET}
+                     cls.UE_CONNECTION_RESET, cls.UE_WRONG_INSTANCE}
         mcp_side = {cls.SCHEMA_VALIDATION, cls.TIMEOUT, cls.UIA_UNAVAILABLE, cls.UIA_PATH_NOT_FOUND}
         if code in transport:
             return "transport"

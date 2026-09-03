@@ -86,10 +86,19 @@ def _fake_editor(node_id: str, ready: threading.Event, stop: threading.Event):
             d = msg.get("data", {})
             try:
                 conn = socket.create_connection((d["command_ip"], d["command_port"]), timeout=2)
-                conn.recv(65536)  # the command
+                sent = conn.recv(65536)  # the command
+                # The client identifies every node before it will talk to it (editor vs a
+                # `-game` client of the same project), so a fake editor has to answer that
+                # probe too -- a node that will not say what it is never gets selected.
+                if b"UAPNODE" in sent:
+                    ident = json.dumps({"project": "/fake/Fake.uproject", "role": "editor",
+                                        "pid": 4242, "cmdline": "UnrealEditor.exe Fake.uproject"})
+                    out = "UAPNODE:" + ident + "\n"
+                else:
+                    out = "hello\n"
                 conn.sendall(enc("command_result", data={
                     "success": True, "result": "None",
-                    "output": [{"type": "Info", "output": "hello\n"}]}))
+                    "output": [{"type": "Info", "output": out}]}))
                 conn.close()
             except OSError:
                 pass
