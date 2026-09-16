@@ -1,18 +1,32 @@
-"""Cross-agent editor coordination -- a per-project lease.
+"""Cross-agent editor coordination -- a per-project lease plus a machine-wide foreground lock.
 
-Multiple agents share ONE editor per project (one level, one PIE session; a rebuild takes it
-down entirely). This lets them take turns instead of stepping on each other or hard-failing.
+Two scopes, because two different resources are contended:
 
-Model (decided with the user):
-  * shared reads + one exclusive writer -- many agents may read concurrently; rebuild / PIE /
-    level-load takes an exclusive turn that blocks reads until done.
-  * acquire BLOCKS (polls) until grantable, up to a cap, then returns a structured `busy`.
-  * crash-safe: each poll evicts holders whose owning process is gone OR whose heartbeat is
-    stale (TTL), so a dead agent never wedges the editor.
+1. **Per-project lease** (`<reports>/.leases/<project>.json`). Multiple agents share ONE editor
+   per project (one level, one PIE session; a rebuild takes it down entirely). This lets them
+   take turns instead of stepping on each other or hard-failing.
 
-State lives in one JSON file per project under `<reports>/.leases/<project>.json`, read-modify-
-written under an O_EXCL lockfile so concurrent agents update it atomically. Pure stdlib, so it
-is live for every agent via the shared venv -- no editor rebuild, no plugin change.
+   Model (decided with the user):
+     * shared reads + one exclusive writer -- many agents may read concurrently; rebuild / PIE /
+       level-load takes an exclusive turn that blocks reads until done.
+     * acquire BLOCKS (polls) until grantable, up to a cap, then returns a structured `busy`.
+     * crash-safe: each poll evicts holders whose owning process is gone OR whose heartbeat is
+       stale (TTL), so a dead agent never wedges the editor.
+
+2. **Machine-wide foreground lock** (`<reports>/.leases/_machine.json`). A project lease is
+   scoped to its own project, so it says nothing about the OTHER project's editor -- and one
+   workstation has exactly ONE keyboard, ONE foreground window and ONE GPU. PIE in either editor
+   steals all three from the other. So the operations that start/hold PIE, inject real input, or
+   need the foreground window take a SECOND, machine-scoped turn on top of the project lease.
+   Same mechanics (block-then-busy, heartbeat, TTL eviction), one holder, and the holder record
+   carries its `project` so a blocked caller is told which project is holding the machine.
+
+   Same-project calls pass straight THROUGH this lock -- intra-project turn-taking is the project
+   lease's job. A single-project workstation therefore never waits on it at all.
+
+Each state file is read-modify-written under an O_EXCL lockfile so concurrent agents update it
+atomically. Pure stdlib, so it is live for every agent via the shared venv -- no editor rebuild,
+no plugin change.
 """
 from __future__ import annotations
 
@@ -37,6 +51,20 @@ _FILELOCK_STALE = 30.0
 _TTL_BY_REASON = {"rebuild": 1200, "pie": 600, "level": 600, "read": 120}
 _DEFAULT_TTL = 600
 
+# --- machine-wide foreground lock -------------------------------------------------------------
+# Its own scope key, so it reuses the whole per-project file/lock/eviction machinery unchanged.
+# `_safe_project` reserves this name, so a project literally called "_machine" cannot collide
+# with it.
+MACHINE_SCOPE = "_machine"
+# Matches the pie/level project TTL: an abandoned hold must not wedge the OTHER project for
+# longer than an abandoned hold wedges its own. Every foreground `uap` call from the holding
+# project refreshes it, so an agent that is actually working keeps it indefinitely.
+MACHINE_TTL = 600
+# A hold created just for the duration of one command. Short, because the `finally` in cli.main
+# releases it anyway -- the TTL is only the backstop for a killed process.
+MACHINE_TRANSIENT_TTL = 120
+_MACHINE_LOCK_OFF = {"0", "false", "no", "off"}
+
 
 def _reports_base() -> pathlib.Path:
     root = os.environ.get("UAP_REPORTS_DIR")
@@ -50,15 +78,36 @@ def _leases_dir() -> pathlib.Path:
 
 
 def _safe_project(project: str | None) -> str:
-    return (project or "").strip().lower() or "_default"
+    name = (project or "").strip().lower() or "_default"
+    # MACHINE_SCOPE owns its own lease file. A project of that name would otherwise share it and
+    # silently take/free the machine lock as if it were its own project lease.
+    return f"{name}-project" if name == MACHINE_SCOPE else name
+
+
+class _MachineScope(str):
+    """Scope key for the machine-wide lock.
+
+    A `str` subclass so it satisfies every `project: str | None` signature in this module and
+    flows through `_load` / `_save` / the filelock unchanged, while `_scope_key` still tells it
+    apart from a project name by TYPE. No string a caller can pass can be mistaken for it.
+    """
+
+
+MACHINE_SENTINEL = _MachineScope(MACHINE_SCOPE)
+
+
+def _scope_key(project: str | None) -> str:
+    if isinstance(project, _MachineScope):
+        return MACHINE_SCOPE
+    return _safe_project(project)
 
 
 def _lease_path(project: str | None) -> pathlib.Path:
-    return _leases_dir() / f"{_safe_project(project)}.json"
+    return _leases_dir() / f"{_scope_key(project)}.json"
 
 
 def _lock_path(project: str | None) -> pathlib.Path:
-    return _leases_dir() / f"{_safe_project(project)}.lock"
+    return _leases_dir() / f"{_scope_key(project)}.lock"
 
 
 def default_agent_id() -> str:
@@ -297,7 +346,7 @@ def status(project: str | None) -> dict:
         _save(project, state)
     finally:
         _release_filelock(project)
-    return {"ok": True, "project": _safe_project(project), **state}
+    return {"ok": True, "project": _scope_key(project), **state}
 
 
 def wait_while_rebuild(project: str | None, *, wait: float = DEFAULT_WAIT_CAP) -> dict:
@@ -328,6 +377,130 @@ def wait_while_rebuild(project: str | None, *, wait: float = DEFAULT_WAIT_CAP) -
             return {"ok": False, "timed_out": True, "holder": holder}
         waited = True
         time.sleep(POLL_SECONDS)
+
+
+# ----------------------------------------------------------------------------------------------
+# Machine-wide foreground lock
+#
+# The project lease is scoped to one project's editor, which is correct for everything that
+# project's editor owns alone (its level, its RC port, its PIE world) and useless for everything
+# the WORKSTATION owns: the keyboard, the foreground window, the GPU. Two projects open at once
+# (Project Broken Wings + School's Out VR on the same box, running the same uap install) each held
+# their own lease and happily started PIE under each other.
+#
+# So: one more turn, taken machine-wide, by the ops that genuinely need those shared resources.
+# Everything else -- reads, `rc`, `exec`, `status`, logs -- is untouched and stays project-scoped.
+# ----------------------------------------------------------------------------------------------
+
+
+def machine_lock_enabled() -> bool:
+    """False disables the machine lock entirely ($UAP_MACHINE_LOCK=0).
+
+    An escape hatch, not a setting to reach for: it exists so a lock bug can never be the thing
+    standing between an agent and the editor.
+    """
+    raw = os.environ.get("UAP_MACHINE_LOCK")
+    return not (raw is not None and raw.strip().lower() in _MACHINE_LOCK_OFF)
+
+
+def _machine_holder() -> dict | None:
+    state = _evict_stale(_load(MACHINE_SENTINEL))
+    _save(MACHINE_SENTINEL, state)
+    return state.get("exclusive")
+
+
+def _machine_busy(holder: dict | None, agent: str, wait: float) -> dict:
+    holder = holder or {}
+    return {"ok": False, "granted": False, "busy": True, "acquired": False,
+            "agent": agent, "scope": "machine",
+            "blocked_by": holder.get("agent"), "project": holder.get("project"),
+            "reason": holder.get("reason"), "holder": holder,
+            "waited_seconds": round(max(0.0, wait), 1)}
+
+
+def acquire_machine(project: str | None, *, reason: str = "", agent: str | None = None,
+                    pid: int | None = None, wait: float = DEFAULT_WAIT_CAP,
+                    ttl: int | None = None) -> dict:
+    """Block until this machine's foreground lock is ours, then take it.
+
+    Grant rule -- the lock arbitrates BETWEEN projects, never within one:
+      * free                       -> take it (`acquired: True`, caller owns the release);
+      * held by THIS project       -> pass through, refresh its heartbeat (`acquired: False`),
+                                      because intra-project turn-taking is the project lease's
+                                      job and a second gate there would only deadlock agents that
+                                      the project lease already serializes correctly;
+      * held by ANOTHER project    -> poll until it frees, then as above; on the wait cap, return
+                                      `{ok: False, busy: True, blocked_by, project}`.
+
+    Pass `pid=0` for a hold that must outlive this process (a PIE session held across several
+    calls); the default anchors to this process so a kill reclaims it immediately.
+    """
+    agent = agent or default_agent_id()
+    pid = os.getpid() if pid is None else int(pid)
+    ttl = int(ttl) if ttl else MACHINE_TTL
+    mine = _safe_project(project)
+    deadline = _now() + max(0.0, wait)
+    holder = None
+    while True:
+        _acquire_filelock(MACHINE_SENTINEL)
+        try:
+            state = _evict_stale(_load(MACHINE_SENTINEL))
+            holder = state.get("exclusive")
+            if holder is not None and holder.get("project") == mine:
+                holder["heartbeat_at"] = _now()
+                _save(MACHINE_SENTINEL, state)
+                return {"ok": True, "granted": True, "acquired": False, "agent": agent,
+                        "scope": "machine", "project": mine, "holder": holder}
+            if holder is None:
+                rec = {"agent": agent, "project": mine, "reason": reason, "pid": pid,
+                       "acquired_at": _now(), "heartbeat_at": _now(), "ttl": ttl}
+                state["exclusive"] = rec
+                _save(MACHINE_SENTINEL, state)
+                return {"ok": True, "granted": True, "acquired": True, "agent": agent,
+                        "scope": "machine", "project": mine, "reason": reason, "holder": rec}
+        finally:
+            _release_filelock(MACHINE_SENTINEL)
+        if _now() >= deadline:
+            return _machine_busy(holder, agent, wait)
+        time.sleep(POLL_SECONDS)
+
+
+def release_machine(*, agent: str | None = None, project: str | None = None,
+                    force: bool = False) -> dict:
+    """Free the machine lock if it is ours.
+
+    Matches on the holder's `agent` OR its `project`: `uap pie stop` legitimately frees the hold a
+    DIFFERENT agent on the same project took with `pie start`, because the thing being held (that
+    project's PIE session) is genuinely over. `force=True` breaks a hold belonging to anyone --
+    the break-glass for a session that died without releasing and has not yet aged out.
+    """
+    agent = agent or default_agent_id()
+    mine = _safe_project(project) if project is not None else None
+    holder = None
+    released = False
+    _acquire_filelock(MACHINE_SENTINEL)
+    try:
+        state = _load(MACHINE_SENTINEL)
+        holder = state.get("exclusive")
+        if holder and (force or holder.get("agent") == agent
+                       or (mine is not None and holder.get("project") == mine)):
+            state["exclusive"] = None
+            released = True
+            _save(MACHINE_SENTINEL, state)
+    finally:
+        _release_filelock(MACHINE_SENTINEL)
+    return {"ok": True, "released": released, "scope": "machine", "agent": agent,
+            "was_held_by": holder if released else None, "holder": None if released else holder}
+
+
+def machine_status() -> dict:
+    """Who owns this machine's foreground right now (stale holders evicted first)."""
+    _acquire_filelock(MACHINE_SENTINEL)
+    try:
+        holder = _machine_holder()
+    finally:
+        _release_filelock(MACHINE_SENTINEL)
+    return {"ok": True, "scope": "machine", "enabled": machine_lock_enabled(), "holder": holder}
 
 
 def wait_if_blocked(project: str | None, *, agent: str | None = None,

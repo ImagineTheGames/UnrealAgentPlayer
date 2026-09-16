@@ -58,7 +58,16 @@ These are the errors agents make every time. Don't.
    `uap pie stop`, or `uap report finish`, which stops it for you unless you pass `--keep-pie`. A
    human is often watching that window, and a live PIE session with nobody at the controls is not
    an idle editor -- it is a game being played by nothing. On 2026-08-28 an agent left one running
-   and a Project Broken Wings aircraft flew unattended into a building.
+   and a Project Broken Wings aircraft flew unattended into a building. It also blocks the OTHER
+   project on this machine (next point) for the full 10-minute TTL.
+   - **Another PROJECT may hold the machine.** Two editors open at once share one keyboard and one
+     foreground window, so `pie` / `input` / `screenshot` / `click` / `tab` / `nav` / `read-ui`
+     take a machine-wide turn on top of this project's lease. A `{"busy": true, "blocked_by": ...,
+     "project": ..., "scope": "machine"}` answer means the other project is playing: wait, or
+     report it. Do NOT route around it by driving the editor another way. `uap lease
+     machine-status` names the holder; `uap lease machine-release --force` is only for a session
+     that is genuinely gone. Read-only verbs (`status`, `log`, `sample`) always answer, so you can
+     still diagnose a locked machine.
 10. **Do NOT tight-loop `uap exec` while PIE is starting or stopping** -- Python remote-exec runs
    on the GAME THREAD, and re-entering it during a PIE transition hard-crashes the editor
    (`RecursionGuard` assert; `docs/known-issues.md` #12). **DO use the blocking verbs instead:**

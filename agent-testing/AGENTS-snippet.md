@@ -10,6 +10,13 @@ and renders an HTML report.
   human is often watching that window, and a live PIE session with nobody at the controls is not an
   idle editor: it is a game being played by nothing. On 2026-08-28 an agent left one running and a
   Project Broken Wings aircraft flew unattended into a building.
+- **Another PROJECT may be playing on this machine.** If two projects are open at once they share
+  one keyboard and one foreground window, so `pie` / `input` / `screenshot` / `click` / `tab` /
+  `nav` / `read-ui` take a machine-wide turn as well as this project's editor lease. Yours WAITS
+  and then answers `{"busy": true, "blocked_by": ..., "project": ...}` -- that is the coordination
+  working, not a bug: report it, do not route around it. `uap lease machine-status` names the
+  holder; `uap lease machine-release --force` only for a session that is genuinely gone. Leaving
+  PIE running is therefore not just untidy, it blocks the other project for 10 minutes.
 - **Do NOT tight-loop `uap exec` while PIE is starting or stopping** -- Python remote-exec runs on
   the GAME THREAD, and re-entering it during a PIE transition HARD-CRASHES the editor
   (`RecursionGuard` assert). **DO use the blocking verbs:** `uap pie start` waits for the live

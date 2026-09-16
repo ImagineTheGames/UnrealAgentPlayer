@@ -19,6 +19,23 @@ def _no_browser(monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def _isolated_coordination_state(tmp_path_factory, monkeypatch):
+    """No test may read or write the developer's REAL lease state.
+
+    `$UAP_REPORTS_DIR` roots the lease files (`coordination._reports_base`), so a test that drove
+    a lease verb without setting it wrote into `~/.uap-reports/.leases/` on the real machine.
+    That was already untidy; it became load-bearing once the machine-wide foreground lock landed,
+    because a test running `pie start` left a REAL machine hold behind and blocked every live
+    agent on the box for the full TTL.
+
+    Also pins the wait cap to 0: a test must never sit in a coordination poll loop. Tests that
+    exercise waiting set their own values, and this fixture runs before they do.
+    """
+    monkeypatch.setenv("UAP_REPORTS_DIR", str(tmp_path_factory.mktemp("uap-reports")))
+    monkeypatch.setenv("UAP_LEASE_WAIT", "0")
+
+
+@pytest.fixture(autouse=True)
 def _no_live_contract(monkeypatch):
     """Default every test to "the editor's contract could not be read".
 
