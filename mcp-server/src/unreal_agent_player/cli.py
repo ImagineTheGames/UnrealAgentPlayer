@@ -1485,6 +1485,19 @@ MULTI-AGENT COORDINATION (several agents sharing one editor; see docs/agent-coor
                                             first (`uap pie stop`), or --force to hand over a
                                             live session on purpose.
 
+TWO PROJECTS ON ONE MACHINE (a second lock, above the per-project lease)
+  A project lease covers that project's editor. It says nothing about the OTHER editor open on
+  this workstation -- and there is only one keyboard, one foreground window and one GPU. So
+  `pie` / `input` / `screenshot` / `click` / `tab` / `nav` / `read-ui` also take a MACHINE-wide
+  turn: if the other project is playing, yours WAITS (same block-then-`busy` as the lease) and
+  the busy answer names the project holding it. Automatic -- nothing to remember.
+  Calls from your own project pass straight through, so working alone never waits.
+  `pie start` holds the machine until `pie stop`; everything else holds it for one call.
+  uap lease machine-status                  which project owns the foreground right now
+  uap lease machine-release [--force]       hand it back / break a hold left by a dead session
+  Read-only verbs (status, log, sample, helpers) and rc/exec never take it.
+  $UAP_MACHINE_LOCK=0 disables it entirely (escape hatch, not a setting).
+
 DRIVE + OBSERVE
   uap rc <Func> [key=value ...]   call a plugin UFUNCTION (one-shot input injection lives here)
                                   Values are encoded against the function's DECLARED parameter
@@ -1613,6 +1626,25 @@ _REBUILD_GUARDED = {"status", "rc", "exec", "exec-file", "pie",
 # stuck editor, so it must always answer instead of blocking behind the thing you are probing.
 _LEASE_GUARDED = _REBUILD_GUARDED - {"status"}
 
+# ...and, on top of that, wait out the OTHER PROJECT on this machine -- but only for the verbs
+# that contend for something the whole workstation shares: PIE, real input injection, and the
+# foreground window (a screenshot of a background editor is a 3fps stale frame, and `read-ui`
+# needs focus to answer at all on this setup).
+#
+# Deliberately NOT here: `status`, `log`, `helpers`, `sample` (read-only -- they must answer while
+# you diagnose), and `rc` / `exec` / `exec-file`. Those last three CAN do anything, but they are
+# the generic transport for ordinary project-scoped work; gating every one of them on the other
+# project's PIE session would make two projects serialize almost completely, which is a far bigger
+# behaviour change than the clash being fixed. They remain governed by the per-project lease.
+_MACHINE_GUARDED = {"pie", "input", "screenshot", "click", "tab", "nav", "read-ui"}
+
+# `uap lease acquire --reason <r>` for one of these is a declaration that the agent is about to
+# hold the foreground across several calls, so it takes the machine lock too. `rebuild` is absent
+# on purpose: a rebuild is CPU-heavy but it neither takes the keyboard nor runs a game window, and
+# blocking the other project for a 20-minute rebuild TTL would be a worse trade than the
+# contention it avoids.
+_FOREGROUND_REASONS = ("pie", "level", "input", "screenshot", "click", "nav")
+
 
 def _pie_state_for_lease(project: str | None) -> tuple[bool | None, str]:
     """Best-effort "is this editor still in PIE", for the release guard.
@@ -1640,6 +1672,27 @@ def _lease(args) -> int:
     if cmd == "acquire":
         res = _coord.acquire(proj, args.mode, reason=args.reason, agent=args.agent,
                              pid=args.pid, wait=args.wait, ttl=args.ttl)
+        # A declared foreground hold (pie / level / input ...) is a claim on the whole
+        # workstation, not just this project's editor, so take the machine turn as well. If the
+        # OTHER project has it, give the project lease straight back rather than sitting on a
+        # half-held claim that blocks this project's other agents for nothing.
+        if res.get("granted") and _is_foreground_reason(args.reason) \
+                and _coord.machine_lock_enabled():
+            mach = _coord.acquire_machine(proj, reason=args.reason, agent=res["agent"],
+                                          pid=args.pid, wait=args.wait, ttl=args.ttl)
+            if mach.get("busy"):
+                _coord.release(proj, agent=res["agent"])
+                res = dict(mach)
+                res["hint"] = ("another PROJECT on this machine holds the foreground; your "
+                               "project lease was released again so it does not block your own "
+                               "team. `uap lease machine-status` names the holder.")
+            else:
+                res["machine"] = mach
+    elif cmd == "machine-status":
+        res = _coord.machine_status()
+    elif cmd == "machine-release":
+        res = _coord.release_machine(agent=args.agent, project=None if args.force else proj,
+                                     force=args.force)
     elif cmd == "release":
         # Releasing says "the editor is free"; the next agent takes the lease on that word alone.
         # A release granted while PIE is still live is therefore worse than a stop that lies: by
@@ -1659,12 +1712,23 @@ def _lease(args) -> int:
             res = _coord.release(proj, agent=args.agent)
             res["pie_live"] = live
             res["checked_with"] = how
+            # Releasing the editor also gives the machine back: the agent has just proved PIE is
+            # down, which is the whole reason the other project was waiting.
+            res["machine"] = _coord.release_machine(agent=res["agent"], project=proj)
     elif cmd == "heartbeat":
         res = _coord.heartbeat(proj, agent=args.agent)
     else:  # status
         res = _coord.status(proj)
+        # Contention is only legible with both scopes side by side: "my project lease is free"
+        # explains nothing when what is actually blocking you is the other project's PIE.
+        res["machine"] = _coord.machine_status()
     _emit(res)
     return 0 if res.get("ok", True) else 1
+
+
+def _is_foreground_reason(reason: str) -> bool:
+    """Does `--reason` declare a hold on the keyboard / foreground window / a PIE session?"""
+    return (reason or "").strip().lower().split(":")[0] in _FOREGROUND_REASONS
 
 
 def _env_project() -> str:
@@ -1930,7 +1994,23 @@ def build_parser() -> argparse.ArgumentParser:
                           "next agent is the failure the lease exists to prevent.")
     lzr.set_defaults(func=_lease)
     lzs.add_parser("heartbeat", parents=[proj]).set_defaults(func=_lease)
-    lzs.add_parser("status", parents=[proj]).set_defaults(func=_lease)
+    lzs.add_parser("status", parents=[proj],
+                   help="this project's lease + who holds the machine-wide foreground lock"
+                   ).set_defaults(func=_lease)
+    # The machine-wide lock: one per WORKSTATION, above every project lease. Inspect and break
+    # only -- it is taken and given back automatically by the verbs that need the foreground.
+    lzs.add_parser("machine-status", parents=[proj],
+                   help="which PROJECT currently owns this machine's foreground (PIE / input / "
+                        "screenshots), and whether the lock is enabled"
+                   ).set_defaults(func=_lease)
+    lzm = lzs.add_parser("machine-release", parents=[proj],
+                         help="hand the machine-wide foreground lock back (default: only if it "
+                              "is yours)")
+    lzm.add_argument("--force", action="store_true",
+                     help="break the lock whoever holds it. For a session that died without "
+                          "releasing and has not aged out yet -- check `lease machine-status` "
+                          "first, because the other project may simply still be playing.")
+    lzm.set_defaults(func=_lease)
     return p
 
 
@@ -1986,7 +2066,71 @@ def main(argv: list[str] | None = None) -> int:
             _coord.heartbeat(project, agent=agent)
         except Exception:
             pass
-    return args.func(args)
+
+    # ...and finally the MACHINE turn, for the verbs that contend for the one keyboard / one
+    # foreground window / one GPU this workstation has. Without it, a project lease said nothing
+    # about the OTHER project's editor: a Project Broken Wings agent could start PIE while a
+    # School's Out VR agent was mid-session, and neither lease noticed.
+    return _run_under_machine_lock(args, cmd, project)
+
+
+def _machine_reason(args, cmd: str) -> str:
+    """What the machine-lock holder record says it is doing, e.g. `pie:start`, `screenshot`."""
+    sub = getattr(args, f"{cmd.replace('-', '_')}_cmd", "") or ""
+    return f"{cmd}:{sub}" if sub else cmd
+
+
+def _release_machine_quiet(**kw) -> None:
+    """Fail-open release: the machine lock must never be the reason a command reports failure."""
+    try:
+        _coord.release_machine(**kw)
+    except Exception:
+        pass
+
+
+def _run_under_machine_lock(args, cmd: str | None, project: str) -> int:
+    """Take the machine-wide foreground turn (if this verb needs it), run the verb, hand it back.
+
+    Two hold shapes, because two lifetimes:
+      * `pie start` takes a STICKY hold (pid 0, so it outlives this short-lived process) -- what it
+        is holding is the PIE SESSION, which lives on after the command returns. `pie stop` frees
+        it; otherwise the TTL does, the same way an abandoned project lease is reclaimed.
+      * every other guarded verb takes a TRANSIENT hold, released in `finally` -- it only needs the
+        foreground for the duration of the call.
+    A call whose project already holds the lock passes straight through and releases nothing.
+    """
+    sticky = cmd == "pie" and getattr(args, "pie_cmd", "") == "start"
+    machine = None
+    if cmd in _MACHINE_GUARDED and _coord.machine_lock_enabled():
+        agent = getattr(args, "agent", None) or _coord.default_agent_id()
+        try:
+            machine = _coord.acquire_machine(
+                project, reason=_machine_reason(args, cmd), agent=agent,
+                pid=0 if sticky else None, wait=_lease_wait_cap(),
+                ttl=_coord.MACHINE_TTL if sticky else _coord.MACHINE_TRANSIENT_TTL)
+        except Exception:
+            machine = None          # fail-open: a coordination bug must not brick uap
+        if machine is not None and machine.get("busy"):
+            _emit({"ok": False, "busy": True, "blocked_by": machine.get("blocked_by"),
+                   "project": machine.get("project"), "reason": machine.get("reason"),
+                   "scope": "machine", "cmd": cmd, "agent": agent,
+                   "hint": "another PROJECT on this machine holds the foreground (PIE / input / "
+                           "screenshots); this is the machine-wide lock, not your project lease. "
+                           "Wait for it, or if that session is gone: "
+                           "`uap lease machine-status`, then "
+                           "`uap lease machine-release --force`. $UAP_MACHINE_LOCK=0 disables it."})
+            return 1
+    try:
+        rc = args.func(args)
+    finally:
+        if machine is not None and machine.get("acquired") and not sticky:
+            _release_machine_quiet(agent=machine.get("agent"))
+    # A CONFIRMED `pie stop` is what ends the sticky hold: the session the other project was
+    # waiting on is genuinely over. Only on success -- a stop that failed left PIE running.
+    if rc == 0 and cmd == "pie" and getattr(args, "pie_cmd", "") == "stop":
+        _release_machine_quiet(agent=getattr(args, "agent", None) or _coord.default_agent_id(),
+                               project=project)
+    return rc
 
 
 if __name__ == "__main__":

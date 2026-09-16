@@ -7,8 +7,10 @@ stateful resource: one level loaded, one PIE session, and a rebuild takes it dow
 Today agents either step on each other (one rebuilds while another is mid-`uap`) or hard-fail
 and stop, forcing the human to manually tell them "editor is free now."
 
-Cross-project contention is already solved (separate editors + per-project RC port pin). This
-is strictly about **multiple agents on the same editor**.
+Cross-project contention is a SECOND problem on the same machine, solved separately below
+("Two projects, one workstation"): separate editors and a per-project RC port stop the two
+projects from *addressing* each other, and do nothing about the keyboard, foreground window and
+GPU they share.
 
 Two agents fundamentally cannot both have different levels / PIE live on one editor, so the goal
 is not true parallelism -- it is **clean turn-taking with auto-wait/resume and no hard-fails**.
@@ -127,11 +129,72 @@ lease, so an actively-working agent never needs manual heartbeating, while an ab
 out (pie/level 10 min, rebuild 20 min, reads 2 min) and PID-death evicts sooner where anchored.
 `uap lease status` names the holder; `uap lease release --agent <tok>` breaks an abandoned one.
 
+## Two projects, one workstation (the machine-wide foreground lock)
+
+Everything above is scoped to ONE project's editor. That scoping is correct for what a project's
+editor owns alone -- its level, its RC port, its PIE world -- and it is exactly why it could not
+see the real second problem: a developer runs **both** projects at once from the **same uap
+install** (Project Broken Wings pins `UAP_PROJECT=ProjectBrokenWings`, School's Out VR pins
+`UAP_PROJECT=SchoolsOut`, both launchers resolving to the same repo and venv). Each project's
+lease lives in its own file, so a PBW agent asking "is the editor free?" got "yes" while a SOVR
+agent was mid-PIE, and vice versa. Both leases were right; neither was answering the question
+that mattered, because a workstation has **one keyboard, one foreground window and one GPU**, and
+PIE in either editor takes all three from the other.
+
+So there is a second lock, machine-scoped, on top of the project lease:
+`~/.uap-reports/.leases/_machine.json`, same mechanics (block-then-`busy`, heartbeat, TTL + PID
+eviction, O_EXCL lockfile) and one holder, whose record carries its `project`:
+
+```json
+{ "exclusive": { "agent": "id", "project": "schoolsout", "reason": "pie:start",
+                 "pid": 0, "acquired_at": .., "heartbeat_at": .., "ttl": 600 } }
+```
+
+**What takes it:** `pie`, `input`, `screenshot`, `click`, `tab`, `nav`, `read-ui` -- the verbs
+that start/hold PIE, inject real input, or need the foreground window (a screenshot of a
+background editor is a stale 3fps frame, and `read-ui` needs focus to answer at all). Blocked
+callers WAIT, exactly as they do for an exclusive project lease, and on the cap return
+`{"ok": false, "busy": true, "blocked_by": "<agent>", "project": "SchoolsOut", "scope": "machine"}`
+with exit 1.
+
+**What does not:** `status`, `log`, `sample`, `helpers` -- read-only, and they are the verbs you
+reach for *while* diagnosing a locked machine. Nor `rc` / `exec` / `exec-file`: those can do
+anything, but they are the generic transport for ordinary project-scoped work, and gating every
+one of them on the other project's PIE session would serialize the two projects almost completely
+-- a far bigger behaviour change than the clash being fixed. They stay governed by the project
+lease.
+
+**Same-project calls pass straight through.** The lock arbitrates BETWEEN projects only; within a
+project, turn-taking already has an owner (the exclusive lease) and a second gate there would
+deadlock agents it serializes correctly. This is also what keeps the common case free: on a
+one-project machine nothing else ever asks, so the wait is always zero.
+
+**Hold lifetimes.** `pie start` takes a STICKY hold (`pid: 0`, TTL 600) because what it is holding
+is the SESSION, which outlives the command; `pie stop` gives it back, but only on a *confirmed*
+stop -- freeing the machine on a stop that did not happen would hand the other project a live PIE,
+the same failure `lease release` refuses. Every other guarded verb takes a transient hold released
+in a `finally`, so a crash or an exception cannot leave the machine locked. Any pass-through call
+from the holding project refreshes the heartbeat, so an agent that is actually working keeps it.
+
+**Explicit holds:** `uap lease acquire exclusive --reason pie|level|input ... --agent <tok>` takes
+both turns; if the machine is denied it gives the project lease back rather than half-holding.
+`--reason rebuild` does NOT take the machine: a rebuild is CPU-heavy but takes neither the keyboard
+nor a game window, and blocking the other project for a 20-minute rebuild TTL is the worse trade.
+`uap lease release` hands back both.
+
+**Inspecting and breaking it:** `uap lease status` now reports the machine holder beside the
+project lease (a project lease that reads "free" explains nothing when the blocker is the other
+project). `uap lease machine-status` shows it alone; `uap lease machine-release [--force]` breaks
+a hold left by a session that died and has not aged out. `UAP_MACHINE_LOCK=0` disables the lock
+entirely -- an escape hatch so a coordination bug can never be the thing standing between an agent
+and the editor, not a setting to reach for.
+
 ## Non-goals
 
 - True parallel stateful work on one editor (physically impossible: one level, one PIE).
 - Spawning a second editor per agent (RAM; the machine already strains with two).
-- Cross-project coordination (already handled by separate editors + RC port pins).
+- True parallel PIE in two projects at once. Also physically impossible on one workstation: one
+  keyboard, one foreground window. The machine lock makes them take turns, not overlap.
 
 ## Rollout
 
@@ -141,3 +204,8 @@ venv, no editor rebuild, no P4 for the code. The lease is baked into each projec
 file (`AGENTS.md` for SchoolsOut, `CLAUDE.md` for PBW -- both P4-tracked, read by every tool). Rule:
 rebuild ONLY via `Restart-Editor.ps1` (it self-coordinates); never bounce the editor by hand; `uap`
 editor ops auto-wait through a rebuild; hold PIE/level across calls with `uap lease ... --agent`.
+
+The machine-wide lock ships the same way, and needs nothing from either project: both projects'
+`uap.ps1` launchers already resolve to the same repo and venv, so it is live for both the moment
+this lands. Nothing in a launcher changes -- `UAP_PROJECT` is what the lock reads to tell the two
+apart, and both already pin it.
