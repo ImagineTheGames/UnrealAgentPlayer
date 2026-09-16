@@ -3,6 +3,7 @@ import webbrowser
 import pytest
 
 from unreal_agent_player import cli
+from unreal_agent_player.reporting import viewer
 
 
 @pytest.fixture
@@ -12,10 +13,17 @@ def anyio_backend():
 
 @pytest.fixture(autouse=True)
 def _no_browser(monkeypatch):
-    """Tests must never pop a real browser window. `uap report finish` calls
-    webbrowser.open() to show the HTML report; several tests exercise that path, which
-    otherwise spawns browser tabs on the developer's machine during every test run."""
+    """Tests must never pop a real browser window, nor touch one that is already open.
+
+    `uap report finish` shows the HTML report and several tests exercise that path, which
+    would otherwise spawn a browser on the developer's machine during every test run. Both
+    routes are stubbed: the fallback (webbrowser.open) and the app-window route -- including
+    the window list, so a test can never post WM_CLOSE to a real window."""
     monkeypatch.setattr(webbrowser, "open", lambda *a, **k: False)
+    monkeypatch.setattr(viewer, "_spawn", lambda exe, url: True)
+    monkeypatch.setattr(viewer, "list_windows", list)
+    monkeypatch.setattr(viewer, "close_window", lambda hwnd: False)
+    monkeypatch.setenv("UAP_REPORT_OPEN_TIMEOUT", "0")
 
 
 @pytest.fixture(autouse=True)

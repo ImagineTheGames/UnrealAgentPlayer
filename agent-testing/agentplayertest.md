@@ -413,7 +413,10 @@ Verbs used in this flow:
 - `uap report start "<task>"` -- open a new report (writes `~/.uap-reports/<ts>/data.json`).
 - `uap report assert "<label>" pass|fail "<evidence>"` -- record a pass/fail check.
 - `uap report note "<text>"` -- add a free-text note.
-- `uap report finish pass|fail "<summary>"` -- render + open `index.html`; prints the path.
+- `uap report finish pass|fail "<summary>"` -- render + show `index.html`; prints the path. The
+  report reuses ONE browser window (each run replaces the window the previous report opened, so
+  tabs do not pile up across a session). `--no-open` / `UAP_REPORT_NO_OPEN=1` renders it with no
+  browser at all -- the path is still printed, which is all you need to cite it.
 - `uap exec "<python>"` -- run `import unreal; ...` in the live editor. **Reading the live world:
   use `UnrealEditorSubsystem.get_game_world()`, not `get_editor_world()`** -- the editor one
   intermittently returns `None` while PIE is PAUSED, which is exactly when you are most likely to

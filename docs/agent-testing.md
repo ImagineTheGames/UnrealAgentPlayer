@@ -37,6 +37,10 @@ bone delta, log line) settle a question -- never a screenshot alone.
 - `uap report start "<task>" [--project X] [--require-screenshot]` -- `--require-screenshot`
   makes `finish pass` auto-downgrade to fail unless a screenshot is attached.
 - `uap report assert "<label>" pass|fail "<evidence>"` / `note "<text>"` / `finish pass|fail "<summary>"`.
+  `finish` shows the report in ONE reusable browser window: each run replaces the window the
+  previous report opened rather than leaving a tab behind. `--no-open` (or
+  `UAP_REPORT_NO_OPEN=1`) skips the browser entirely; the path is printed either way, so an
+  agent that only cites the path never needs a window. See `docs/capabilities.md` -> Reports.
 - `uap report diag --project <X>` -- capture editor diagnostics (env: plugin version, level, PIE
   state) AND perf (frame_ms / draw_ms / gpu_ms / fps, from the plugin's GetStatGroupText) into the
   report via `exec` (reads the right editor even if another squats the RC port). Run it while PIE

@@ -4,6 +4,7 @@ import html as _html
 import json
 from typing import Any
 
+from unreal_agent_player.reporting.viewer import TITLE_PREFIX
 from unreal_agent_player.throttle import THROTTLE_NOTE, is_throttled
 
 _CSS = """
@@ -122,7 +123,7 @@ def render(data: dict) -> str:
     tabs = "".join(f'<div class="tab" data-tab="{n}" onclick="showTab(\'{n}\')">{n}</div>' for n in panels)
     bodies = "".join(f'<div class="panel" data-panel="{n}">{html}</div>' for n, html in panels.items())
     return f"""<!DOCTYPE html>
-<html lang="en"><head><meta charset="utf-8"><title>{_e(data.get('task'))}</title>
+<html lang="en"><head><meta charset="utf-8"><title>{TITLE_PREFIX}{_e(data.get('task'))}</title>
 <style>{_CSS}</style></head><body>
 <div class="header status-{_e(status)}">
   <div class="verdict">{verdict}&nbsp;&nbsp;{_e(data.get('task'))}</div>
