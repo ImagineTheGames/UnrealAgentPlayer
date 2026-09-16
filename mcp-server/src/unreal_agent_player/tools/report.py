@@ -1,10 +1,10 @@
 from __future__ import annotations
 
-import webbrowser
 from typing import Any
 
 from unreal_agent_player.errors import ErrorCode, error_response, ok_response
 from unreal_agent_player.reporting import session as sess
+from unreal_agent_player.reporting import viewer as _viewer
 from unreal_agent_player.reporting.render import render
 
 
@@ -83,7 +83,9 @@ async def report_finish(*, rc: Any = None, py_exec: Any = None,
     html_path = s.run_dir / "index.html"
     try:
         html_path.write_text(render(s.to_dict()), encoding="utf-8")
-        opened = bool(webbrowser.open(html_path.as_uri()))
+        # Reuses one browser window across a session instead of adding a tab per report;
+        # UAP_REPORT_NO_OPEN=1 turns opening off entirely (reporting/viewer.py).
+        opened = bool(_viewer.open_report(html_path).get("opened"))
     except Exception as exc:
         sess.clear_active()
         return ok_response({"run_dir": str(s.run_dir), "html": None,

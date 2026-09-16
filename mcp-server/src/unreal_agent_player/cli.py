@@ -9,13 +9,13 @@ import pathlib
 import re
 import sys
 import time
-import webbrowser
 
 from unreal_agent_player import contract as _contract
 from unreal_agent_player import coordination as _coord
 from unreal_agent_player import throttle as _throttle
 from unreal_agent_player.errors import AgentError, ErrorCode
 from unreal_agent_player.reporting import session as sess
+from unreal_agent_player.reporting import viewer as _viewer
 from unreal_agent_player.reporting.render import render
 from unreal_agent_player.transport import PythonRemoteExecClient, RemoteControlClient
 
@@ -210,13 +210,13 @@ def _report_finish(args) -> int:
         _emit({"ok": False, "error": f"render failed: {exc}"})
         return 1
     sess.clear_active_run()
-    if not os.environ.get("UAP_NO_BROWSER"):
-        try:
-            webbrowser.open(html_path.as_uri())
-        except Exception:
-            pass
+    # One window per testing session, not one tab per report: this REPLACES the window the
+    # previous report opened instead of adding another (see reporting/viewer.py). `html` below
+    # still names the per-run file -- agents quote that path, and nothing about it moved.
+    shown = _viewer.open_report(html_path, no_open=getattr(args, "no_open", False) or None)
     out = {"ok": True, "html": str(html_path), "verdict": s.status,
-           "downgraded": s.status != args.verdict, "pie_stopped": pie_stopped}
+           "downgraded": s.status != args.verdict, "pie_stopped": pie_stopped,
+           "opened": shown.get("opened", False)}
     if pie_stop_error:
         out["pie_stop_error"] = pie_stop_error
     if not s.env:
@@ -1443,6 +1443,9 @@ REPORT (a verification is NOT done until `report finish` emits the HTML report; 
   uap report note "<text>"
   uap report finish pass|fail "<summary>"   # pass w/o screenshot -> FAIL; also auto-stops PIE (--keep-pie to skip)
   -> attach proof: `uap screenshot <abs.png>` (auto-attaches), or `uap report screenshot <file>`
+  -> finish shows the report in ONE reusable browser window: each run REPLACES the window the
+     previous report opened instead of leaving a tab behind. `--no-open` (or
+     UAP_REPORT_NO_OPEN=1) renders it without a browser at all; the path is printed either way.
 
 PLAY-IN-EDITOR
   uap pie start                   start PIE and BLOCK until the play world is live (default; a
@@ -1807,6 +1810,11 @@ def build_parser() -> argparse.ArgumentParser:
     rf.add_argument("--keep-pie", action="store_true",
                     help="do not auto-stop PIE on finish (default: stop it so a finished test "
                          "never leaves the editor stuck in Play-In-Editor)")
+    rf.add_argument("--no-open", dest="no_open", action="store_true",
+                    help="render the report but do not show it in a browser (same as "
+                         "UAP_REPORT_NO_OPEN=1). The path is still printed; by default the "
+                         "report REPLACES the window the previous report opened rather than "
+                         "piling up a tab per run")
     rf.set_defaults(func=_report_finish)
 
     st = sub.add_parser("status", parents=[proj])

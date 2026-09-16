@@ -300,10 +300,25 @@ Capture an agent run into a self-contained, tabbed HTML report and open it.
 | `report_assert` | Record a pass/fail check with evidence. |
 | `report_note` | Add a curated note (optional section). |
 | `report_caption` | Caption a gallery screenshot (by index/filename; omit for most recent). |
-| `report_finish` | `verdict` (`pass`/`fail`) + `summary`; renders `index.html` (Overview/Screenshots/Timeline/Diagnostics tabs) and auto-opens it. |
+| `report_finish` | `verdict` (`pass`/`fail`) + `summary`; renders `index.html` (Overview/Screenshots/Timeline/Diagnostics tabs) and shows it. |
 
 Reports are written to `~/.uap-reports/<timestamp>__<task>/` (override with
 `UAP_REPORTS_DIR`): `index.html` + `screenshots/*.png` + `data.json`.
+
+**One window, not a tab per run.** `finish` opens the report in a dedicated browser app
+window (Chrome or Edge, `--app=`) and closes the window the PREVIOUS report opened, so a
+session of twenty verifications leaves one window instead of twenty tabs. Only a window
+this tool opened and recorded (`~/.uap-reports/.viewer.json`) is ever closed, and only
+while its caption still starts with `UAP report: ` -- an ordinary browser window that
+happens to be showing a report is never touched. With no Chromium installed it falls back
+to the old behaviour, a tab via the default browser.
+
+- `uap report finish ... --no-open` or `UAP_REPORT_NO_OPEN=1` renders the report without
+  showing it (the older `UAP_NO_BROWSER=1` still works). The `html` path is printed either
+  way, so an agent that only quotes the path can skip the browser entirely.
+- `UAP_BROWSER_EXE` forces which browser gets the app window;
+  `UAP_REPORT_OPEN_TIMEOUT` (default 6s) caps how long `finish` waits to identify the
+  window it just opened. Failing to identify it costs one stale window, never the report.
 
 ---
 
