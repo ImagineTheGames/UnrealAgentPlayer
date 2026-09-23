@@ -40,6 +40,65 @@ public:
     // has no such user, rather than throwing the event away.
     static bool InjectMouseMove(FVector2D Delta, bool bAbsolute, int32 UserIndex = INDEX_NONE);
     static bool InjectMouseButton(EAgentMouseButton Btn, bool bPressed, int32 UserIndex = INDEX_NONE);
+
+    // --- Mouse position: the AGENT CURSOR ---------------------------------------------
+    // A PIE viewport holds the mouse, and while it does there is NO way to move the pointer.
+    // Win32 SetCursorPos is inert, and so is FSlateApplication::SetCursorPos, which is a thin
+    // wrapper over the same platform cursor; FSlateUser then reads the position straight back
+    // out of that cursor (engine SlateUser.cpp:445), so nothing engine-side can cache a
+    // different one either. Measured against a live PIE session: SetCursorPos(1754, 989)
+    // followed by GetCursorPos() still read 0,0, and InjectMouseMove returned true.
+    //
+    // What works is NOT MOVING THE CURSOR AT ALL. Slate routes a pointer event by the position
+    // carried ON THE EVENT: ProcessMouseButtonDownEvent locates the widget path with
+    // LocateWindowUnderMouse(MouseEvent.GetScreenSpacePosition(), ...) (engine
+    // SlateApplication.cpp:5282), ProcessMouseMoveEvent does the same (:6300), and SButton's
+    // click test is MyGeometry.IsUnderLocation(MouseEvent.GetScreenSpacePosition()). So the
+    // agent cursor is a REMEMBERED POSITION that every injected pointer event is stamped with.
+    //
+    // This is exactly what the old InjectMouseButton did not do: it read App.GetCursorPos() for
+    // its event position, so with the real cursor pinned at the origin every injected click
+    // landed at 0,0, hit nothing, and reported ok:true. That is ClickUp 17tm466fbyj in full --
+    // the click layer was right the whole time, the POSITION was 0,0.
+    //
+    // The GAME side is a separate cache and that one IS settable under capture:
+    // APlayerController::SetMouseLocation -> FSceneViewport::SetMouse writes CachedCursorPos,
+    // which is what PlayerController::GetMousePosition / GetHitResultUnderCursor read. Both are
+    // set, and BOTH are reported with a read-back, because "asked for" is not "took".
+
+    /** The position injected pointer events are stamped with. Falls back to the real cursor. */
+    static FVector2D GetAgentCursorPos();
+
+    /**
+     * Move the agent cursor to an ABSOLUTE screen-space point -- the same space `read-ui`
+     * reports (FGeometry::GetAbsolutePosition). Returns JSON reporting what each layer did:
+     * which position injected events will now use, whether the OS cursor moved (usually NOT,
+     * under capture), whether the game-side viewport mouse took, and WHAT SLATE WIDGET IS
+     * UNDER THE POINT. The last one is the anti-false-positive: a move onto empty space or
+     * onto SViewport is reported as such instead of a bare ok:true.
+     */
+    static FString SetMousePositionJson(float X, float Y);
+
+    /**
+     * Press+release a mouse button at the agent cursor, or at X,Y first if given. X/Y are
+     * STRINGS for the RemoteControl reason documented on ResolveSlateUserParam: RC builds the
+     * argument struct zero-initialised, so an omitted float would arrive as 0.0 -- a VALID
+     * screen position -- and silently click the top-left corner, which is the exact failure
+     * this verb exists to end. Empty means "use the agent cursor".
+     */
+    static FString ClickMouseJson(EAgentMouseButton Btn, const FString& XStr, const FString& YStr);
+
+    /** Pointer button event stamped with an EXPLICIT position instead of the real cursor's. */
+    static bool InjectMouseButtonAt(EAgentMouseButton Btn, bool bPressed, FVector2D ScreenPos,
+                                    int32 UserIndex = INDEX_NONE);
+
+    /**
+     * "SWindow > SViewport > ... > SButton" -- the widgets Slate finds under an absolute point,
+     * via the SAME lookup ProcessMouseButtonDownEvent uses. Empty means a click there hits
+     * nothing. This is the anti-false-positive: it is what turns "the events were delivered"
+     * into "they were delivered TO SOMETHING".
+     */
+    static FString DescribeWidgetsAt(FVector2D ScreenPos, int32 UserIndex);
     static bool InjectGamepad(EAgentGamepadButton Btn, bool bPressed, float AnalogValue,
                               int32 UserIndex = INDEX_NONE);
 

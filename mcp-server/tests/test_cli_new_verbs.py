@@ -485,3 +485,107 @@ def test_helpers_falls_back_and_explains_on_a_404(monkeypatch, capsys):
     assert cli.main(["helpers"]) == 1
     err = _out(capsys)["error"]
     assert "ListTestHelpersJson" in err and "Rebuild the plugin" in err
+
+
+# --- mouse position inside a CAPTURED viewport (ClickUp 17tm466fbyj) -------------------
+#
+# The defect these cover is not a crash, it is a SUCCESS: with the PIE viewport holding
+# mouse capture the pointer cannot be moved, so the old chain clicked 0,0, hit nothing and
+# returned ok:true. Everything here is about that shape -- the position must survive the
+# wire, and "nothing was under it" must not read as success.
+
+def test_mouse_move_sends_the_coordinates_and_relays_the_plugin_envelope(monkeypatch, capsys):
+    _stub_rc(monkeypatch, {"SetMousePosition": json.dumps({
+        "ok": True, "x": 1754.0, "y": 989.0, "os_cursor_moved": False,
+        "game_mouse_set": True, "hit": "SBox > SButton"})})
+    assert cli.main(["input", "mouse", "move", "1754", "989"]) == 0
+    body = _out(capsys)
+    assert (body["x"], body["y"]) == (1754.0, 989.0)
+    # Reported, not hidden: under capture the OS cursor does NOT move, and a caller who needs
+    # the real pointer has to be able to see that.
+    assert body["os_cursor_moved"] is False
+    assert body["hit"] == "SBox > SButton"
+
+
+def test_mouse_click_without_coordinates_sends_EMPTY_not_zero(monkeypatch, capsys):
+    """0.0 is a VALID position -- the top-left corner -- so "omitted" cannot be sent as 0.
+
+    RemoteControl zero-initialises the argument struct, so an omitted float arrives as 0.0
+    and the plugin cannot tell it from a deliberate click at the origin. That is exactly the
+    silent miss this verb replaces, so the coordinates go on the wire as strings.
+    """
+    seen = _stub_rc(monkeypatch, {"ClickMouse": json.dumps(
+        {"ok": True, "clicked": True, "hit": "SButton"})})
+    assert cli.main(["input", "mouse", "click"]) == 0
+    params = seen[0][1]
+    assert params["X"] == "" and params["Y"] == ""
+    assert params["Button"] == "Left"
+
+
+def test_mouse_click_with_coordinates_passes_them_as_strings(monkeypatch, capsys):
+    seen = _stub_rc(monkeypatch, {"ClickMouse": json.dumps(
+        {"ok": True, "clicked": True, "hit": "SButton"})})
+    assert cli.main(["input", "mouse", "click", "1754", "989", "--button", "right"]) == 0
+    params = seen[0][1]
+    assert (params["X"], params["Y"], params["Button"]) == ("1754.0", "989.0", "Right")
+
+
+def test_mouse_click_that_hits_NOTHING_fails_instead_of_reporting_ok(monkeypatch, capsys):
+    """The whole point. The events were delivered; they landed on no widget. That is a FAIL.
+
+    Reporting it as ok:true is what let `uap click "DEV"` claim success while the menu never
+    changed, and cost a full investigation before anyone doubted the result.
+    """
+    _stub_rc(monkeypatch, {"ClickMouse": json.dumps({
+        "ok": True, "clicked": True, "hit": "",
+        "warning": "no Slate widget at 0,0, so the click hit nothing"})})
+    assert cli.main(["input", "mouse", "click"]) == 1
+    body = _out(capsys)
+    assert body["ok"] is False
+    assert "hit nothing" in body["error"]
+
+
+def test_click_by_label_uses_ClickMouse_and_not_the_cursor_reading_chain(monkeypatch, capsys):
+    """`uap click "<label>"` must go out on the positioned verb.
+
+    InjectMouseMove + InjectMouseButton take the click position from the OS cursor, which a
+    captured viewport pins -- so reaching for them here is the original bug.
+    """
+    seen = _stub_rc(monkeypatch, {
+        "DumpViewportUI": json.dumps({"available": True, "texts": [
+            {"text": "DEV", "x": 1754.0, "y": 989.0, "focused": False}]}),
+        "ClickMouse": json.dumps({"ok": True, "clicked": True, "hit": "SButton"}),
+    })
+    assert cli.main(["click", "DEV"]) == 0
+    called = [f for f, _p, _pr in seen]
+    assert "ClickMouse" in called
+    assert "InjectMouseButton" not in called and "InjectMouseMove" not in called
+
+
+def test_click_by_label_fails_when_the_label_matched_but_nothing_was_under_it(monkeypatch, capsys):
+    _stub_rc(monkeypatch, {
+        "DumpViewportUI": json.dumps({"available": True, "texts": [
+            {"text": "DEV", "x": 1754.0, "y": 989.0, "focused": False}]}),
+        "ClickMouse": json.dumps({"ok": True, "clicked": True, "hit": ""}),
+    })
+    assert cli.main(["click", "DEV"]) == 1
+    assert _out(capsys)["ok"] is False
+
+
+def test_click_by_label_degrades_loudly_on_a_plugin_without_ClickMouse(monkeypatch, capsys):
+    """A plugin copy too old to have the verb still clicks -- but must not imply proof."""
+    def _missing(_params):
+        raise AgentError(ErrorCode.UE_UNREACHABLE, "RemoteControl returned 404", recoverable=False)
+
+    seen = _stub_rc(monkeypatch, {
+        "DumpViewportUI": json.dumps({"available": True, "texts": [
+            {"text": "DEV", "x": 1754.0, "y": 989.0, "focused": False}]}),
+        "ClickMouse": _missing,
+        "InjectMouseMove": True,
+        "InjectMouseButton": True,
+    })
+    assert cli.main(["click", "DEV"]) == 0
+    body = _out(capsys)
+    assert "degraded" in body
+    assert "0,0" in body["degraded"]
+    assert "InjectMouseButton" in [f for f, _p, _pr in seen]

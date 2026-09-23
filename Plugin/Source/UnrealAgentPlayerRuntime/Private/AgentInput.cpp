@@ -10,6 +10,8 @@
 #include "GameFramework/PlayerController.h"
 #include "GameFramework/PlayerInput.h"
 #include "Widgets/SViewport.h"
+#include "Widgets/SWindow.h"
+#include "Layout/WidgetPath.h"
 #include "InputKeyEventArgs.h"
 #include "GenericPlatform/GenericPlatformInputDeviceMapper.h"
 #include "HAL/PlatformTime.h"
@@ -306,6 +308,24 @@ bool FAgentInput::InjectAxisSlate(FKey Key, float Value, int32 UserIndex)
 }
 
 
+// The agent cursor. See the long note in AgentInput.h: under viewport capture this remembered
+// position is the ONLY thing that decides where an injected pointer event lands, because the
+// real cursor cannot be moved and Slate routes by the position carried on the event.
+namespace
+{
+    FVector2D GAgentCursorPos = FVector2D::ZeroVector;
+    bool      GAgentCursorSet = false;
+}
+
+FVector2D FAgentInput::GetAgentCursorPos()
+{
+    if (GAgentCursorSet) { return GAgentCursorPos; }
+    // Never set -- fall back to the real cursor so behaviour without a `mouse move` is
+    // unchanged from before this existed.
+    return FSlateApplication::IsInitialized() ? FSlateApplication::Get().GetCursorPos()
+                                              : FVector2D::ZeroVector;
+}
+
 bool FAgentInput::InjectMouseMove(FVector2D Delta, bool bAbsolute, int32 UserIndex)
 {
     TSharedPtr<SWidget> Target = FindPIEViewportWidget();
@@ -320,8 +340,12 @@ bool FAgentInput::InjectMouseMove(FVector2D Delta, bool bAbsolute, int32 UserInd
     }
     FSlateApplication& App = FSlateApplication::Get();
 
-    FVector2D CursorPos = App.GetCursorPos();
+    // The AGENT cursor, not App.GetCursorPos(): a relative move has to compose with where the
+    // last injected move put us, and under capture the real cursor never went there.
+    FVector2D CursorPos = GetAgentCursorPos();
     FVector2D NewPos = bAbsolute ? Delta : CursorPos + Delta;
+    GAgentCursorPos = NewPos;
+    GAgentCursorSet = true;
 
     // The 7-arg FPointerEvent ctor hardcodes the user index to 0 in the ENGINE
     // (FInputEvent(InModifierKeys, 0, false) -- SlateCore Events.h:730), so "not passing a
@@ -343,6 +367,15 @@ bool FAgentInput::InjectMouseMove(FVector2D Delta, bool bAbsolute, int32 UserInd
 
 bool FAgentInput::InjectMouseButton(EAgentMouseButton Btn, bool bPressed, int32 UserIndex)
 {
+    // GetAgentCursorPos(), NOT App.GetCursorPos(). Under viewport capture the real cursor is
+    // pinned (see the agent-cursor note in AgentInput.h), so reading it back here is what made
+    // every injected click land at 0,0 while reporting ok:true -- ClickUp 17tm466fbyj.
+    return InjectMouseButtonAt(Btn, bPressed, GetAgentCursorPos(), UserIndex);
+}
+
+bool FAgentInput::InjectMouseButtonAt(EAgentMouseButton Btn, bool bPressed, FVector2D ScreenPos,
+                                      int32 UserIndex)
+{
     FKey Key = MouseButtonToKey(Btn);
     if (!Key.IsValid()) { return false; }
 
@@ -354,18 +387,38 @@ bool FAgentInput::InjectMouseButton(EAgentMouseButton Btn, bool bPressed, int32 
         return false;
     }
     FSlateApplication& App = FSlateApplication::Get();
-    FVector2D CursorPos = App.GetCursorPos();
 
     // Named, not a temporary: FPointerEvent stores a POINTER to this set
     // (PressedButtons(&InPressedButtons) -- SlateCore Events.h), so a temporary would dangle
     // by the time the event is processed on the next line.
     const TSet<FKey> Pressed{Key};
     FPointerEvent Evt(
-        (uint32)User, /*PointerIndex*/ 0u, CursorPos, CursorPos,
+        (uint32)User, /*PointerIndex*/ 0u, ScreenPos, ScreenPos,
         Pressed, Key, 0.f, App.GetModifierKeys()
     );
     if (bPressed) { return App.ProcessMouseButtonDownEvent(nullptr, Evt); }
     return App.ProcessMouseButtonUpEvent(Evt);
+}
+
+FString FAgentInput::DescribeWidgetsAt(FVector2D ScreenPos, int32 UserIndex)
+{
+    if (!FSlateApplication::IsInitialized()) { return FString(); }
+    FSlateApplication& App = FSlateApplication::Get();
+
+    // The same lookup ProcessMouseButtonDownEvent performs for a real click
+    // (SlateApplication.cpp:5282), so what this reports is what the click will actually hit.
+    FWidgetPath Path = App.LocateWindowUnderMouse(
+        ScreenPos, App.GetInteractiveTopLevelWindows(), /*bIgnoreEnabledStatus*/ false, UserIndex);
+    if (!Path.IsValid() || Path.Widgets.Num() == 0) { return FString(); }
+
+    // Leafmost few only: the full path is a 40-deep chain of layout panels nobody reads.
+    TArray<FString> Types;
+    const int32 First = FMath::Max(0, Path.Widgets.Num() - 5);
+    for (int32 i = First; i < Path.Widgets.Num(); ++i)
+    {
+        Types.Add(Path.Widgets[i].Widget->GetType().ToString());
+    }
+    return FString::Join(Types, TEXT(" > "));
 }
 
 bool FAgentInput::InjectAxis(FName AxisName, float Value, int32 UserIndex)
@@ -823,4 +876,225 @@ void FAgentInput::ShutdownHolds()
         FTSTicker::RemoveTicker(GHoldTicker);
         GHoldTicker.Reset();
     }
+}
+
+// --- Mouse position ---------------------------------------------------------------------
+// Read the design note at the top of AgentInput.h before changing any of this. The short
+// version: the real cursor cannot be moved while the PIE viewport holds the mouse, so these
+// do not try to move it -- they stamp a position onto the injected events instead, and report
+// a read-back of every layer so "asked for" is never mistaken for "took".
+
+namespace
+{
+    /** Absolute screen point -> the PIE viewport's local pixels, for SetMouseLocation. */
+    bool UAPAbsoluteToViewportLocal(FVector2D Absolute, FVector2D& OutLocal)
+    {
+        TSharedPtr<SWidget> VP = FAgentWorld::GetActiveGameViewport()
+            ? FAgentWorld::GetActiveGameViewport()->GetGameViewportWidget() : nullptr;
+        if (!VP.IsValid()) { return false; }
+        const UE::Slate::FDeprecateVector2DResult Local =
+            VP->GetCachedGeometry().AbsoluteToLocal(Absolute);
+        OutLocal = FVector2D(Local.X, Local.Y);
+        return true;
+    }
+
+    /**
+     * Set the GAME-side mouse cache and read it back. This one is genuinely settable under
+     * capture -- APlayerController::SetMouseLocation goes to FSceneViewport::SetMouse, which
+     * writes CachedCursorPos, and that is what GetMousePosition / GetHitResultUnderCursor
+     * read. It is reported separately from the Slate side because the two can disagree and a
+     * caller chasing a gameplay trace needs to know which one moved.
+     */
+    void UAPSetGameMouse(const TSharedRef<FJsonObject>& O, FVector2D Absolute)
+    {
+        UWorld* World = FAgentWorld::GetActiveGameWorld();
+        APlayerController* PC = World ? World->GetFirstPlayerController() : nullptr;
+        FVector2D Local;
+        if (!PC || !UAPAbsoluteToViewportLocal(Absolute, Local))
+        {
+            O->SetBoolField(TEXT("game_mouse_set"), false);
+            return;
+        }
+        PC->SetMouseLocation(FMath::RoundToInt(Local.X), FMath::RoundToInt(Local.Y));
+
+        float MX = 0.f, MY = 0.f;
+        const bool bRead = PC->GetMousePosition(MX, MY);
+        O->SetBoolField(TEXT("game_mouse_set"),
+                        bRead && FMath::Abs(MX - Local.X) <= 2.f && FMath::Abs(MY - Local.Y) <= 2.f);
+        if (bRead)
+        {
+            O->SetNumberField(TEXT("game_mouse_x"), MX);
+            O->SetNumberField(TEXT("game_mouse_y"), MY);
+        }
+    }
+
+    /** Shared body of `mouse move` and the implicit move inside `mouse click`. */
+    FString UAPMoveAgentCursor(FVector2D Target, int32 User, const TSharedRef<FJsonObject>& O)
+    {
+        FSlateApplication& App = FSlateApplication::Get();
+
+        // 1. The agent cursor. This is the one that decides where a click lands.
+        GAgentCursorPos = Target;
+        GAgentCursorSet = true;
+        O->SetNumberField(TEXT("x"), Target.X);
+        O->SetNumberField(TEXT("y"), Target.Y);
+
+        // 2. Ask the platform cursor as well, then READ IT BACK. Under capture this does
+        //    nothing, and saying so is the point: a caller who needs the real pointer (an OS
+        //    drag, a native tooltip) has to know it did not move, and a caller who only needs
+        //    a click can see that it does not matter.
+        App.SetCursorPos(Target);
+        const FVector2D OsAfter = App.GetCursorPos();
+        const bool bOsMoved = FVector2D::Distance(OsAfter, Target) <= 2.0;
+        O->SetBoolField(TEXT("os_cursor_moved"), bOsMoved);
+        O->SetNumberField(TEXT("os_cursor_x"), OsAfter.X);
+        O->SetNumberField(TEXT("os_cursor_y"), OsAfter.Y);
+
+        // 3. The game-side cache (GetMousePosition / GetHitResultUnderCursor).
+        UAPSetGameMouse(O, Target);
+
+        // 4. A real move event at the target, so hover / OnMouseEnter fire like a user's.
+        const TSet<FKey> NoButtons;   // named: FPointerEvent keeps a pointer to it
+        FPointerEvent Move((uint32)User, /*PointerIndex*/ 0u, Target, Target, NoButtons,
+                           EKeys::Invalid, 0.f, App.GetModifierKeys());
+        O->SetBoolField(TEXT("hover_delivered"), App.ProcessMouseMoveEvent(Move));
+
+        // 5. WHAT IS ACTUALLY THERE. The same lookup the click will do. An empty path, or one
+        //    ending at SViewport, means the click will hit the 3D scene and no UI -- report it
+        //    rather than let a bare ok:true read as "the element was clicked".
+        const FString Hit = FAgentInput::DescribeWidgetsAt(Target, User);
+        O->SetStringField(TEXT("hit"), Hit);
+        return Hit;
+    }
+
+    /** "" -> unset; otherwise a number. Strings, because RC zero-init makes 0.0 indistinguishable
+        from "omitted" and 0,0 is the top-left corner -- the exact wrong answer this verb ends. */
+    bool UAPParseOptionalCoord(const FString& In, float& Out, bool& bPresent, FString& OutError)
+    {
+        bPresent = false;
+        if (In.TrimStartAndEnd().IsEmpty()) { return true; }
+        if (!In.IsNumeric())
+        {
+            OutError = FString::Printf(
+                TEXT("'%s' is not a number. X and Y are ABSOLUTE screen pixels, the same space ")
+                TEXT("`read-ui` reports. Give both or neither -- with neither, the click lands ")
+                TEXT("at the agent cursor set by `input mouse move`."), *In);
+            return false;
+        }
+        Out = FCString::Atof(*In);
+        bPresent = true;
+        return true;
+    }
+
+    FString UAPMouseRefuse(const FString& Error)
+    {
+        TSharedRef<FJsonObject> O = MakeShared<FJsonObject>();
+        O->SetBoolField(TEXT("ok"), false);
+        O->SetStringField(TEXT("error"), Error);
+        O->SetBoolField(TEXT("clicked"), false);
+        return UAPJson(O);
+    }
+}
+
+FString FAgentInput::SetMousePositionJson(float X, float Y)
+{
+    if (!FSlateApplication::IsInitialized())
+    {
+        return UAPMouseRefuse(TEXT("Slate is not initialised in this process, so there is no "
+                                   "pointer layer to position. Run this against a live editor / "
+                                   "PIE session (uap pie start), not a headless commandlet."));
+    }
+    FString UserError;
+    const int32 User = ResolveSlateUserIndex(INDEX_NONE, UserError);
+    if (User == INDEX_NONE) { return UAPMouseRefuse(UserError); }
+
+    TSharedRef<FJsonObject> O = MakeShared<FJsonObject>();
+    O->SetBoolField(TEXT("ok"), true);
+    const FString Hit = UAPMoveAgentCursor(FVector2D(X, Y), User, O);
+    O->SetNumberField(TEXT("user_index"), User);
+    if (Hit.IsEmpty())
+    {
+        O->SetStringField(TEXT("warning"), FString::Printf(
+            TEXT("no Slate widget at %.0f,%.0f -- a click there will hit nothing. Coordinates ")
+            TEXT("are ABSOLUTE screen pixels (what `read-ui` reports), not viewport-local."),
+            X, Y));
+    }
+    return UAPJson(O);
+}
+
+FString FAgentInput::ClickMouseJson(EAgentMouseButton Btn, const FString& XStr, const FString& YStr)
+{
+    if (!FSlateApplication::IsInitialized())
+    {
+        return UAPMouseRefuse(TEXT("Slate is not initialised in this process, so there is no "
+                                   "pointer layer to click. Run this against a live editor / "
+                                   "PIE session (uap pie start), not a headless commandlet."));
+    }
+    FKey Key = MouseButtonToKey(Btn);
+    if (!Key.IsValid()) { return UAPMouseRefuse(TEXT("unknown mouse button")); }
+
+    // Validate BEFORE anything is injected, like every other refusal here: a refused call must
+    // have zero side effects, so it can never leave a button down.
+    float PX = 0.f, PY = 0.f;
+    bool bHasX = false, bHasY = false;
+    FString ParseError;
+    if (!UAPParseOptionalCoord(XStr, PX, bHasX, ParseError)) { return UAPMouseRefuse(ParseError); }
+    if (!UAPParseOptionalCoord(YStr, PY, bHasY, ParseError)) { return UAPMouseRefuse(ParseError); }
+    if (bHasX != bHasY)
+    {
+        return UAPMouseRefuse(TEXT("give BOTH X and Y or neither. One coordinate alone would "
+                                   "pair a real value with a zero-initialised 0, i.e. click the "
+                                   "top-left corner -- the exact silent miss this verb exists "
+                                   "to end."));
+    }
+    FString UserError;
+    const int32 User = ResolveSlateUserIndex(INDEX_NONE, UserError);
+    if (User == INDEX_NONE) { return UAPMouseRefuse(UserError); }
+
+    TSharedRef<FJsonObject> O = MakeShared<FJsonObject>();
+    O->SetBoolField(TEXT("ok"), true);
+    O->SetStringField(TEXT("button"), Key.ToString());
+
+    FString Hit;
+    if (bHasX)
+    {
+        Hit = UAPMoveAgentCursor(FVector2D(PX, PY), User, O);
+    }
+    else
+    {
+        const FVector2D Where = GetAgentCursorPos();
+        O->SetNumberField(TEXT("x"), Where.X);
+        O->SetNumberField(TEXT("y"), Where.Y);
+        Hit = DescribeWidgetsAt(Where, User);
+        O->SetStringField(TEXT("hit"), Hit);
+    }
+
+    const FVector2D At = GetAgentCursorPos();
+    // Down then up at the SAME point. SButton captures the pointer on the down and fires
+    // OnClicked from the up, whose own test is MyGeometry.IsUnderLocation(event position) --
+    // so the position on the event is what makes this a click and not a no-op.
+    const bool bDown = InjectMouseButtonAt(Btn, /*bPressed*/ true, At, User);
+    const bool bUp   = InjectMouseButtonAt(Btn, /*bPressed*/ false, At, User);
+    O->SetBoolField(TEXT("down_handled"), bDown);
+    O->SetBoolField(TEXT("up_handled"), bUp);
+    O->SetBoolField(TEXT("clicked"), true);
+    O->SetNumberField(TEXT("user_index"), User);
+
+    // The two ways this reports success while having done nothing, named explicitly. Neither
+    // is an error -- the events WERE delivered -- but a caller must not read them as a click.
+    if (Hit.IsEmpty())
+    {
+        O->SetStringField(TEXT("warning"), FString::Printf(
+            TEXT("no Slate widget at %.0f,%.0f, so the click hit nothing. Coordinates are "
+                 "ABSOLUTE screen pixels (what `read-ui` reports). Verify with a second "
+                 "`read-ui` that the UI actually changed."), At.X, At.Y));
+    }
+    else if (!bDown && !bUp)
+    {
+        O->SetStringField(TEXT("warning"), FString::Printf(
+            TEXT("delivered to '%s' but NOTHING HANDLED either event, so this probably did not "
+                 "activate anything. Verify with a second `read-ui` that the UI changed."),
+            *Hit));
+    }
+    return UAPJson(O);
 }

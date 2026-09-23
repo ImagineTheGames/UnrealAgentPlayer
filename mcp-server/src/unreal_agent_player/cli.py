@@ -1072,6 +1072,65 @@ def _input(args) -> int:
     return 0 if body.get("ok") else 1
 
 
+_NEEDS_MOUSE = ("positioning the mouse INSIDE a captured PIE viewport; the OS cursor cannot be "
+                "moved while PIE holds the mouse, so this has to happen engine-side")
+
+_MOUSE_BUTTONS = {"left": "Left", "right": "Right", "middle": "Middle",
+                  "xbutton1": "XButton1", "xbutton2": "XButton2"}
+
+
+def _input_mouse(args) -> int:
+    """Position and click the mouse inside a viewport that holds mouse capture.
+
+    Why this is not just SetCursorPos: while the PIE viewport has the mouse, the pointer cannot
+    be moved AT ALL. Win32 SetCursorPos is inert, and so is FSlateApplication::SetCursorPos --
+    measured live, SetCursorPos(1754, 989) left GetCursorPos() reading 0,0 while the call
+    reported success. The engine cannot cache a different position either: FSlateUser reads the
+    cursor straight back out of the platform cursor.
+
+    So the plugin does not move the cursor. Slate routes a pointer event by the position carried
+    ON THE EVENT, and that is what it stamps -- an "agent cursor". The old chain
+    (InjectMouseMove + InjectMouseButton) took its click position from GetCursorPos(), so every
+    injected click landed at 0,0 on nothing while reporting ok:true. ClickUp 17tm466fbyj.
+
+    x/y are ABSOLUTE SCREEN PIXELS -- the same space `read-ui` reports, so read-ui output feeds
+    straight in. The result carries `hit`: the Slate widgets actually found under the point. An
+    empty `hit` on a click is reported as a FAILURE, not a success, because clicking nothing is
+    exactly the outcome this verb exists to stop reporting as ok."""
+    sub = args.mouse_cmd
+    t0 = time.monotonic()
+    body: dict = {"ok": True, "action": f"mouse {sub}"}
+    try:
+        if sub == "move":
+            body.update(_rc_json("SetMousePosition", {"X": args.x, "Y": args.y},
+                                 args.project, needs=_NEEDS_MOUSE))
+        else:  # click
+            if (args.x is None) != (args.y is None):
+                _emit({"ok": False, "action": "mouse click", "clicked": False,
+                       "error": "give BOTH x and y or neither"})
+                return 1
+            # Strings on the wire, empty for "omitted". RemoteControl zero-initialises the
+            # argument struct, so an omitted float would arrive as 0.0 -- a valid position, and
+            # the top-left corner: the exact silent miss this verb replaces.
+            params = {"Button": _MOUSE_BUTTONS[args.button],
+                      "X": "" if args.x is None else str(args.x),
+                      "Y": "" if args.y is None else str(args.y)}
+            body.update(_rc_json("ClickMouse", params, args.project, needs=_NEEDS_MOUSE))
+            if body.get("ok") and not str(body.get("hit") or ""):
+                # The plugin delivered the events and says so; what it did NOT do is hit a
+                # widget. Reporting that as ok:true is the bug, not the click.
+                body["ok"] = False
+                body.setdefault("error", body.get("warning")
+                                or "the click landed on no Slate widget")
+    except (AgentError, json.JSONDecodeError) as exc:
+        body = _err(exc)
+    _capture(f"input:mouse:{sub}", {k: v for k, v in vars(args).items()
+                                    if k in ("x", "y", "button")},
+             body, int((time.monotonic() - t0) * 1000))
+    _emit(body)
+    return 0 if body.get("ok") else 1
+
+
 def _sample_stats(samples: list) -> dict:
     """Frame-to-frame movement of the sampled value: what a judder test actually asserts on.
     Works for numbers and for the {x,y,z} / {pitch,yaw,roll} objects the sampler emits."""
@@ -1287,9 +1346,30 @@ def _click(args) -> int:
         else:
             x, y = float(match["x"]), float(match["y"])
             body.update({"matched": match.get("text"), "x": x, "y": y})
-            _rc_call("InjectMouseMove", {"X": x, "Y": y, "bAbsolute": True}, args.project)
-            _rc_call("InjectMouseButton", {"Button": "Left", "bPressed": True}, args.project)
-            _rc_call("InjectMouseButton", {"Button": "Left", "bPressed": False}, args.project)
+            # ClickMouse stamps the position onto the pointer events. The old chain below took
+            # its click position from the OS cursor, which cannot be moved while the PIE
+            # viewport holds the mouse -- so it clicked 0,0 and reported ok (ClickUp
+            # 17tm466fbyj). Degrade to it only on a plugin too old to have the new verb, and
+            # SAY SO, because on that path a success is not evidence of a click.
+            try:
+                res = _rc_json("ClickMouse", {"Button": "Left", "X": str(x), "Y": str(y)},
+                               args.project, needs=_NEEDS_MOUSE)
+                body.update({k: v for k, v in res.items() if k != "ok"})
+                if not str(res.get("hit") or ""):
+                    body["ok"] = False
+                    body.setdefault("error", res.get("warning")
+                                    or "the click landed on no Slate widget")
+            except AgentError as exc:
+                if not _is_missing_verb(exc) and "sync and rebuild" not in str(exc):
+                    raise
+                _rc_call("InjectMouseMove", {"X": x, "Y": y, "bAbsolute": True}, args.project)
+                _rc_call("InjectMouseButton", {"Button": "Left", "bPressed": True}, args.project)
+                _rc_call("InjectMouseButton", {"Button": "Left", "bPressed": False}, args.project)
+                body["degraded"] = (
+                    "this editor's plugin has no ClickMouse, so the click went out on the legacy "
+                    "chain, which takes its position from the OS cursor. If that viewport holds "
+                    "mouse capture the cursor cannot be moved and the click landed at 0,0 -- "
+                    "ok here is NOT evidence of a click. Rebuild the plugin for this project.")
     except (AgentError, ValueError, KeyError, json.JSONDecodeError) as exc:
         body = _err(exc)
     _capture("click", {"label": args.label}, body, int((time.monotonic() - t0) * 1000))
@@ -1545,6 +1625,27 @@ SUSTAINED INPUT (a single injected event CANNOT drive locomotion -- see below)
   reach Enhanced Input" has already cost another project several sessions -- it was the
   wrong verb, not a missing capability.
 
+MOUSE (a captured viewport pins the pointer -- the POSITION is the hard part, not the click)
+  uap input mouse move <x> <y>         put the agent cursor at an ABSOLUTE screen point
+  uap input mouse click [x y] [--button left]   press+release there (omit x y to use the
+                                       position `mouse move` left)
+  x/y are ABSOLUTE SCREEN PIXELS -- exactly what `read-ui` prints, so its output feeds in
+  unchanged. Read the element's x,y, move, click, then `read-ui` AGAIN to prove the UI
+  changed. A screenshot is not proof; a different read-ui is.
+  Why a verb at all: while PIE holds mouse capture the pointer CANNOT BE MOVED. Win32
+  SetCursorPos is inert and so is FSlateApplication::SetCursorPos (FSlateUser reads the
+  position straight back out of the platform cursor), so `SetCursorPos(1754,989)` then
+  `GetCursorPos()` still reads 0,0 -- while both calls report success. The plugin therefore
+  does not move the cursor: Slate routes a pointer event by the position carried ON THE EVENT,
+  so it stamps that instead. The legacy chain (`rc InjectMouseMove` + `rc InjectMouseButton`)
+  read the pinned OS cursor for its click position, so every click landed at 0,0, hit nothing
+  and reported ok:true. That is the whole of ClickUp 17tm466fbyj -- the LAYER was right all
+  along, the POSITION was the corner of the screen.
+  The result carries `hit`: the Slate widgets really found under the point. A click whose
+  `hit` is empty FAILS instead of returning ok. It also reports `os_cursor_moved` (usually
+  false, and that is fine) and `game_mouse_set` -- the separate PlayerController-side cache
+  that GetMousePosition / GetHitResultUnderCursor read, which IS settable under capture.
+
 SAMPLING + LOGS (sub-second truth; a ~1s exec round-trip cannot see judder or a 0.6s wind-up)
   uap sample start <object> <property> --seconds N   per-frame series + delta stats
       object: /Game/... path | actor name in the live world | PlayerPawn | PlayerController
@@ -1559,11 +1660,15 @@ SAMPLING + LOGS (sub-second truth; a ~1s exec round-trip cannot see judder or a 
 RECIPES
   Click an on-screen button by label (one call):
     uap click "VR TRAINING"
-  ...or the underlying chain (what `uap click` does), e.g. to click a precise spot:
+  ...or the underlying chain (what `uap click` does), e.g. to click a precise spot, and to
+  PROVE it landed -- the second read-ui showing different content is the evidence:
     uap read-ui                                   # find the element's x,y
-    uap rc InjectMouseMove X=<x> Y=<y> bAbsolute=true
-    uap rc InjectMouseButton Button=Left bPressed=true
-    uap rc InjectMouseButton Button=Left bPressed=false
+    uap input mouse move <x> <y>                  # `hit` names the widget really under it
+    uap input mouse click
+    uap read-ui                                   # MUST now show the new screen
+  Do NOT use `rc InjectMouseMove` + `rc InjectMouseButton` for this. Those take the click
+  position from the OS cursor, which a captured PIE viewport pins -- they report ok and click
+  the top-left corner (ClickUp 17tm466fbyj).
   Press a key once (routes through the real input path):
     uap rc InjectKey KeyName=E bPressed=true ; uap rc InjectKey KeyName=E bPressed=false
   WALK for 3 seconds and read state WHILE moving (this is what one-shot injection cannot do):
@@ -1911,6 +2016,25 @@ def build_parser() -> argparse.ArgumentParser:
     ir.set_defaults(func=_input)
     inps.add_parser("status", parents=[proj],
                     help="what is currently held and for how much longer").set_defaults(func=_input)
+
+    # Mouse position inside a CAPTURED viewport. Not a hold -- a position, which is a different
+    # problem: while PIE holds the mouse the pointer cannot be moved at all (Win32 SetCursorPos
+    # and FSlateApplication::SetCursorPos are both inert), so the plugin stamps the position
+    # onto the injected pointer events instead. See _input_mouse.
+    im = inps.add_parser("mouse", help="position/click the mouse inside a captured PIE viewport")
+    ims = im.add_subparsers(dest="mouse_cmd", required=True)
+    imm = ims.add_parser("move", parents=[proj], help="move the agent cursor to x,y")
+    imm.add_argument("x", type=float, help="ABSOLUTE screen pixels -- what `read-ui` reports")
+    imm.add_argument("y", type=float)
+    imm.set_defaults(func=_input_mouse)
+    imc = ims.add_parser("click", parents=[proj],
+                         help="press+release at the agent cursor, or at x y if given")
+    imc.add_argument("x", type=float, nargs="?", default=None,
+                     help="optional; omit to click where `mouse move` left the cursor")
+    imc.add_argument("y", type=float, nargs="?", default=None)
+    imc.add_argument("--button", default="left",
+                     choices=["left", "right", "middle", "xbutton1", "xbutton2"])
+    imc.set_defaults(func=_input_mouse)
 
     # Frame-rate property sampling: sub-second behaviour a ~1s exec round-trip cannot see.
     smp = sub.add_parser("sample", help="record a property per-frame in-engine, return the series")

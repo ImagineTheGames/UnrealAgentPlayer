@@ -98,6 +98,19 @@ public:
     UFUNCTION(BlueprintCallable, Category="Agent|Input")
     bool InjectMouseButton(EAgentMouseButton Button, bool bPressed);
 
+    // The mouse position inside a CAPTURED viewport. Win32 SetCursorPos and
+    // FSlateApplication::SetCursorPos are both inert while PIE holds the mouse, so these do not
+    // move the pointer -- they stamp the position onto the injected pointer events, which is
+    // what Slate actually routes by. Both return JSON with a read-back of every layer and with
+    // the WIDGET FOUND UNDER THE POINT, because the failure this replaced was a click that
+    // reported ok:true from the top-left corner. X/Y on ClickMouse are strings so that
+    // "omitted" is distinguishable from 0,0. See AgentInput.h.
+    UFUNCTION(BlueprintCallable, Category="Agent|Input")
+    FString SetMousePosition(float X, float Y);
+
+    UFUNCTION(BlueprintCallable, Category="Agent|Input")
+    FString ClickMouse(EAgentMouseButton Button, FString X, FString Y);
+
     // SlateUser: "" (or omitted) resolves the target Slate user automatically; "0"/"1"/... targets
     // one explicitly and REFUSES LOUDLY if Slate has no such user. It is a string because
     // RemoteControl zero-initialises the argument struct: an omitted int32 would arrive as 0,
