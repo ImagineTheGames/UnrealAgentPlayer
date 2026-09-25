@@ -10,8 +10,11 @@ Two scopes, because two different resources are contended:
      * shared reads + one exclusive writer -- many agents may read concurrently; rebuild / PIE /
        level-load takes an exclusive turn that blocks reads until done.
      * acquire BLOCKS (polls) until grantable, up to a cap, then returns a structured `busy`.
+     * waiting is FIFO -- a blocked acquire joins a queue and only the head of it may take the
+       lease when it frees (see `_turn_ok`), so waiting is eventually rewarded.
      * crash-safe: each poll evicts holders whose owning process is gone OR whose heartbeat is
-       stale (TTL), so a dead agent never wedges the editor.
+       stale (TTL), and waiters that stopped polling, so neither a dead agent nor a dead waiter
+       ever wedges the editor.
 
 2. **Machine-wide foreground lock** (`<reports>/.leases/_machine.json`). A project lease is
    scoped to its own project, so it says nothing about the OTHER project's editor -- and one
@@ -50,6 +53,22 @@ _FILELOCK_STALE = 30.0
 # legitimately runs many minutes with no uap calls at all (the editor is down).
 _TTL_BY_REASON = {"rebuild": 1200, "pie": 600, "level": 600, "read": 120}
 _DEFAULT_TTL = 600
+
+# --- FIFO wait queue --------------------------------------------------------------------------
+# Before this, `acquire` was a race: every blocked agent polled independently and whoever happened
+# to look in the instant after a release won, so an agent could wait out TWO full 900s caps and
+# lose both times to agents that arrived later (2026-09-24; three of six agents abandoned runtime
+# verification because of it). Each individual call behaved as documented; the emergent behaviour
+# was starvation.
+#
+# So a blocked acquire now REGISTERS itself, in arrival order, and only the head of the queue may
+# take the lease. The queue lives in the same state file, under the same filelock, so it is
+# atomic with the grant decision -- there is no window in which a latecomer can slip past the head.
+#
+# A waiter re-registers (heartbeats) on every poll while it blocks. A waiter that dies, is killed,
+# or times out therefore disappears on its own: this TTL is deliberately a few poll intervals, not
+# a lease TTL, because a waiter is only ever alive inside one blocking call.
+_WAITER_TTL = 15.0
 
 # --- machine-wide foreground lock -------------------------------------------------------------
 # Its own scope key, so it reuses the whole per-project file/lock/eviction machinery unchanged.
@@ -193,7 +212,7 @@ def _release_filelock(project: str | None) -> None:
 
 
 def _blank() -> dict:
-    return {"generation": 0, "exclusive": None, "shared": []}
+    return {"generation": 0, "exclusive": None, "shared": [], "waiters": []}
 
 
 def _load(project: str | None) -> dict:
@@ -205,6 +224,7 @@ def _load(project: str | None) -> dict:
     state.setdefault("generation", 0)
     state.setdefault("exclusive", None)
     state.setdefault("shared", [])
+    state.setdefault("waiters", [])
     return state
 
 
@@ -239,6 +259,82 @@ def _grantable(state: dict, mode: str, agent: str) -> bool:
     return ex is None or ex.get("agent") == agent
 
 
+def _holds_already(state: dict, mode: str, agent: str) -> bool:
+    """Does `agent` already hold this lease in `mode`?
+
+    A re-acquire is a refresh, not a request, so it must never join the queue: an agent that
+    already owns the lease queueing behind its own waiters would deadlock itself.
+    """
+    ex = state.get("exclusive")
+    if mode == "exclusive":
+        return bool(ex) and ex.get("agent") == agent
+    return any(h.get("agent") == agent for h in state.get("shared", []))
+
+
+def _waiter_alive(w: dict) -> bool:
+    if _now() - float(w.get("heartbeat_at", 0)) > _WAITER_TTL:
+        return False            # stopped polling -> the call it belonged to is over
+    pid = int(w.get("pid", 0) or 0)
+    return _pid_alive(pid) if pid else True
+
+
+def _evict_stale_waiters(state: dict) -> dict:
+    state["waiters"] = [w for w in state.get("waiters", []) if _waiter_alive(w)]
+    return state
+
+
+def _enqueue(state: dict, agent: str, mode: str, reason: str) -> None:
+    """Register `agent` as waiting, or refresh it if it already is.
+
+    Refreshing deliberately does NOT move it to the back -- arrival order is the whole point.
+    """
+    q = state.setdefault("waiters", [])
+    for w in q:
+        if w.get("agent") == agent:
+            w["heartbeat_at"] = _now()
+            w["mode"] = mode
+            return
+    q.append({"agent": agent, "mode": mode, "reason": reason, "pid": os.getpid(),
+              "since": _now(), "heartbeat_at": _now()})
+
+
+def _dequeue(state: dict, agent: str) -> None:
+    state["waiters"] = [w for w in state.get("waiters", []) if w.get("agent") != agent]
+
+
+def _queue_position(state: dict, agent: str) -> int:
+    """1-based position in the queue; 0 when not queued."""
+    for i, w in enumerate(state.get("waiters", [])):
+        if w.get("agent") == agent:
+            return i + 1
+    return 0
+
+
+def _queue_ahead(state: dict, agent: str) -> list[str]:
+    ahead: list[str] = []
+    for w in state.get("waiters", []):
+        if w.get("agent") == agent:
+            break
+        ahead.append(str(w.get("agent")))
+    return ahead
+
+
+def _turn_ok(state: dict, mode: str, agent: str) -> bool:
+    """FIFO gate: is it this agent's turn to take the lease?
+
+    Only the head of the queue may take it -- with one exception, a run of SHARED waiters at the
+    head. Those do not exclude one another, so making the 2nd shared waiter sit out a poll cycle
+    behind the 1st would cost latency and buy nothing. An exclusive waiter anywhere ahead always
+    blocks, which is exactly what stops shared traffic from starving a rebuild forever.
+    """
+    for w in state.get("waiters", []):
+        if w.get("agent") == agent:
+            return True
+        if mode != "shared" or w.get("mode") != "shared":
+            return False
+    return True                 # not queued at all (fail-open)
+
+
 def _ttl_for(reason: str, ttl: int | None) -> int:
     if ttl:
         return int(ttl)
@@ -253,6 +349,11 @@ def acquire(project: str | None, mode: str, *, reason: str = "", agent: str | No
     long-lived process (e.g. a rebuild script's $PID) to have PID-death auto-reclaim the lease, or
     pass 0 for a cross-call hold that relies on TTL + heartbeat instead.
 
+    Waiting is FIFO. A blocked caller joins the queue in arrival order and only the head may take
+    the lease when it frees, so an agent that has been waiting longest cannot be overtaken by one
+    that arrives later. The `busy` return carries `queue_position` / `queue_ahead` so a caller
+    that gives up can say whether it was next or ninth instead of retrying blind.
+
     Returns {ok, granted, generation, ...} on success, or {ok:False, busy:True, holder} if the
     wait cap elapses. Re-entrant per agent (re-acquiring refreshes, never deadlocks on self).
     """
@@ -261,13 +362,21 @@ def acquire(project: str | None, mode: str, *, reason: str = "", agent: str | No
     agent = agent or default_agent_id()
     pid = os.getpid() if pid is None else int(pid)
     ttl = _ttl_for(reason, ttl)
-    deadline = _now() + max(0.0, wait)
+    started = _now()
+    deadline = started + max(0.0, wait)
     holder = None
+    position = 0
+    ahead: list[str] = []
+    queue_len = 0
     while True:
         _acquire_filelock(project)
         try:
-            state = _evict_stale(_load(project))
-            if _grantable(state, mode, agent):
+            state = _evict_stale_waiters(_evict_stale(_load(project)))
+            mine = _holds_already(state, mode, agent)
+            if not mine:
+                _enqueue(state, agent, mode, reason)
+            if _grantable(state, mode, agent) and (mine or _turn_ok(state, mode, agent)):
+                _dequeue(state, agent)
                 rec = {"agent": agent, "reason": reason, "pid": pid,
                        "acquired_at": _now(), "heartbeat_at": _now(), "ttl": ttl}
                 if mode == "exclusive":
@@ -278,13 +387,36 @@ def acquire(project: str | None, mode: str, *, reason: str = "", agent: str | No
                                        + [rec])
                 _save(project, state)
                 return {"ok": True, "granted": True, "agent": agent, "mode": mode,
-                        "reason": reason, "generation": state.get("generation", 0)}
+                        "reason": reason, "generation": state.get("generation", 0),
+                        "queued_seconds": round(_now() - started, 1),
+                        "queue_length": len(state.get("waiters", []))}
             holder = state.get("exclusive") or (state.get("shared") or [None])[0]
+            position = _queue_position(state, agent)
+            ahead = _queue_ahead(state, agent)
+            queue_len = len(state.get("waiters", []))
+            # Persist the registration/heartbeat, so every other waiter can see our place.
+            _save(project, state)
         finally:
             _release_filelock(project)
         if _now() >= deadline:
+            # Give the slot back: a caller that has stopped waiting must not hold up the queue
+            # for the _WAITER_TTL it would otherwise take to age out.
+            _acquire_filelock(project)
+            try:
+                state = _load(project)
+                _dequeue(state, agent)
+                _save(project, state)
+            finally:
+                _release_filelock(project)
             return {"ok": False, "granted": False, "busy": True, "agent": agent,
-                    "mode": mode, "holder": holder, "waited_seconds": round(max(0.0, wait), 1)}
+                    "mode": mode, "holder": holder,
+                    "waited_seconds": round(max(0.0, wait), 1),
+                    "queue_position": position, "queue_length": queue_len,
+                    "queue_ahead": ahead,
+                    "hint": ("you left the FIFO queue by timing out; a fresh acquire re-joins at "
+                             "the BACK. queue_position is where you stood when the wait capped: "
+                             "1 means you were next." if position
+                             else "the lease was held but you were not queued behind it")}
         time.sleep(POLL_SECONDS)
 
 
@@ -301,6 +433,9 @@ def release(project: str | None, *, agent: str | None = None) -> dict:
         before = len(state.get("shared", []))
         state["shared"] = [h for h in state.get("shared", []) if h.get("agent") != agent]
         was = was or len(state["shared"]) != before
+        # An agent that releases is done, so it is not waiting for anything either. Drops a stale
+        # queue entry left by a killed `acquire --wait` from the same token.
+        _dequeue(state, agent)
         _save(project, state)
     finally:
         _release_filelock(project)
@@ -342,11 +477,14 @@ def bump_generation(project: str | None) -> int:
 def status(project: str | None) -> dict:
     _acquire_filelock(project)
     try:
-        state = _evict_stale(_load(project))
+        state = _evict_stale_waiters(_evict_stale(_load(project)))
         _save(project, state)
     finally:
         _release_filelock(project)
-    return {"ok": True, "project": _scope_key(project), **state}
+    # `waiters` rides along inside **state; `queue` names them in arrival order so a human
+    # reading the output can see who is next without decoding timestamps.
+    return {"ok": True, "project": _scope_key(project),
+            "queue": [str(w.get("agent")) for w in state.get("waiters", [])], **state}
 
 
 def wait_while_rebuild(project: str | None, *, wait: float = DEFAULT_WAIT_CAP) -> dict:
@@ -363,7 +501,7 @@ def wait_while_rebuild(project: str | None, *, wait: float = DEFAULT_WAIT_CAP) -
         try:
             _acquire_filelock(project)
             try:
-                state = _evict_stale(_load(project))
+                state = _evict_stale_waiters(_evict_stale(_load(project)))
                 _save(project, state)
             finally:
                 _release_filelock(project)
@@ -409,13 +547,15 @@ def _machine_holder() -> dict | None:
     return state.get("exclusive")
 
 
-def _machine_busy(holder: dict | None, agent: str, wait: float) -> dict:
+def _machine_busy(holder: dict | None, agent: str, wait: float, *, position: int = 0,
+                  ahead: list[str] | None = None, queue_len: int = 0) -> dict:
     holder = holder or {}
     return {"ok": False, "granted": False, "busy": True, "acquired": False,
             "agent": agent, "scope": "machine",
             "blocked_by": holder.get("agent"), "project": holder.get("project"),
             "reason": holder.get("reason"), "holder": holder,
-            "waited_seconds": round(max(0.0, wait), 1)}
+            "waited_seconds": round(max(0.0, wait), 1),
+            "queue_position": position, "queue_ahead": ahead or [], "queue_length": queue_len}
 
 
 def acquire_machine(project: str | None, *, reason: str = "", agent: str | None = None,
@@ -434,6 +574,12 @@ def acquire_machine(project: str | None, *, reason: str = "", agent: str | None 
 
     Pass `pid=0` for a hold that must outlive this process (a PIE session held across several
     calls); the default anchors to this process so a kill reclaims it immediately.
+
+    Waiting here is FIFO for the same reason the project lease's is (ClickUp 17tm466ft2n): with
+    two projects open, whichever agent happened to poll first after a release won, so the one
+    that had waited longest could be overtaken indefinitely. A blocked caller queues; only the
+    head may take the lock. The pass-through case (this project already holds it) skips the queue
+    entirely -- it is not a request, and queueing it would deadlock the holding project.
     """
     agent = agent or default_agent_id()
     pid = os.getpid() if pid is None else int(pid)
@@ -441,27 +587,45 @@ def acquire_machine(project: str | None, *, reason: str = "", agent: str | None 
     mine = _safe_project(project)
     deadline = _now() + max(0.0, wait)
     holder = None
+    position = 0
+    ahead: list[str] = []
+    queue_len = 0
     while True:
         _acquire_filelock(MACHINE_SENTINEL)
         try:
-            state = _evict_stale(_load(MACHINE_SENTINEL))
+            state = _evict_stale_waiters(_evict_stale(_load(MACHINE_SENTINEL)))
             holder = state.get("exclusive")
             if holder is not None and holder.get("project") == mine:
                 holder["heartbeat_at"] = _now()
+                _dequeue(state, agent)
                 _save(MACHINE_SENTINEL, state)
                 return {"ok": True, "granted": True, "acquired": False, "agent": agent,
                         "scope": "machine", "project": mine, "holder": holder}
-            if holder is None:
+            _enqueue(state, agent, "exclusive", reason)
+            if holder is None and _turn_ok(state, "exclusive", agent):
+                _dequeue(state, agent)
                 rec = {"agent": agent, "project": mine, "reason": reason, "pid": pid,
                        "acquired_at": _now(), "heartbeat_at": _now(), "ttl": ttl}
                 state["exclusive"] = rec
                 _save(MACHINE_SENTINEL, state)
                 return {"ok": True, "granted": True, "acquired": True, "agent": agent,
                         "scope": "machine", "project": mine, "reason": reason, "holder": rec}
+            position = _queue_position(state, agent)
+            ahead = _queue_ahead(state, agent)
+            queue_len = len(state.get("waiters", []))
+            _save(MACHINE_SENTINEL, state)
         finally:
             _release_filelock(MACHINE_SENTINEL)
         if _now() >= deadline:
-            return _machine_busy(holder, agent, wait)
+            _acquire_filelock(MACHINE_SENTINEL)
+            try:
+                state = _load(MACHINE_SENTINEL)
+                _dequeue(state, agent)
+                _save(MACHINE_SENTINEL, state)
+            finally:
+                _release_filelock(MACHINE_SENTINEL)
+            return _machine_busy(holder, agent, wait, position=position, ahead=ahead,
+                                 queue_len=queue_len)
         time.sleep(POLL_SECONDS)
 
 
@@ -486,6 +650,7 @@ def release_machine(*, agent: str | None = None, project: str | None = None,
                        or (mine is not None and holder.get("project") == mine)):
             state["exclusive"] = None
             released = True
+            _dequeue(state, agent)
             _save(MACHINE_SENTINEL, state)
     finally:
         _release_filelock(MACHINE_SENTINEL)
@@ -498,9 +663,11 @@ def machine_status() -> dict:
     _acquire_filelock(MACHINE_SENTINEL)
     try:
         holder = _machine_holder()
+        queue = [str(w.get("agent")) for w in _load(MACHINE_SENTINEL).get("waiters", [])]
     finally:
         _release_filelock(MACHINE_SENTINEL)
-    return {"ok": True, "scope": "machine", "enabled": machine_lock_enabled(), "holder": holder}
+    return {"ok": True, "scope": "machine", "enabled": machine_lock_enabled(), "holder": holder,
+            "queue": queue}
 
 
 def wait_if_blocked(project: str | None, *, agent: str | None = None,
@@ -515,7 +682,7 @@ def wait_if_blocked(project: str | None, *, agent: str | None = None,
         try:
             _acquire_filelock(project)
             try:
-                state = _evict_stale(_load(project))
+                state = _evict_stale_waiters(_evict_stale(_load(project)))
                 _save(project, state)
             finally:
                 _release_filelock(project)

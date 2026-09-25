@@ -304,3 +304,52 @@ def test_machine_status_and_release_verbs(monkeypatch, capsys):
     assert cli.main(["lease", "machine-release", "--force"]) == 0
     assert _out(capsys)["released"] is True
     assert co.machine_status()["holder"] is None
+
+
+# --- FIFO wait queue on the machine lock (ClickUp 17tm466ft2n) --------------------------------
+
+
+def _mq(state_agent, reason="pie"):
+    st = co._load(co.MACHINE_SENTINEL)
+    co._enqueue(st, state_agent, "exclusive", reason)
+    co._save(co.MACHINE_SENTINEL, st)
+
+
+def test_machine_lock_grants_the_longest_waiter_first(tmp_path, monkeypatch):
+
+    co.acquire_machine("projA", reason="pie", agent="A", pid=0, wait=0)
+    _mq("waited_longest")
+    co.release_machine(agent="A")
+    late = co.acquire_machine("projC", reason="pie", agent="latecomer", wait=0)
+    assert late.get("busy")
+    assert late["queue_ahead"] == ["waited_longest"]
+    assert co.acquire_machine("projB", reason="pie", agent="waited_longest",
+                              wait=0)["granted"]
+
+
+def test_machine_lock_same_project_passthrough_skips_the_queue(tmp_path, monkeypatch):
+
+    co.acquire_machine("projA", reason="pie", agent="A", pid=0, wait=0)
+    _mq("someone_waiting")
+    # A second agent on the HOLDING project must not be made to queue behind a waiter from
+    # another project -- intra-project turn-taking is the project lease's job.
+    res = co.acquire_machine("projA", reason="screenshot", agent="A2", wait=0)
+    assert res["granted"] and res["acquired"] is False
+
+
+def test_machine_lock_dead_waiter_does_not_wedge_the_queue(tmp_path, monkeypatch):
+
+    co.acquire_machine("projA", reason="pie", agent="A", pid=0, wait=0)
+    _mq("ZOMBIE")
+    st = co._load(co.MACHINE_SENTINEL)
+    st["waiters"][0]["heartbeat_at"] = time.time() - 9999
+    co._save(co.MACHINE_SENTINEL, st)
+    co.release_machine(agent="A")
+    assert co.acquire_machine("projB", reason="pie", agent="B", wait=0)["granted"]
+
+
+def test_machine_status_names_the_queue(tmp_path, monkeypatch):
+
+    co.acquire_machine("projA", reason="pie", agent="A", pid=0, wait=0)
+    _mq("next_up")
+    assert co.machine_status()["queue"] == ["next_up"]
