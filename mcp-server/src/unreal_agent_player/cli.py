@@ -1804,6 +1804,20 @@ def _pie_state_for_lease(project: str | None) -> tuple[bool | None, str]:
 
 def _lease(args) -> int:
     """Multi-agent coordination lease for a shared editor. See docs/agent-coordination.md."""
+    try:
+        return _lease_inner(args)
+    except _coord.CoordinationError as exc:
+        # The lease could not be decided safely, so it was not decided. Say that as a structured
+        # refusal rather than a traceback: a traceback through a PowerShell tool comes back as
+        # NativeCommandError with the message stripped, which reads as a silent failure.
+        _emit({"ok": False, "coordination_unsafe": True, "cmd": f"lease {args.lease_cmd}",
+               "error": str(exc),
+               "hint": "nothing was granted or released. Retry; if it persists, `uap lease "
+                       "status` and check no agent is wedged holding the editor."})
+        return 1
+
+
+def _lease_inner(args) -> int:
     proj = getattr(args, "project", "") or _env_project()
     cmd = args.lease_cmd
     if cmd == "acquire":

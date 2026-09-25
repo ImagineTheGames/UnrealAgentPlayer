@@ -38,6 +38,7 @@ import json
 import os
 import pathlib
 import time
+import uuid
 
 POLL_SECONDS = 2.0
 DEFAULT_WAIT_CAP = 900          # 15 min -- covers a full rebuild
@@ -182,32 +183,91 @@ def _now() -> float:
     return time.time()
 
 
+class CoordinationError(RuntimeError):
+    """A lease decision could not be made safely, so none was made.
+
+    Both subclasses exist because of ClickUp 17tm466ftzp, where a LIVE unexpired exclusive
+    lease was handed to a second agent and the holder's PIE session died under it. Both halves
+    of that failure were a read that could not tell "the answer is no" from "I could not read
+    the answer", and returned the benign-looking one. Anything that cannot establish the
+    current state must refuse, not assume the lease is free.
+    """
+
+
+class LeaseUnavailable(CoordinationError):
+    """The coordination mutex could not be taken."""
+
+
+class LeaseStateUnreadable(CoordinationError):
+    """The lease file exists but its contents could not be parsed."""
+
+
+# Which lock file this process currently owns, and with what token. There is no nesting in this
+# module -- every critical section acquires and releases the same scope's lock -- so one entry
+# per scope is enough.
+_LOCK_OWNER: dict[str, str] = {}
+
+
 def _acquire_filelock(project: str | None) -> None:
+    """Take the scope's mutex, or raise.
+
+    It used to give the mutex up and carry on after `_FILELOCK_TIMEOUT`, with the reasoning
+    that a wedged lockfile must not brick coordination. But every critical section in this
+    module is a sub-millisecond read-modify-write, so a 10s wait never means "busy", it means
+    "something is wrong" -- and carrying on unprotected makes two writers lose one of the two
+    updates, which for `acquire` means two exclusive holders. The wedged-lock case is already
+    handled, and better, by breaking a lock older than `_FILELOCK_STALE`; proceeding without
+    the mutex only converted a visible stall into a silent exclusivity failure.
+    """
     lp = _lock_path(project)
+    token = f"{os.getpid()}:{uuid.uuid4().hex}"
     deadline = _now() + _FILELOCK_TIMEOUT
     while True:
         try:
             fd = os.open(str(lp), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
-            os.write(fd, str(os.getpid()).encode())
-            os.close(fd)
+            try:
+                os.write(fd, token.encode())
+            finally:
+                os.close(fd)
+            _LOCK_OWNER[str(lp)] = token
             return
         except FileExistsError:
             try:
                 if _now() - lp.stat().st_mtime > _FILELOCK_STALE:
-                    lp.unlink()
+                    lp.unlink()          # a wedged lock must not brick coordination
                     continue
             except FileNotFoundError:
                 continue
+            except OSError:
+                pass
             if _now() > deadline:
-                # Give up the mutex but proceed -- a wedged lockfile must not brick coordination.
-                return
+                raise LeaseUnavailable(
+                    f"could not take the coordination lock {lp} within {_FILELOCK_TIMEOUT:.0f}s. "
+                    f"Refusing to make a lease decision without it -- an unsynchronised "
+                    f"read-modify-write here grants the same exclusive lease twice."
+                ) from None
             time.sleep(0.05)
 
 
 def _release_filelock(project: str | None) -> None:
+    """Remove the lock only while it is still OURS.
+
+    An unconditional unlink released whichever lock happened to be there. Once one lock had
+    been broken as stale and replaced, the original owner's release deleted the NEW owner's
+    lock on its way out, so a single lost lock cascaded into every pair of callers after it.
+    """
+    lp = _lock_path(project)
+    mine = _LOCK_OWNER.pop(str(lp), None)
+    if mine is None:
+        return
     try:
-        _lock_path(project).unlink()
-    except FileNotFoundError:
+        if lp.read_text(encoding="utf-8").strip() != mine:
+            return                       # somebody broke ours and took it; leave theirs alone
+    except OSError:
+        return
+    try:
+        lp.unlink()
+    except OSError:
         pass
 
 
@@ -215,21 +275,72 @@ def _blank() -> dict:
     return {"generation": 0, "exclusive": None, "shared": [], "waiters": []}
 
 
+_LOAD_RETRIES = 5
+_LOAD_RETRY_SLEEP = 0.02
+
+
 def _load(project: str | None) -> dict:
+    """The current state, or raise -- never a blank state standing in for an unreadable one.
+
+    ABSENT and UNREADABLE are different facts and this used to collapse them: any
+    JSONDecodeError became `_blank()`, whose `exclusive` is None, i.e. "the lease is free".
+    Combined with the non-atomic `_save` below, a reader that caught the file mid-write
+    concluded nobody held the lease, granted itself exclusive, and wrote that over the real
+    holder's record -- which is how a live, unexpired exclusive lease vanished and its holder's
+    PIE session died under the next agent (ClickUp 17tm466ftzp).
+
+    A missing file still means genuinely blank: nothing has ever taken this lease. A present
+    but unparseable file is retried briefly -- if it is a torn read it resolves in
+    milliseconds -- and then refused.
+    """
     p = _lease_path(project)
-    try:
-        state = json.loads(p.read_text(encoding="utf-8"))
-    except (FileNotFoundError, ValueError):
-        return _blank()
-    state.setdefault("generation", 0)
-    state.setdefault("exclusive", None)
-    state.setdefault("shared", [])
-    state.setdefault("waiters", [])
-    return state
+    detail = "unknown"
+    for attempt in range(_LOAD_RETRIES):
+        try:
+            raw = p.read_text(encoding="utf-8")
+        except FileNotFoundError:
+            return _blank()          # never written -> nobody holds anything
+        except OSError as exc:
+            detail = repr(exc)
+        else:
+            try:
+                state = json.loads(raw)
+            except ValueError as exc:
+                detail = f"{exc} (first 80 bytes: {raw[:80]!r})"
+            else:
+                if isinstance(state, dict):
+                    state.setdefault("generation", 0)
+                    state.setdefault("exclusive", None)
+                    state.setdefault("shared", [])
+                    state.setdefault("waiters", [])
+                    return state
+                detail = f"top level is {type(state).__name__}, not an object"
+        if attempt < _LOAD_RETRIES - 1:
+            time.sleep(_LOAD_RETRY_SLEEP)
+    raise LeaseStateUnreadable(
+        f"lease state {p} exists but could not be read after {_LOAD_RETRIES} attempts: "
+        f"{detail}. Refusing to treat it as free -- that is how a live lease gets handed to a "
+        f"second agent. Delete the file only if no agent holds the editor.")
 
 
 def _save(project: str | None, state: dict) -> None:
-    _lease_path(project).write_text(json.dumps(state, indent=2), encoding="utf-8")
+    """Atomically replace the state file.
+
+    `write_text` truncates the target and then writes, so a reader could see an empty or
+    half-written file -- and `_load` read that as "the lease is free". `os.replace` is atomic
+    on both Windows and POSIX, so a reader now sees either the previous state or the new one,
+    never a partial one.
+    """
+    p = _lease_path(project)
+    tmp = p.with_name(f"{p.name}.{os.getpid()}.{uuid.uuid4().hex[:8]}.tmp")
+    try:
+        tmp.write_text(json.dumps(state, indent=2), encoding="utf-8")
+        os.replace(tmp, p)
+    finally:
+        try:
+            tmp.unlink()
+        except OSError:
+            pass                     # already renamed into place, or never created
 
 
 def _holder_alive(h: dict) -> bool:
