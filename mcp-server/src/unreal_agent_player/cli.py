@@ -1251,11 +1251,14 @@ def _log(args) -> int:
             # every natural reading use the positional form, so rejecting it was a trap.
             positional = getattr(args, "cursor", None)
             after = positional if positional is not None else args.since
+            # `log tail 400` and `log tail --lines 400` are the same request.
+            count = getattr(args, "count", None)
+            lines = count if count is not None else args.lines
             if sub == "tail":
                 current = int(_rc_require("GetLogCursor", {}, args.project, _NEEDS_LOG) or 0)
-                after = max(0, current - args.lines)
+                after = max(0, current - lines)
             raw = _rc_require("GetLogsSince",
-                              {"AfterCursor": after, "MaxLines": args.lines,
+                              {"AfterCursor": after, "MaxLines": lines,
                                "CategoryFilter": args.category,
                                "MinVerbosity": args.verbosity},
                               args.project, _NEEDS_LOG)
@@ -1674,7 +1677,7 @@ SAMPLING + LOGS (sub-second truth; a ~1s exec round-trip cannot see judder or a 
   uap sample read [--summary]          read the series (use with `sample start --no-wait`)
   uap log cursor                       grab a cursor BEFORE driving the condition
   uap log since <cursor> --grep RE     what the editor logged since then
-  uap log tail --lines 200 --grep RE   the last N captured lines
+  uap log tail 200 [--grep RE]         the last N captured lines (or --lines 200)
 
 RECIPES
   Click an on-screen button by label (one call):
@@ -2123,6 +2126,12 @@ def build_parser() -> argparse.ArgumentParser:
             # naturally; only accepting --since made the documented incantation an error.
             lp.add_argument("cursor", type=int, nargs="?", default=None,
                             help="cursor from `uap log cursor` (same as --since)")
+        if name == "tail":
+            # Same trap, other verb: `uap log tail 400` died with "unrecognized arguments: 400"
+            # and required `--lines 400`. `since` already accepted its positional; this did not,
+            # which makes the inconsistency itself the trap (ClickUp 17tm466ft7z).
+            lp.add_argument("count", type=int, nargs="?", default=None,
+                            help="how many lines (same as --lines)")
         lp.set_defaults(func=_log)
     lgs.add_parser("cursor", parents=[proj],
                    help="current log cursor -- grab one BEFORE driving the condition"

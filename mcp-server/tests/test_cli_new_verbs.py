@@ -589,3 +589,15 @@ def test_click_by_label_degrades_loudly_on_a_plugin_without_ClickMouse(monkeypat
     assert "degraded" in body
     assert "0,0" in body["degraded"]
     assert "InjectMouseButton" in [f for f, _p, _pr in seen]
+
+
+def test_log_tail_accepts_the_positional_line_count():
+    """`uap log tail 400` used to die with "unrecognized arguments: 400" (ClickUp 17tm466ft7z).
+
+    `log since` already took its positional, so the inconsistency was the trap: the form that
+    reads naturally worked for one subverb and was an error for the other.
+    """
+    parser = cli.build_parser()
+    assert parser.parse_args(["log", "tail", "400"]).count == 400
+    assert parser.parse_args(["log", "tail", "--lines", "400"]).lines == 400
+    assert parser.parse_args(["log", "tail"]).count is None
