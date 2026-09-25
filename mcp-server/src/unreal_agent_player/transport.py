@@ -289,6 +289,10 @@ print('UAPNODE:' + json.dumps({'project': unreal.Paths.get_project_file_path(),
         # means the target process ended mid-exec -- a different fact from "nothing matched",
         # and the one the caller needs, because every reading taken after it is void.
         self._prior_target: dict[str, Any] | None = None
+        # Foreign command_result messages refused by the last exec, newest exchange only.
+        # A crossing that is caught has to be VISIBLE, or the next person to hit it has no
+        # more evidence than the last one did (ClickUp 17tm466ft7z).
+        self.last_rejected: list[dict[str, Any]] = []
 
     # --- message helpers ---
 
@@ -343,12 +347,16 @@ print('UAPNODE:' + json.dumps({'project': unreal.Paths.get_project_file_path(),
         Retries re-run discovery, so the SAME project filter is re-applied every attempt
         -- a retry can never land on a different editor.
         """
+        # Per CALL, not per exchange: a crossing caught during the identity probe is still a
+        # crossing the caller needs to know happened.
+        self.last_rejected = []
         last_exc: AgentError | None = None
         for attempt in range(self.CONNECTION_RETRIES):
             try:
                 return self._exec_python_once(code, unattended=unattended, exec_mode=exec_mode)
             except AgentError as exc:
-                if exc.code is not ErrorCode.UE_CONNECTION_RESET:
+                if exc.code not in (ErrorCode.UE_CONNECTION_RESET,
+                                    ErrorCode.UE_CROSSED_RESPONSE):
                     raise
                 last_exc = exc
                 if attempt < self.CONNECTION_RETRIES - 1:
@@ -669,50 +677,113 @@ print('UAPNODE:' + json.dumps({'project': unreal.Paths.get_project_file_path(),
         cmd_server.listen(1)
         cmd_server.settimeout(2.0)
         cmd_port = cmd_server.getsockname()[1]
+        # Foreign replies refused during this exchange. Kept so a caller -- and the stress
+        # harness -- can SEE that a crossing happened and was caught, not infer it.
+        rejected: list[dict[str, Any]] = []
+        connected = False
         try:
             # The open_connection datagram or the editor's connect-back can be dropped;
             # resend and re-accept a few times before giving up.
-            conn = None
             for _attempt in range(4):
                 mcast.sendto(self._encode(
                     self.T_OPEN_CONNECTION, dest=node,
                     data={"command_ip": self._command_ip, "command_port": cmd_port}), dest)
-                try:
-                    conn, _ = cmd_server.accept()
-                    break
-                except TimeoutError:
-                    continue
-                except OSError:
-                    continue
-            if conn is None:
+                while True:
+                    try:
+                        conn, _ = cmd_server.accept()
+                    except TimeoutError:
+                        break
+                    except OSError:
+                        break
+                    connected = True
+                    with conn:
+                        conn.settimeout(self._exec_timeout)
+                        try:
+                            conn.sendall(self._encode(
+                                self.T_COMMAND, dest=node,
+                                data={"command": code, "unattended": unattended,
+                                      "exec_mode": exec_mode}))
+                        except OSError as exc:
+                            raise AgentError(
+                                ErrorCode.UE_CONNECTION_RESET,
+                                f"Editor closed the command connection while sending: {exc}",
+                                retry_hint="transient; retry the call",
+                            ) from exc
+                        data, reject = self._read_command_result(conn, node)
+                    if data is not None:
+                        self.last_rejected.extend(rejected)
+                        return data
+                    if reject is not None:
+                        # Somebody else's process answered our port. Do NOT return it, and do
+                        # NOT give up: the node we addressed may still be connecting back, so
+                        # keep accepting on the same advertised port. We deliberately do not
+                        # tear down here -- close_connection would tell the real editor to drop
+                        # the very connection we are still waiting for.
+                        rejected.append(reject)
+                        continue
+                    break   # clean EOF with no result -> re-advertise and try again
+            self.last_rejected.extend(rejected)
+            if not connected:
                 raise AgentError(
                     ErrorCode.UE_REMOTE_EXEC_OFF,
                     "Editor did not connect back to the command server.",
                 )
-            try:
-                with conn:
-                    conn.settimeout(self._exec_timeout)
-                    try:
-                        conn.sendall(self._encode(
-                            self.T_COMMAND, dest=node,
-                            data={"command": code, "unattended": unattended,
-                                  "exec_mode": exec_mode}))
-                    except OSError as exc:
-                        raise AgentError(
-                            ErrorCode.UE_CONNECTION_RESET,
-                            f"Editor closed the command connection while sending: {exc}",
-                            retry_hint="transient; retry the call",
-                        ) from exc
-                    return self._read_command_result(conn)
-            finally:
-                try:
-                    mcast.sendto(self._encode(self.T_CLOSE_CONNECTION, dest=node), dest)
-                except OSError:
-                    pass  # best-effort teardown; never mask the real error
+            if rejected:
+                raise self._crossed_response_error(node, rejected)
+            return None
         finally:
+            try:
+                mcast.sendto(self._encode(self.T_CLOSE_CONNECTION, dest=node), dest)
+            except OSError:
+                pass  # best-effort teardown; never mask the real error
             cmd_server.close()
 
-    def _read_command_result(self, conn: socket.socket) -> dict[str, Any] | None:
+    def _crossed_response_error(self, node: str, rejected: list[dict[str, Any]]) -> AgentError:
+        """The refusal for -- something answered, but it was not the process I asked."""
+        who = "; ".join(
+            "source={} dest={}{}".format(
+                r.get("source") or "(none)", r.get("dest") or "(none)",
+                " output={!r}".format(r["output"]) if r.get("output") else "")
+            for r in rejected[:3])
+        return AgentError(
+            ErrorCode.UE_CROSSED_RESPONSE,
+            f"{len(rejected)} foreign reply/replies answered this call's command connection "
+            f"instead of the node it was addressed to ({node}), and were refused: {who}. "
+            f"Nothing was read from them, so no value here came from the wrong process. "
+            f"Something else on this machine answers Python remote-execution and connected "
+            f"back to our advertised port first -- another editor, a -game client, or the "
+            f"uap test suite's fake editor in tests/test_python_remote_exec.py.",
+            retry_hint="transient; retry, and check what else answers with `uap nodes`",
+        )
+
+    def _read_command_result(self, conn: socket.socket,
+                             expect_source: str) -> tuple[dict[str, Any] | None,
+                                                          dict[str, Any] | None]:
+        """Read one command_result, returning it ONLY if it answers OUR command.
+
+        Returns (data, None) for our answer and (None, reject) for somebody else's. A reject
+        must never be treated as a result.
+
+        The wire protocol already carries the correlation in both directions and this used to
+        check neither end of it. Every message we send carries a per-client uuid4 `source`;
+        the editor stamps its reply's `source` with its own node id and its `dest` with the
+        node id of whoever sent the command -- engine PythonScriptRemoteExecution.cpp:620,
+        SendCommandResultMessage(InMessage.Source, ...).
+
+        Checking it matters because "the first process that connected to my port" is NOT the
+        same fact as "the editor I selected". open_connection is a MULTICAST datagram, so
+        every remote-exec node on the box sees it; the real editor honours its dest
+        (PassesReceiveFilter, same file) but nothing on the wire forces that, and the
+        connect-back is an ordinary TCP connection to an advertised port. A node that ignores
+        dest -- which is exactly what this repo's own fake editor did -- hijacks every
+        exchange on the machine and answers success: true with its own canned output. That is
+        how `uap exec` returned another caller's "hello" on 2026-09-25, while several agents
+        shared one editor and the test suite ran alongside them (ClickUp 17tm466ft7z).
+
+        dest is enforced only when present: source alone already identifies the answering
+        process, and refusing a reply that omits an optional field would trade a silent wrong
+        answer for a noisy wrong failure.
+        """
         buf = b""
         while True:
             try:
@@ -733,8 +804,22 @@ print('UAPNODE:' + json.dumps({'project': unreal.Paths.get_project_file_path(),
                 break
             buf += chunk
             msg = self._decode(buf)
-            if msg is not None:
-                if msg.get("type") == self.T_COMMAND_RESULT:
-                    return msg.get("data", {})
+            if msg is None:
+                continue
+            if msg.get("type") != self.T_COMMAND_RESULT:
                 buf = b""  # unexpected complete message; keep reading
-        return None
+                continue
+            src = str(msg.get("source") or "")
+            dst = str(msg.get("dest") or "")
+            if src == expect_source and (not dst or dst == self._node_id):
+                return msg.get("data", {}), None
+            data = msg.get("data") or {}
+            outs = [str(o.get("output", "")) for o in (data.get("output") or [])
+                    if isinstance(o, dict)]
+            return None, {
+                "source": src, "dest": dst,
+                "expected_source": expect_source, "expected_dest": self._node_id,
+                "command": str(data.get("command") or "")[:200],
+                "output": ("".join(outs))[:200],
+            }
+        return None, None
