@@ -11,6 +11,9 @@ Two channels:
 from __future__ import annotations
 
 import json
+import os
+import pathlib
+import re
 import socket
 import struct
 import time
@@ -20,6 +23,73 @@ from typing import Any
 import httpx
 
 from unreal_agent_player.errors import AgentError, ErrorCode
+
+# --- proven-node cache (ClickUp 17tm466ft35) ---------------------------------------------------
+# Every `uap exec` re-ran the WHOLE discovery handshake from scratch: multicast ping, an 0.8s
+# settle window to catch every responder, then a full identity probe -- itself a round-trip that
+# executes Python IN the editor -- against each one, before the caller's actual code ran. Measured
+# on this workstation with two editors open: ~1.05s of discovery plus two probe round-trips, per
+# call, every call.
+#
+# None of that answers a new question after the first time. The node id is a uuid4 minted by the
+# editor's remote-exec module when the process starts, so it identifies that process for its whole
+# lifetime. So: remember the node we PROVED matches, and on the next call just ask whether it is
+# still there. A cache hit skips the settle window and both probes; a miss (editor restarted ->
+# new node id, so the ping goes unanswered) falls through to the full path unchanged.
+#
+# The safety property this must not weaken is "never talk to a node that does not match" -- two
+# real incidents came from a fallback here (PIE started in the WRONG PROJECT; `exec` answered from
+# a `-game` client). The cache cannot weaken it: an entry is only ever written after a real probe
+# matched, it is keyed by the same project+instance selector that proved it, and it is only used
+# when THAT EXACT node id answers and its pid is still alive. A stale entry can only fail to
+# match, never mis-match. $UAP_NODE_CACHE=0 disables it.
+_NODE_CACHE_OFF = {"0", "false", "no", "off"}
+# How long to wait for the known node to say it is still there. It is a localhost round-trip that
+# takes single-digit milliseconds when the editor is up; this is the give-up bound, after which
+# the full discovery path runs anyway.
+_FAST_PING_TIMEOUT = 0.35
+_FAST_PING_TRIES = 2
+
+
+def node_cache_enabled() -> bool:
+    raw = os.environ.get("UAP_NODE_CACHE")
+    return not (raw is not None and raw.strip().lower() in _NODE_CACHE_OFF)
+
+
+def _node_cache_dir() -> pathlib.Path:
+    root = os.environ.get("UAP_REPORTS_DIR")
+    base = pathlib.Path(root) if root else (pathlib.Path.home() / ".uap-reports")
+    return base / ".nodes"
+
+
+def _pid_alive(pid: int) -> bool:
+    """Local, cheap liveness check -- a second gate on a cached entry, costing no network."""
+    if not pid:
+        return False
+    if os.name == "nt":
+        try:
+            import ctypes
+
+            k32 = ctypes.windll.kernel32
+            h = k32.OpenProcess(0x1000, False, int(pid))   # QUERY_LIMITED_INFORMATION
+            if not h:
+                return False
+            try:
+                code = ctypes.c_ulong()
+                ok = k32.GetExitCodeProcess(h, ctypes.byref(code))
+                return bool(ok) and code.value == 259      # STILL_ACTIVE
+            finally:
+                k32.CloseHandle(h)
+        except Exception:
+            return True                                    # cannot check -> let the ping decide
+    try:
+        os.kill(int(pid), 0)
+        return True
+    except OSError:
+        return False
+    except Exception:
+        return True
+
 
 SUBSYSTEM_OBJECT_PATH = "/Engine/Transient.UAPAgentSubsystem_0"
 DEFAULT_PRESET_NAME = "UAP_Preset"
@@ -298,6 +368,22 @@ print('UAPNODE:' + json.dumps({'project': unreal.Paths.get_project_file_path(),
             ) from exc
         dest = (self.MULTICAST_GROUP, self.MULTICAST_PORT)
         try:
+            # FAST PATH: a node we have already PROVED matches this exact selector. One ping to
+            # that node id; if it answers, its identity is already established and both the
+            # settle window and the identity probes are pure cost. See the cache notes at the
+            # top of this module for why this cannot mis-target.
+            cached = self._cached_node()
+            if cached is not None and self._ping_node(mcast, dest, str(cached["node"])):
+                self._prior_target = self.last_target
+                self.last_target = cached
+                self._last_candidates = [cached]
+                result = self._run_on_node(mcast, dest, str(cached["node"]), code,
+                                           unattended, exec_mode)
+                if result is not None:
+                    return result
+                # It answered discovery but would not run anything: stop trusting the entry and
+                # fall through to the full path, which will re-probe and re-cache.
+                self._forget_node()
             # The target's PONG can be slow/dropped on a given round, so re-discover a few
             # times rather than failing -- and NEVER fall back to a node that does not match
             # (see _select_node).
@@ -318,7 +404,9 @@ print('UAPNODE:' + json.dumps({'project': unreal.Paths.get_project_file_path(),
                     retry_hint="Project Settings > Python > Enable Remote Execution, then restart the editor",
                 )
             if target is None:
+                self._forget_node()
                 raise self._no_match_error(nodes)
+            self._remember_node(self.last_target)
             result = self._run_on_node(mcast, dest, target, code, unattended, exec_mode)
             if result is None:
                 raise AgentError(ErrorCode.UE_REMOTE_EXEC_OFF,
@@ -326,6 +414,69 @@ print('UAPNODE:' + json.dumps({'project': unreal.Paths.get_project_file_path(),
             return result
         finally:
             mcast.close()
+
+    # --- proven-node cache ---
+
+    def _cache_key(self) -> str:
+        raw = f"{self._node_project_substr or '_any'}|{self._node_instance}"
+        return re.sub(r"[^A-Za-z0-9]+", "-", raw).strip("-").lower() or "default"
+
+    def _cache_file(self) -> pathlib.Path:
+        return _node_cache_dir() / f"{self._cache_key()}.json"
+
+    def _cached_node(self) -> dict[str, Any] | None:
+        """A previously PROVEN node for this exact selector, or None.
+
+        Re-checks the recorded identity against the live selector before returning it, so an
+        entry written under a different filter can never be honoured here, and drops it if the
+        process is gone.
+        """
+        if not node_cache_enabled():
+            return None
+        try:
+            info = json.loads(self._cache_file().read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return None
+        if not isinstance(info, dict) or not info.get("node"):
+            return None
+        if not self._matches_project(info) or not self._matches_instance(info):
+            return None                       # belt and braces: the filter must still hold
+        if not _pid_alive(int(info.get("pid") or 0)):
+            self._forget_node()
+            return None
+        return info
+
+    def _remember_node(self, info: dict[str, Any] | None) -> None:
+        if not node_cache_enabled() or not info or info.get("probe_failed"):
+            return
+        try:
+            f = self._cache_file()
+            f.parent.mkdir(parents=True, exist_ok=True)
+            f.write_text(json.dumps(info), encoding="utf-8")
+        except OSError:
+            pass                              # a cache that cannot be written is only slow
+
+    def _forget_node(self) -> None:
+        try:
+            self._cache_file().unlink()
+        except OSError:
+            pass
+
+    def _ping_node(self, mcast: socket.socket, dest: tuple[str, int], node: str) -> bool:
+        """Is that exact node still answering? Returns on ITS pong, never on anyone else's."""
+        mcast.settimeout(0.1)
+        for _ in range(_FAST_PING_TRIES):
+            mcast.sendto(self._encode(self.T_PING), dest)
+            deadline = time.monotonic() + _FAST_PING_TIMEOUT
+            while time.monotonic() < deadline:
+                try:
+                    raw, _addr = mcast.recvfrom(8192)
+                except (TimeoutError, OSError):
+                    continue
+                msg = self._decode(raw)
+                if msg and msg.get("type") == self.T_PONG and str(msg.get("source")) == node:
+                    return True
+        return False
 
     # --- internals ---
 

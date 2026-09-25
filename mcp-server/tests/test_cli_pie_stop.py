@@ -177,3 +177,18 @@ def test_wait_asks_whether_the_world_is_LIVE_not_merely_queued(monkeypatch, caps
     seen = _stub(monkeypatch, {"IsInPIE": True})
     assert cli.main(["pie", "wait", "5"]) == 0
     assert seen == ["IsInPIE"] and _out(capsys)["playing"] is True
+
+
+# --- poll granularity (ClickUp 17tm466ft35) ---------------------------------------------------
+# Both PIE waits polled on a flat 0.5s, so a start or stop the engine finished in 0.2s was still
+# reported ~0.5s later. The CONFIRMATION is not what is being shortened here -- `pie stop` still
+# does not return until teardown is real -- only the rounding up of it.
+
+
+def test_pie_poll_is_fast_early_then_backs_off():
+    assert cli._pie_poll_interval(0.0) == cli._PIE_POLL_FAST_SECONDS
+    assert cli._pie_poll_interval(2.9) == cli._PIE_POLL_FAST_SECONDS
+    assert cli._pie_poll_interval(3.1) == cli._PIE_POLL_SLOW_SECONDS
+    assert cli._pie_poll_interval(120.0) == cli._PIE_POLL_SLOW_SECONDS
+    # Backing off matters: a cold map load can take a minute and must not be polled 600 times.
+    assert cli._PIE_POLL_FAST_SECONDS < cli._PIE_POLL_SLOW_SECONDS

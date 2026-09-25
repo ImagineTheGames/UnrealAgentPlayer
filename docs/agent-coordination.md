@@ -189,6 +189,33 @@ a hold left by a session that died and has not aged out. `UAP_MACHINE_LOCK=0` di
 entirely -- an escape hatch so a coordination bug can never be the thing standing between an agent
 and the editor, not a setting to reach for.
 
+## Waiting is FIFO
+
+`acquire ... --wait <n>` used not to queue. Every blocked agent polled independently, so whoever
+happened to look in the instant after a release won, regardless of how long anyone had waited. On
+2026-09-24 one agent waited out two full 900s caps and lost both times to agents that asked later,
+then got it on a third try; three of the six agents sharing that editor gave up on runtime
+verification altogether. Reproduced with four processes arriving 1.5s apart: the old code granted
+in exact REVERSE arrival order, so the longest waiter went last every time.
+
+A blocked acquire now registers itself in a `waiters` list in arrival order, and only the head of
+the queue may take the lease. The queue lives in the same state file under the same O_EXCL
+filelock as the grant decision, so no latecomer can slip past the head. The machine-wide
+foreground lock queues the same way, for the same reason.
+
+- A waiter re-registers on every poll. One that dies, is killed or times out ages out on a short
+  waiter TTL (15s -- a few poll intervals, not a lease TTL) and on PID-death, so it cannot wedge
+  the queue; a caller that times out also dequeues itself on the way out.
+- An agent that already holds the lease never queues behind its own waiters.
+- A run of SHARED waiters at the head goes together, since they do not exclude each other. An
+  exclusive waiter anywhere ahead still blocks shared traffic, so a queued rebuild cannot be
+  starved by a stream of readers.
+- Holder TTL age-out and `uap lease release --agent <token>` are unchanged.
+
+The `busy` response carries `queue_position`, `queue_ahead` and `queue_length`, and `uap lease
+status` / `lease machine-status` name the queue in order -- so an agent that gives up can report
+whether it was next or ninth instead of retrying blind.
+
 ## Non-goals
 
 - True parallel stateful work on one editor (physically impossible: one level, one PIE).

@@ -2,11 +2,14 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import contextlib
+import io
 import itertools
 import json
 import os
 import pathlib
 import re
+import shlex
 import sys
 import time
 
@@ -766,7 +769,24 @@ def _pie_start(mode: str, project: str | None) -> dict:
 #      within a bounded timeout; on timeout say ok:false and that the editor is NOT free.
 # (1) without (2) still returns before teardown finishes; (2) without (1) can only observe the
 # race, not prevent it.
-_PIE_STOP_POLL_SECONDS = 0.5
+# --- how often to ask "has it happened yet?" ----------------------------------------------
+# Both PIE waits polled on a flat 0.5s. A start or a stop that the engine finishes in 0.2s was
+# still reported ~0.5s later, and an agent running start/stop around each check paid that twice
+# per iteration for nothing (ClickUp 17tm466ft35). The wait itself is correct and stays -- `pie
+# stop` confirming teardown rather than acking a queued request is NOT negotiable, and none of
+# this shortens the engine's actual work. It only stops rounding it up.
+#
+# So: ask often while the answer is plausibly about to change, then back off. RC is a separate
+# channel from the game-thread Python exec (which must NOT be tight-looped during a transition --
+# it re-enters the task graph and hard-crashes the editor), and each poll is a synchronous
+# request/response, so a faster interval cannot pile up requests.
+_PIE_POLL_FAST_SECONDS = 0.1
+_PIE_POLL_FAST_WINDOW = 3.0
+_PIE_POLL_SLOW_SECONDS = 0.5
+
+
+def _pie_poll_interval(elapsed: float) -> float:
+    return _PIE_POLL_FAST_SECONDS if elapsed < _PIE_POLL_FAST_WINDOW else _PIE_POLL_SLOW_SECONDS
 
 
 def _float_env(name: str, default: float) -> float:
@@ -882,7 +902,7 @@ def _pie_stop(project: str | None, timeout: float) -> dict:
                 "`uap pie stop`, or stop it in the editor by hand."
             )
             break
-        time.sleep(_PIE_STOP_POLL_SECONDS)
+        time.sleep(_pie_poll_interval(now - t0))
     out["waited_seconds"] = round(time.monotonic() - t0, 2)
     if restops:
         out["restops"] = restops
@@ -893,7 +913,6 @@ def _pie_stop(project: str | None, timeout: float) -> dict:
 # One implementation of "is PIE live", shared by `pie wait` and by the blocking `pie start`.
 # Two notions of it would drift, and the whole class of bug here is a caller acting on a
 # weaker signal than the one it thinks it has.
-_PIE_WAIT_POLL_SECONDS = 0.5
 
 
 def _pie_wait_for_live(project: str | None, seconds: float) -> dict:
@@ -913,7 +932,7 @@ def _pie_wait_for_live(project: str | None, seconds: float) -> dict:
     deadline = t0 + max(0.0, seconds)
     playing = bool(_rc_call("IsInPIE", {}, project))
     while not playing and time.monotonic() < deadline:
-        time.sleep(_PIE_WAIT_POLL_SECONDS)
+        time.sleep(_pie_poll_interval(time.monotonic() - t0))
         playing = bool(_rc_call("IsInPIE", {}, project))
     return {"playing": playing, "waited_seconds": round(time.monotonic() - t0, 2)}
 
@@ -1702,6 +1721,19 @@ RECIPES
   Read game-truth (preferred over screenshots): uap rc CallTestHelper Name=... JsonArgs={}
     list helpers: uap helpers --names
 
+SPEED: a uap call costs ~0.6s before it reaches the editor (PowerShell host + the launcher's
+engine resolve + Python imports), and `exec` used to re-run the whole node-discovery handshake
+every time on top of that. Two things to know:
+  * `uap batch` runs many commands in ONE process and pays that once. 20 steps measured 11.0s as
+    separate calls and 0.75s as a batch. Same verbs, same lease/machine-lock guards, one JSON
+    line streamed per step plus a summary. Reach for it for any multi-step sequence.
+        uap batch "pie start --mode vr" "exec print(1)" "rc GetPIEPhase" "pie stop"
+        uap batch --file steps.txt      # one command per line, or a JSON array of arg arrays
+  * the editor `exec` talks to is remembered between calls, so discovery is one ping instead of
+    a ~1s handshake plus an identity probe per answering process. $UAP_NODE_CACHE=0 disables it.
+  Neither changes what any verb PROVES: `pie stop` still does not return until teardown is
+  confirmed, and `exec` still refuses to run against a process that does not match --project.
+
 FLAGS: --project <name>, --instance <sel> and --agent <token> are accepted by EVERY verb
 (ignored by the ones that don't touch the editor), so you can pass the same set on every call.
   --project picks the PROJECT; --instance picks WHICH PROCESS of it. Every verb targets that
@@ -2135,7 +2167,129 @@ def build_parser() -> argparse.ArgumentParser:
                           "releasing and has not aged out yet -- check `lease machine-status` "
                           "first, because the other project may simply still be playing.")
     lzm.set_defaults(func=_lease)
+
+    # --- batch --------------------------------------------------------------------------
+    b = sub.add_parser(
+        "batch", parents=[proj],
+        help="run several uap commands in ONE process, paying the startup cost once",
+        description="Run several uap commands in one process. Each step is exactly the verb you "
+                    "would have typed, runs under the same lease/machine-lock guards, and emits "
+                    "its own JSON line as it finishes; a final line summarises the run. The "
+                    "batch's --project/--agent are inherited by every step that does not set "
+                    "its own. Steps come from arguments, --file, or stdin, as either one shell "
+                    "line per command or a JSON array of argument arrays.")
+    b.add_argument("steps", nargs="*",
+                   help='one command per argument, e.g. "exec print(1)" "rc GetPIEPhase"')
+    b.add_argument("--file", default=None,
+                   help="read the steps from this file ('-' for stdin)")
+    b.add_argument("--keep-going", action="store_true",
+                   help="run every step even after one fails (default: stop, because a sequence "
+                        "normally assumes the step before it worked)")
+    b.set_defaults(func=_batch)
     return p
+
+
+# --- batch: many commands, one process ---------------------------------------------------
+# The per-call price of `uap` is mostly fixed and mostly not the editor. Measured on this
+# workstation (ClickUp 17tm466ft35): ~195ms to start a PowerShell host, ~170ms for the launcher's
+# engine resolve, ~235ms for the Python interpreter plus this package's imports -- roughly 0.6s
+# before a single packet leaves the machine -- and then, for `exec`, a full discovery handshake.
+# An agent running a 20-step sequence paid every one of those 20 times.
+#
+# `uap batch` pays them once. It is deliberately NOT a daemon: no background process to leak, no
+# lifetime to manage, no new way for a session to be left running. Each step runs through exactly
+# the same guard path as a standalone invocation (`_run_parsed`), so the lease, the machine lock
+# and every verb's semantics are unchanged -- what is saved is the setup, not the safety.
+
+
+def _batch_steps(args) -> list[list[str]]:
+    """The steps to run, from --file / stdin / inline arguments.
+
+    Two accepted shapes, because quoting is where a batch format goes wrong. A JSON array of
+    argument arrays is unambiguous and is what a script should emit; plain lines are for a human
+    and are split with shell rules.
+    """
+    if args.steps:
+        raw = "\n".join(args.steps)
+    elif args.file and args.file != "-":
+        raw = pathlib.Path(args.file).read_text(encoding="utf-8")
+    else:
+        raw = sys.stdin.read()
+    raw = raw.strip()
+    if raw.startswith("["):
+        parsed = json.loads(raw)
+        return [list(s) if isinstance(s, list) else shlex.split(str(s)) for s in parsed]
+    return [shlex.split(line) for line in raw.splitlines()
+            if line.strip() and not line.lstrip().startswith("#")]
+
+
+def _batch_run_step(args) -> int:
+    """Run one batch step exactly as a standalone `uap` invocation would.
+
+    A named seam, not indirection for its own sake: it is what makes "a step is the same verb you
+    would have typed" testable, and it is the single place a step's guard path could ever diverge
+    from a standalone one -- so if it does, it does so visibly.
+    """
+    return _run_parsed(args)
+
+
+def _batch(args) -> int:
+    parser = build_parser()
+    try:
+        steps = _batch_steps(args)
+    except (OSError, ValueError) as exc:
+        _emit({"ok": False, "error": f"could not read the batch steps: {exc}"})
+        return 2
+    if not steps:
+        _emit({"ok": False, "error": "no steps to run"})
+        return 2
+
+    results: list[dict] = []
+    failed = 0
+    t0 = time.monotonic()
+    for i, argv in enumerate(steps):
+        # Inherit the batch's own --project/--agent unless the step names its own, so a caller
+        # does not have to repeat the lease token on all twenty lines (and cannot forget it on
+        # one, which is how an agent locks itself out of its own lease).
+        if "--project" not in argv and args.project:
+            argv = [*argv, "--project", args.project]
+        if "--agent" not in argv and args.agent:
+            argv = [*argv, "--agent", args.agent]
+        step: dict = {"step": i + 1, "argv": argv}
+        buf = io.StringIO()
+        try:
+            with contextlib.redirect_stdout(buf):
+                code = _batch_run_step(parser.parse_args(argv))
+        except SystemExit as exc:            # argparse refused the step's own arguments
+            code = int(exc.code or 2)
+        except Exception as exc:             # a bad step must not kill the whole batch
+            code = 1
+            step["error"] = str(exc)
+        out = [ln for ln in buf.getvalue().splitlines() if ln.strip()]
+        step["exit_code"] = code
+        step["seconds"] = round(time.monotonic() - t0, 2)
+        try:
+            step["body"] = json.loads(out[-1]) if out else None
+        except (ValueError, IndexError):
+            step["body"] = None
+            step["output"] = out
+        results.append(step)
+        _emit(step)                          # stream, so a long batch is never silent
+        if code != 0:
+            failed += 1
+            if not args.keep_going:
+                break
+    summary = {"ok": failed == 0, "batch": True, "steps": len(steps), "ran": len(results),
+               "failed": failed, "seconds": round(time.monotonic() - t0, 2),
+               "results": results}
+    if failed and not args.keep_going and len(results) < len(steps):
+        summary["stopped_early"] = True
+        summary["not_run"] = len(steps) - len(results)
+        summary["hint"] = ("a step failed and the rest were NOT run, because a sequence normally "
+                           "assumes the step before it worked. Pass --keep-going to run them all "
+                           "regardless.")
+    _emit(summary)
+    return 0 if failed == 0 else 1
 
 
 def _lease_wait_cap() -> float:
@@ -2154,7 +2308,10 @@ def _lease_wait_cap() -> float:
 
 
 def main(argv: list[str] | None = None) -> int:
-    args = build_parser().parse_args(argv)
+    return _run_parsed(build_parser().parse_args(argv))
+
+
+def _run_parsed(args) -> int:
     cmd = getattr(args, "cmd", None)
     project = getattr(args, "project", "") or _env_project()
     # Coordination: if another agent is rebuilding this editor (it's down), wait it out instead of
