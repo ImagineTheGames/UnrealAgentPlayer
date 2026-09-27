@@ -1233,13 +1233,77 @@ def _sample_read(args) -> int:
     return 0 if body["ok"] else 1
 
 
+#: A cursor that is AHEAD of the capture's head did not come from this capture. The ring is
+#: rebuilt from scratch on every editor start, so a cursor taken before a restart (or from a
+#: different instance) points past the end of the current one -- and `log since` then answers
+#: `count: 0, ok: true`, which is the same false "clean log" shape by another route. The editor
+#: is shared and any agent may rebuild it via Restart-Editor.ps1 mid-task, so this is not exotic.
+_LOG_STALE_CURSOR_NOTE = (
+    "STALE CURSOR: {after} is ahead of this capture's head ({head}), so it was not taken from "
+    "the editor process now running -- the log ring is rebuilt on every editor start, and the "
+    "editor is shared, so a restart by another agent resets it. This read covered NONE of the "
+    "window you meant; count=0 says nothing about it. Take a fresh `uap log cursor`, or read "
+    "Saved/Logs/<Project>.log (and its SchoolsOut-backup-*.log for the pre-restart process)."
+)
+
+#: What a caller must be told when the window it asked for no longer exists in full. The
+#: point of the wording is that `count: 0` is NOT evidence of a clean log -- see _log_dropped.
+_LOG_TRUNCATED_NOTE = (
+    "log window TRUNCATED: the plugin's capture is a fixed-size ring buffer and the oldest "
+    "{dropped} record(s) of the range you asked for had already been evicted when this read "
+    "ran, so they were NOT searched. A low count -- and count=0 in particular -- is UNPROVEN "
+    "here, not a clean log. Either re-read a narrower window ending sooner after the action, "
+    "raise LogBufferCapacity under [/Script/UnrealAgentPlayer.UAPAgentSettings] in the "
+    "project's Config/DefaultEditor.ini and restart the editor, or read "
+    "Saved/Logs/<Project>.log for the evicted span."
+)
+
+
+def _log_dropped(after: int, first_returned: int | None, project) -> tuple[int, int | None]:
+    """How many records between `after` and the oldest SURVIVING record were evicted.
+
+    Capture cursors are handed out by a single `NextCursor++` per log record, so they are
+    contiguous: if the oldest retained record with cursor > `after` is K, then exactly
+    K - after - 1 records were dropped. That is an exact count, not an estimate.
+
+    `first_returned` is the lowest cursor the main read gave back. When it is already
+    after + 1 the window is provably intact and this costs nothing; otherwise it takes ONE
+    extra RC call, unfiltered and MaxLines=1, to find the true floor -- the main read cannot
+    reveal it because its own verbosity/category filter also skips records.
+
+    An empty probe means dropped=0 and is not a blind spot: eviction only ever removes the
+    OLDEST records, so if anything at all had been logged past `after` the newest of it would
+    still be there. No lines past the cursor therefore means nothing was logged past it.
+    """
+    if first_returned is not None and first_returned <= after + 1:
+        return 0, first_returned
+    probe = _rc_require("GetLogsSince",
+                        {"AfterCursor": after, "MaxLines": 1,
+                         "CategoryFilter": "", "MinVerbosity": "VeryVerbose"},
+                        project, _NEEDS_LOG)
+    parsed = json.loads(probe) if isinstance(probe, str) else (probe or {})
+    probe_lines = parsed.get("lines") or []
+    if not probe_lines:
+        return 0, None
+    oldest = int(probe_lines[0].get("cursor", after + 1))
+    return max(0, oldest - after - 1), oldest
+
+
 def _log(args) -> int:
     """Read the editor's log through the plugin's in-process capture, so log evidence lands in
     the report instead of being tailed out-of-band with shell tools -- and so it targets the
     SAME editor as every other verb (this machine runs two).
 
-    Note: this is the plugin's 4096-line ring buffer, populated from subsystem init onward. It
-    is not Saved/Logs/<Project>.log; for a whole-session history read that file directly."""
+    Note: this is the plugin's ring buffer (LogBufferCapacity, 4096 records by default),
+    populated from subsystem init onward. It is not Saved/Logs/<Project>.log; for a
+    whole-session history read that file directly.
+
+    The ring is why a sweep over a long window used to lie. A PIE session logs far more than
+    4096 records, so `log since <old cursor> --verbosity Error` searched only the surviving
+    tail and answered `count: 0, ok: true` -- indistinguishable from a clean log, while the
+    startup errors the caller was told to sweep for had been overwritten hours earlier. Every
+    read now reports `oldest_cursor` / `dropped`, and sets `truncated` + `warning` when the
+    requested window is not retained in full, so silence is provable rather than assumed."""
     sub = args.log_cmd
     t0 = time.monotonic()
     body: dict = {"ok": True}
@@ -1264,16 +1328,41 @@ def _log(args) -> int:
                               args.project, _NEEDS_LOG)
             parsed = json.loads(raw) if isinstance(raw, str) else (raw or {})
             lines = parsed.get("lines") or []
+            cursors = [int(ln.get("cursor", 0)) for ln in lines if ln.get("cursor") is not None]
             if args.grep:
                 try:
                     rx = re.compile(args.grep, re.IGNORECASE)
                 except re.error as exc:
                     _emit({"ok": False, "error": f"bad --grep regex: {exc}"})
                     return 2
-                lines = [ln for ln in lines if rx.search(str(ln.get("message", "")))]
+                # Match the record, not just its message text. `--grep "Error|Warning"` is the
+                # documented broad sweep and it used to match only `message`, so a record whose
+                # VERBOSITY is Error but whose text does not contain the word was missed: over
+                # one real window, 15 of 19 Error records were invisible to it. Verbosity and
+                # category are part of what an agent means when it greps for "Error" or for
+                # "LogJanitorAI", so they are part of what is searched. Over-matching a prose
+                # "error" is harmless in a sweep; under-matching a real one is the whole defect.
+                lines = [ln for ln in lines
+                         if rx.search(f"{ln.get('verbosity', '')} {ln.get('category', '')}: "
+                                      f"{ln.get('message', '')}")]
             body["cursor"] = parsed.get("cursor", after)
             body["count"] = len(lines)
             body["lines"] = lines
+            dropped, oldest = _log_dropped(after, min(cursors) if cursors else None,
+                                           args.project)
+            body["oldest_cursor"] = oldest
+            body["dropped"] = dropped
+            if dropped:
+                body["truncated"] = True
+                body["warning"] = _LOG_TRUNCATED_NOTE.format(dropped=dropped)
+            elif oldest is None and not lines:
+                # Nothing at all past the cursor. Honest when the cursor is at the head, a lie
+                # when it is past it -- so only here, where it can matter, pay for the head.
+                head = int(_rc_require("GetLogCursor", {}, args.project, _NEEDS_LOG) or 0)
+                body["head_cursor"] = head
+                if after > head:
+                    body["stale_cursor"] = True
+                    body["warning"] = _LOG_STALE_CURSOR_NOTE.format(after=after, head=head)
     except (AgentError, json.JSONDecodeError) as exc:
         body = _err(exc)
     _capture(f"log:{sub}", {"grep": getattr(args, "grep", None)}, body,
@@ -1678,6 +1767,13 @@ SAMPLING + LOGS (sub-second truth; a ~1s exec round-trip cannot see judder or a 
   uap log cursor                       grab a cursor BEFORE driving the condition
   uap log since <cursor> --grep RE     what the editor logged since then
   uap log tail 200 [--grep RE]         the last N captured lines (or --lines 200)
+    The capture is a fixed-size ring (LogBufferCapacity, 4096 records), so a long window does
+    not fit and a low count can mean "not looked at" rather than "not there". Every read now
+    carries `dropped` / `oldest_cursor`, and sets `truncated` + `warning` when part of the
+    window you asked for had already been evicted, or `stale_cursor` when the cursor predates
+    an editor restart. Treat either one as a sweep that did not happen.
+    `--grep` matches verbosity + category + message, so `--grep "Error|Warning"` finds records
+    CLASSIFIED that way, not just ones whose text happens to say the word.
 
 RECIPES
   Click an on-screen button by label (one call):
@@ -2113,7 +2209,9 @@ def build_parser() -> argparse.ArgumentParser:
                            ("since", "lines after a cursor from an earlier call")):
         lp = lgs.add_parser(name, parents=[proj], help=helptext)
         lp.add_argument("--lines", type=int, default=200)
-        lp.add_argument("--grep", default="", help="case-insensitive regex over the message")
+        lp.add_argument("--grep", default="",
+                        help="case-insensitive regex over verbosity + category + message, "
+                             "so `--grep 'Error|Warning'` finds records CLASSIFIED that way")
         lp.add_argument("--category", default="", help="exact log category, e.g. LogUAP")
         lp.add_argument("--verbosity", default="Log",
                         choices=["Fatal", "Error", "Warning", "Display", "Log",

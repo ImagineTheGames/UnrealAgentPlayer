@@ -1099,3 +1099,68 @@ one investigation.
 **If a `uap` command fails with no output, re-run it through a shell that does not reinterpret
 stderr** -- e.g. Bash invoking `powershell -NoProfile -File uap.ps1 ...` -- and the traceback
 appears. Do not conclude the editor is down, or the verb missing, from an empty failure.
+
+## 35. The mandatory broad log sweep answered "clean" for a window it never read -- FIXED
+
+`AGENTS.md` in School's Out VR makes a broad Error/Warning sweep MANDATORY before an agent
+finishes a task, and says silence reads as "did not look". Both documented ways into that sweep
+returned zero for a window that really did contain errors, and both returned `ok: true` while
+doing it, so an agent following the documented method made a FALSE statement while doing exactly
+as instructed. The project's `AGENTS.md` had to suspend its own rule against shell-tailing logs
+and tell agents to read `Saved/Logs/<Project>.log` instead (ClickUp 17tm466fydg).
+
+Measured over one PIE session, cursor 2779 to 27740: `log since <c> --verbosity Error` returned
+0, `--verbosity Warning` returned 0, and re-sweeping in 4000-line chunks returned 0. The raw log
+for that period held 35 Warning and 13 Error records, including `M_JanitorSkin` failing material
+translation and six `LogClass` uninitialised-property errors.
+
+**Three independent causes, not one.** The verbosity filter itself is correct -- that was ruled
+out first, live: against a fresh editor `--verbosity Error` returned 14 records and
+`--verbosity Warning` 46.
+
+1. **The capture is a fixed-size ring and truncation was invisible.** `FAgentLogCapture` keeps
+   `LogBufferCapacity` records (4096 by default, `UAPAgentSettings.h:17`) and `ReadSince`
+   silently returns only what survives; `GetLogsSince` reports no floor, and `OutCursor` is the
+   last MATCHING record, so nothing in the answer hints that 21,000 records of the requested
+   range had been overwritten. A PIE session logs several times the capacity, so a cursor taken
+   before the action always points below the floor. Checked against a real 17,793-line session
+   log: of 143 Error and 246 Warning lines, only 38 and 139 fall inside the last 4096 lines --
+   and `M_JanitorSkin` (line 1284) and all six `LogClass` errors (1392-1404) fall outside, which
+   is exactly the set the sweep reported as absent.
+2. **`--grep` matched only `message`.** `--grep "Error|Warning"` is the documented broad sweep,
+   but a record whose VERBOSITY is Error and whose text does not contain the word was invisible
+   to it. Measured live on one window of 35 Error/Warning records: message-only matching found
+   17 and missed 18, e.g. `[Warning] LogFileManager: DeleteFile was unable to delete ...`.
+3. **A cursor does not survive an editor restart.** The ring is rebuilt at subsystem init, the
+   editor is shared, and any agent may bounce it with `Restart-Editor.ps1` mid-task -- after
+   which the old cursor is past the head of the new capture and `log since` answers `count: 0`
+   for a window it never looked at. Observed live during the fix: the capture's cursor went 3413
+   to 1798 across a restart another agent performed.
+
+A fourth defect kept even a SUCCESSFUL sweep out of the evidence: `record_call` harvested log
+lines only for the MCP tool names `log_since` / `log_tail`, while the CLI records the same read
+as `log:since` / `log:tail`, so the report's "Log warnings/errors" panel stayed empty for every
+`uap log` an agent ran -- the opposite of the reason `AGENTS.md` tells agents to use it.
+
+**Fixed (CLI-side, live on pull -- no plugin rebuild).** `log since` / `log tail` now report
+`dropped` and `oldest_cursor` on every read, and set `truncated` + a `warning` when part of the
+requested window had been evicted, or `stale_cursor` + a `warning` when the cursor is ahead of
+the capture's head. `dropped` is exact rather than estimated: cursors come from a single
+`NextCursor++` so they are contiguous, and the oldest surviving record with cursor > `after`
+gives the count directly. It costs one extra RC call only when the main read cannot already
+prove contiguity. `--grep` now matches verbosity + category + message. `record_call` accepts
+both spellings of the log verbs.
+
+**Not fixed by that, and deliberately so: the ring is still 4096 records, so a whole-session
+sweep still does not fit.** The fix makes the gap VISIBLE, not absent. Raising
+`LogBufferCapacity` under `[/Script/UnrealAgentPlayer.UAPAgentSettings]` in the project's
+`Config/DefaultEditor.ini` needs no rebuild (it is a `config=Editor` `UDeveloperSettings`), only
+an editor restart, and 32768 covers the session measured above.
+
+**Still open, plugin-side (each needs a rebuild):** `GetLogsSince` should report the retained
+floor and the true head itself, so the CLI needs no probe round-trip; `OutCursor` should be the
+head rather than the last matching record, because a filtered read hands back a cursor BEHIND
+the head and a chained sweep then re-reads lines it already reported; and
+`UAPAgentSettings::bCaptureVerboseAndBelow` is declared but never read, so `FAgentLogCapture`
+stores Verbose and VeryVerbose records unconditionally -- measured at 798 of 3413 records, 23%
+of the ring spent on records no default read will ever return.

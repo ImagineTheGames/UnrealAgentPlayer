@@ -56,6 +56,23 @@ and renders an HTML report.
 - Read logs with `uap log cursor` before the action and `uap log since <c> --grep RE`
   after, so the evidence lands in the report and targets the right editor. Do not shell-tail
   `Saved/Logs/*.log`.
+- **A LOW LOG COUNT IS NOT A CLEAN LOG, and the read now tells you which one you got.** The
+  capture is a fixed-size ring (`LogBufferCapacity`, 4096 records), and one PIE session logs
+  several times that -- so a sweep from a cursor taken before a long action searches only the
+  surviving tail. It used to answer `count: 0, ok: true`, indistinguishable from nothing having
+  happened; over one real session that hid 35 Warning and 13 Error records, including a material
+  that failed to compile. Every `log since` / `log tail` now reports `dropped` and
+  `oldest_cursor`, and sets `truncated` + a `warning` when part of the window you asked for had
+  already been evicted, or `stale_cursor` when the cursor predates an editor restart (the ring is
+  rebuilt on every start, and a shared editor gets restarted under you). **`truncated` or
+  `stale_cursor` means the sweep did not happen**: re-read a narrower window, raise
+  `LogBufferCapacity` under `[/Script/UnrealAgentPlayer.UAPAgentSettings]` in the project's
+  `Config/DefaultEditor.ini` and restart the editor, or read `Saved/Logs/<Project>.log` for the
+  span it says it dropped. A clean sweep with `dropped: 0` is now worth what it says.
+- **`--grep` matches verbosity + category + message**, so `--grep "Error|Warning"` finds records
+  CLASSIFIED that way. It used to match only `message`, which meant a record whose verbosity was
+  Error but whose text did not contain the word was invisible: measured live on one window, it
+  found 17 of 35 Error/Warning records and reported the other 18 as absent.
 - If the behavior is HMD-only (OpenXR input, an `IsHeadMountedDisplayEnabled()` branch such as
   a world-space VR screen), start with `uap pie start --mode vr` -- flat PIE takes neither path,
   so the bug will look absent. `--mode vr` blocks for the live world exactly like flat does.

@@ -273,6 +273,14 @@ def _arg_summary(args: dict, limit: int = 200) -> dict:
     return out
 
 
+#: Both spellings of the log verbs. The MCP server names its tools `log_since` / `log_tail`;
+#: the CLI records the same reads as `log:since` / `log:tail`, and only the MCP spellings were
+#: matched here -- so every log line an agent read through `uap log` was dropped on the floor
+#: and the report's "Log warnings/errors" panel stayed empty, while AGENTS.md told agents to
+#: use `uap log` precisely SO the evidence would land in the report.
+_LOG_TOOLS = ("log_tail", "log_since", "log:tail", "log:since")
+
+
 def record_call(session: ReportSession, tool: str, args: dict,
                 body: dict, ms: int) -> None:
     """Append a timeline entry and harvest known tool outputs. Never raises."""
@@ -297,7 +305,7 @@ def record_call(session: ReportSession, tool: str, args: dict,
                     "remote_exec_reachable": body.get("remote_exec_reachable"),
                 },
             })
-        elif tool in ("log_tail", "log_since") and isinstance(body.get("lines"), list):
+        elif tool in _LOG_TOOLS and isinstance(body.get("lines"), list):
             kept = [ln for ln in body["lines"]
                     if str(ln.get("verbosity")) in ("Warning", "Error", "Fatal")]
             if kept:
