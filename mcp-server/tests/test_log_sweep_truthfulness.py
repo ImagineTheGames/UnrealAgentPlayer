@@ -251,3 +251,137 @@ def test_a_cursor_at_the_head_is_a_real_zero_not_a_stale_one(monkeypatch, capsys
     body = _out(capsys)
     assert body["count"] == 0 and body["head_cursor"] == 50
     assert "stale_cursor" not in body and "warning" not in body
+
+
+# --- `--lines` truncated from the NEWEST end, and said nothing [17tm466fz6a] ------------------
+#
+# The second way the same sweep lied, and the worse one: `--lines` went straight through as
+# MaxLines, and `FAgentLogCapture::ReadSince` fills that quota walking from the OLDEST surviving
+# record forward -- so the cap discarded the NEWEST end of the window, which is the end holding
+# whatever the agent had just caused. Measured over a 667-record window (cursor 1869..2536):
+# `--lines 200` answered 1870..2131, `--lines 300` answered 1870..2491, `--lines 500` answered
+# 1870..2527, and every one reported `dropped: 0` with no `truncated` and no `warning`. A
+# `--grep "PATROL ROUTE AUDIT"` over that window answered `count: 0` while 10 matches sat in it.
+#
+# (The measured spans are wider than the caps because a fraction of the records in them were
+# below the verbosity floor; the rings below admit everything, so the spans are exactly the cap.
+# The mechanism under test -- quota filled from the oldest record forward -- is the same.)
+
+def _audited_window() -> tuple[_FakeRing, int]:
+    """667 records past the cursor, with the 10 records being searched for at the NEWEST end."""
+    ring = _FakeRing(capacity=4096)
+    for i in range(1, 1870):
+        ring.serialize("Log", "LogTemp", f"startup line {i}")
+    cursor = ring.get_log_cursor()          # 1869, as in the measured session
+    for i in range(1870, 2527):
+        ring.serialize("Log", "LogTemp", f"routine line {i}")
+    for i in range(10):
+        ring.serialize("Log", "LogJanitorAI", f"PATROL ROUTE AUDIT leg {i} partial")
+    assert ring.get_log_cursor() == 2536
+    return ring, cursor
+
+
+def test_grep_finds_the_newest_matches_at_the_DEFAULT_lines(monkeypatch, capsys):
+    """The reported defect, as reported: default `--lines`, matches at the newest end.
+
+    This is the positive control for the whole fix -- the instrument returning a hit where it
+    used to return `count: 0` with no flag at all. 10 matches sit at cursors 2527..2536, past
+    where a 200-record quota filled from the oldest record forward would have stopped.
+    """
+    ring, cursor = _audited_window()
+    _wire(monkeypatch, ring)
+    assert cli.main(["log", "since", str(cursor), "--grep", "PATROL ROUTE AUDIT"]) == 0
+    body = _out(capsys)
+    assert body["count"] == 10
+    assert [ln["cursor"] for ln in body["lines"]] == list(range(2527, 2537))
+    assert body["dropped"] == 0                       # the window IS fully retained
+    assert "truncated" not in body
+
+
+def test_a_small_lines_still_finds_every_match_and_says_what_it_did_not_list(monkeypatch, capsys):
+    """`--lines` is a DISPLAY cap now, so the count is complete even when the listing is not --
+    and the shortening is declared instead of silent. The NEWEST are the ones kept."""
+    ring, cursor = _audited_window()
+    _wire(monkeypatch, ring)
+    assert cli.main(["log", "since", str(cursor), "--lines", "4"]) == 0
+    body = _out(capsys)
+    assert body["count"] == 667                       # complete: the whole window was scanned
+    assert body["listed"] == 4 and body["omitted"] == 663
+    assert body["listed_end"] == "newest"
+    assert [ln["cursor"] for ln in body["lines"]] == [2533, 2534, 2535, 2536]
+    assert "--lines" in body["warning"] and "NOT shown" in body["warning"]
+    # And the flag that means "the sweep did not happen" is NOT set: nothing was missed by the
+    # search, only by the listing. Conflating the two would send agents to the raw log for
+    # nothing, and this is the distinction the fix rests on.
+    assert "truncated" not in body and body["dropped"] == 0
+
+
+def test_the_named_negative_a_window_inside_lines_is_not_flagged(monkeypatch, capsys):
+    """Fewer matches than the cap: no `omitted`, no `listed_end`, no warning. If this ever
+    starts warning, the flag stops meaning anything and agents will learn to ignore it."""
+    ring, cursor = _audited_window()
+    _wire(monkeypatch, ring)
+    assert cli.main(["log", "since", str(cursor), "--grep", "PATROL ROUTE AUDIT",
+                     "--lines", "50"]) == 0
+    body = _out(capsys)
+    assert body["count"] == 10 and body["listed"] == 10
+    assert "omitted" not in body and "listed_end" not in body and "warning" not in body
+
+
+def test_keep_oldest_is_available_and_names_the_end_it_kept(monkeypatch, capsys):
+    """The direction is explicit, not assumed. `--keep newest` is the default because an agent
+    asking "what happened since X" means the records its own action produced; the old behaviour
+    was `oldest` and it was neither chosen nor stated."""
+    ring, cursor = _audited_window()
+    _wire(monkeypatch, ring)
+    assert cli.main(["log", "since", str(cursor), "--lines", "3", "--keep", "oldest"]) == 0
+    body = _out(capsys)
+    assert [ln["cursor"] for ln in body["lines"]] == [1870, 1871, 1872]
+    assert body["listed_end"] == "oldest" and body["omitted"] == 664
+
+
+def test_a_window_wider_than_one_page_is_scanned_in_full(monkeypatch, capsys):
+    """One GetLogsSince cannot answer a window wider than its own quota, so the window is paged.
+    A page shorter than the quota proves the ring was walked to its newest record, which is what
+    makes the termination exact rather than a guess."""
+    ring = _FakeRing(capacity=20000)
+    for i in range(1, 10001):
+        ring.serialize("Log", "LogTemp", f"line {i}")
+    ring.serialize("Error", "LogClass", "the needle, at the very newest end")
+    seen = _wire(monkeypatch, ring)
+    assert cli.main(["log", "since", "0", "--grep", "needle"]) == 0
+    body = _out(capsys)
+    assert body["count"] == 1 and body["scanned"] == 10001
+    assert body["lines"][0]["cursor"] == 10001
+    assert seen.count("GetLogsSince") == 3      # 4096 + 4096 + 1809, the last one short
+    assert "truncated" not in body
+
+
+def test_a_scan_that_hits_its_bound_says_the_count_is_a_floor(monkeypatch, capsys):
+    """The one case where a short listing DOES mean the window was not fully examined. It gets
+    `truncated` + `scan_incomplete`, the same weight as ring eviction, because it is the same
+    kind of blindness."""
+    ring = _FakeRing(capacity=20000)
+    for i in range(1, 10001):
+        ring.serialize("Log", "LogTemp", f"line {i}")
+    _wire(monkeypatch, ring)
+    assert cli.main(["log", "since", "0", "--max-scan", "5000"]) == 0
+    body = _out(capsys)
+    assert body["scan_incomplete"] is True and body["truncated"] is True
+    assert body["scanned"] == 8192              # two full pages, then the bound
+    assert "FLOOR" in body["warning"]
+
+
+def test_tail_still_reads_exactly_its_window_in_one_call(monkeypatch, capsys):
+    """`tail N` means the last N records and its window is N wide, so it cannot be truncated at
+    the newest end -- and it must not have grown an extra round-trip to prove that."""
+    ring = _FakeRing(capacity=4096)
+    for i in range(1, 501):
+        ring.serialize("Log", "LogTemp", f"line {i}")
+    seen = _wire(monkeypatch, ring)
+    assert cli.main(["log", "tail", "--lines", "50"]) == 0
+    body = _out(capsys)
+    assert body["count"] == 50 and body["listed"] == 50
+    assert [ln["cursor"] for ln in body["lines"]][0] == 451
+    assert seen.count("GetLogsSince") == 1
+    assert "omitted" not in body and "warning" not in body

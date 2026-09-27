@@ -29,6 +29,16 @@ and renders an HTML report.
   response) unless you pass `--keep-pie`, so an agent that always finishes its report never leaves
   a session live -- but check the field rather than assuming, and if `pie_stop_error` comes back
   the editor is still in PIE.
+- **THE REPORT SLOT IS ONE PER MACHINE, so pass `--agent <your-token>` on every report call.**
+  Two agents verifying at once used to collide QUIETLY: the second `report start` took the slot
+  with no check and no record, so the first agent's later notes and asserts went into the second
+  agent's run and then, once that one finished, got a bare `no active report` -- which reads as
+  "you forgot to start one". A start against a slot held by a DIFFERENT token is now REFUSED
+  (`busy: true, held_by: <token>`); with no token on either side there is nothing to compare, so
+  the take still happens -- it just says so, and the displaced run is closed as `incomplete`,
+  stamped and rendered instead of abandoned. `--takeover` is only for a slot left by a dead
+  session. If you get `no active report` mid-run, read the `superseded` field: it names the run
+  that lost the slot, when, and to whom.
 - A passing report REQUIRES a screenshot FROM THE EDITOR UNDER TEST -- capture with
   `uap screenshot <abs.png>` via this project's `uap.ps1` (it stamps the source editor). A shot of
   another editor (or a manual attach of unknown origin) auto-FAILS the pass. Pixels are not proof
@@ -47,6 +57,15 @@ and renders an HTML report.
   viewport holds Slate focus, and otherwise looks exactly like a dead feature. Sticks and
   keyboard keys already take the viewport route. Key names are exact
   FKeys (`W`, `C`, `LeftControl`, `SpaceBar`, `OculusTouch_Left_Thumbstick_Y`).
+- **A HOLD OUTLIVES THE CALL, BY DESIGN -- and a second hold is now REFUSED while one runs.**
+  `hold` / `axis` return as soon as the input is latched, because the point is to read game state
+  WHILE it is held (`--wait` blocks for the duration instead). The result therefore carries
+  `ends_in_seconds` + `ends_at_epoch` and a `note` saying it is still down. Consecutive holds
+  used to OVERLAP in silence -- "hold W for 3s, then hold A for 3s" gave 3 seconds of W+A, and a
+  pawn drifted ~3500 cm off the plaza before anyone noticed the run was contaminated. A hold on a
+  DIFFERENT key while one is still running now answers `overlap_refused: true` and names what is
+  down; `--overlap` says you meant them simultaneous, which is the right thing for two stick axes
+  (X and Y together). Re-issuing the SAME key is a re-assert and is still fine.
 - If input starts behaving oddly mid-session (a pawn stuck crouched, movement that will not
   stop), run `uap input release` -- it clears every hold AND flushes any key the engine still
   has down. `uap input status` shows what is held and whether it is really `down`.
@@ -73,6 +92,18 @@ and renders an HTML report.
   CLASSIFIED that way. It used to match only `message`, which meant a record whose verbosity was
   Error but whose text did not contain the word was invisible: measured live on one window, it
   found 17 of 35 Error/Warning records and reported the other 18 as absent.
+- **`--lines` on `log since` is a DISPLAY cap, not a read bound -- and it no longer decides what
+  gets searched.** It used to go straight through to the plugin, which fills its quota from the
+  OLDEST surviving record forward, so the cap **decapitated** the window: over a 667-record
+  window, `--lines 200` returned 1870..2131 and `--lines 500` returned 1870..2527, every one
+  reporting `dropped: 0` with no `truncated` and no `warning`, and a `--grep` over that window
+  answered `count: 0` while 10 matches sat in it. It failed in the worst direction -- it hid the
+  records the agent had just caused. The whole window is now paged and filtered first, so `count`
+  is the COMPLETE match count and a small `--lines` only shortens the LISTING, which is declared
+  as `omitted` + `listed_end` + a warning. The NEWEST are kept (`--keep oldest` to flip it). You
+  no longer need `--lines 30000`; the default is 2000 on `since`, 200 on `tail`.
+  `omitted` is NOT `truncated`: nothing was missed by the search, only by the listing, so it is
+  not a reason to go and read the raw log.
 - If the behavior is HMD-only (OpenXR input, an `IsHeadMountedDisplayEnabled()` branch such as
   a world-space VR screen), start with `uap pie start --mode vr` -- flat PIE takes neither path,
   so the bug will look absent. `--mode vr` blocks for the live world exactly like flat does.
