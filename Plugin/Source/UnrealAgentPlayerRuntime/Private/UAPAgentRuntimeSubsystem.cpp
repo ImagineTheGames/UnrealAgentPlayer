@@ -1,6 +1,7 @@
 #include "UAPAgentRuntimeSubsystem.h"
 
 #include "UnrealAgentPlayerRuntimeModule.h"
+#include "AgentActivity.h"
 #include "AgentInput.h"
 #include "AgentLogCapture.h"
 #include "AgentHelperDiscovery.h"
@@ -20,6 +21,7 @@
 #include "RemoteControlSettings.h"
 #include "Misc/CommandLine.h"
 #include "Misc/Parse.h"
+#include "Misc/Paths.h"
 
 namespace
 {
@@ -86,6 +88,7 @@ FString UUAPAgentRuntimeSubsystem::GetPluginVersion() const
 
 FString UUAPAgentRuntimeSubsystem::ExecuteConsoleCommand(FString Command)
 {
+    UAP_ACTIVITY(TEXT("console"), Command);
     UWorld* World = FAgentWorld::GetActiveGameWorld();
     if (!World) { return TEXT("ERROR: No active game world"); }
     FUAPStringOutputDevice Ar;
@@ -95,6 +98,7 @@ FString UUAPAgentRuntimeSubsystem::ExecuteConsoleCommand(FString Command)
 
 bool UUAPAgentRuntimeSubsystem::InjectKey(FString KeyName, bool bPressed, bool bRepeat)
 {
+    UAP_ACTIVITY(TEXT("input key"), KeyName);
     FKey Key(*KeyName);
     if (!Key.IsValid())
     {
@@ -106,26 +110,31 @@ bool UUAPAgentRuntimeSubsystem::InjectKey(FString KeyName, bool bPressed, bool b
 
 bool UUAPAgentRuntimeSubsystem::InjectMouseMove(float X, float Y, bool bAbsolute)
 {
+    UAP_ACTIVITY(TEXT("input mousemove"), FString());
     return FAgentInput::InjectMouseMove(FVector2D(X, Y), bAbsolute);
 }
 
 bool UUAPAgentRuntimeSubsystem::InjectMouseButton(EAgentMouseButton Button, bool bPressed)
 {
+    UAP_ACTIVITY(TEXT("input mousebutton"), FString());
     return FAgentInput::InjectMouseButton(Button, bPressed);
 }
 
 FString UUAPAgentRuntimeSubsystem::SetMousePosition(float X, float Y)
 {
+    UAP_ACTIVITY(TEXT("input mousepos"), FString());
     return FAgentInput::SetMousePositionJson(X, Y);
 }
 
 FString UUAPAgentRuntimeSubsystem::ClickMouse(EAgentMouseButton Button, FString X, FString Y)
 {
+    UAP_ACTIVITY(TEXT("click"), FString::Printf(TEXT("%s,%s"), *X, *Y));
     return FAgentInput::ClickMouseJson(Button, X, Y);
 }
 
 bool UUAPAgentRuntimeSubsystem::InjectAxis(FString AxisName, float Value, FString SlateUser)
 {
+    UAP_ACTIVITY(TEXT("input axis"), AxisName);
     int32 User = INDEX_NONE;
     FString UserError;
     if (!FAgentInput::ResolveSlateUserParam(SlateUser, User, UserError))
@@ -140,6 +149,7 @@ bool UUAPAgentRuntimeSubsystem::InjectAxis(FString AxisName, float Value, FStrin
 
 bool UUAPAgentRuntimeSubsystem::InjectGamepad(EAgentGamepadButton Button, bool bPressed, float AnalogValue, FString SlateUser)
 {
+    UAP_ACTIVITY(TEXT("input gamepad"), FString());
     int32 User = INDEX_NONE;
     FString UserError;
     if (!FAgentInput::ResolveSlateUserParam(SlateUser, User, UserError))
@@ -152,6 +162,7 @@ bool UUAPAgentRuntimeSubsystem::InjectGamepad(EAgentGamepadButton Button, bool b
 
 bool UUAPAgentRuntimeSubsystem::InjectXRButton(EAgentXRHand Hand, FString ButtonKeyName, bool bPressed)
 {
+    UAP_ACTIVITY(TEXT("input xr"), ButtonKeyName);
     FKey Key(*ButtonKeyName);
     if (!Key.IsValid())
     {
@@ -165,17 +176,20 @@ bool UUAPAgentRuntimeSubsystem::InjectXRButton(EAgentXRHand Hand, FString Button
 // path all live in FAgentInput so the editor and runtime subsystems cannot drift apart.
 FString UUAPAgentRuntimeSubsystem::HoldKey(FString KeyName, float Seconds)
 {
+    UAP_ACTIVITY(TEXT("input hold"), KeyName);
     return FAgentInput::HoldKeyJson(KeyName, Seconds);
 }
 
 FString UUAPAgentRuntimeSubsystem::HoldAxis(FString AxisKeyName, float Value, float Seconds,
                                             FString SlateUser)
 {
+    UAP_ACTIVITY(TEXT("input axis-hold"), AxisKeyName);
     return FAgentInput::HoldAxisJson(AxisKeyName, Value, Seconds, SlateUser);
 }
 
 FString UUAPAgentRuntimeSubsystem::ReleaseHeldInput(FString KeyName)
 {
+    UAP_ACTIVITY(TEXT("input release"), KeyName);
     return FAgentInput::ReleaseHeldJson(KeyName);
 }
 
@@ -187,22 +201,26 @@ FString UUAPAgentRuntimeSubsystem::GetHeldInput()
 FString UUAPAgentRuntimeSubsystem::StartPropertySample(FString ObjectPath, FString PropertyPath,
                                                        float Seconds, int32 MaxSamples)
 {
+    UAP_ACTIVITY(TEXT("sample start"), PropertyPath);
     return FAgentSampler::Start(ObjectPath, PropertyPath, Seconds, MaxSamples);
 }
 
 FString UUAPAgentRuntimeSubsystem::ReadPropertySample()
 {
+    UAP_ACTIVITY(TEXT("sample read"), FString());
     return FAgentSampler::Read();
 }
 
 bool UUAPAgentRuntimeSubsystem::StopPropertySample()
 {
+    UAP_ACTIVITY(TEXT("sample stop"), FString());
     FAgentSampler::Stop();
     return true;
 }
 
 bool UUAPAgentRuntimeSubsystem::InjectXRControllerPose(EAgentXRHand Hand, FVector Position, FRotator Orientation, bool bTracked)
 {
+    UAP_ACTIVITY(TEXT("input xr-pose"), FString());
     FUnrealAgentPlayerRuntimeModule* Rtm = FUnrealAgentPlayerRuntimeModule::Get();
     FAgentMotionController* MC = Rtm ? Rtm->GetMotionController() : nullptr;
     if (!MC) { return false; }
@@ -216,6 +234,7 @@ bool UUAPAgentRuntimeSubsystem::InjectXRControllerPose(EAgentXRHand Hand, FVecto
 
 bool UUAPAgentRuntimeSubsystem::ClearXRControllerOverride(EAgentXRHand Hand)
 {
+    UAP_ACTIVITY(TEXT("input xr-clear"), FString());
     FUnrealAgentPlayerRuntimeModule* Rtm = FUnrealAgentPlayerRuntimeModule::Get();
     FAgentMotionController* MC = Rtm ? Rtm->GetMotionController() : nullptr;
     if (!MC) { return false; }
@@ -225,11 +244,13 @@ bool UUAPAgentRuntimeSubsystem::ClearXRControllerOverride(EAgentXRHand Hand)
 
 FString UUAPAgentRuntimeSubsystem::DumpViewportUI()
 {
+    UAP_ACTIVITY(TEXT("read-ui"), FString());
     return FAgentUIReader::DumpViewportUI();
 }
 
 bool UUAPAgentRuntimeSubsystem::CaptureViewportWithUI(FString Filename)
 {
+    UAP_ACTIVITY(TEXT("screenshot"), FPaths::GetCleanFilename(Filename));
     if (Filename.IsEmpty())
     {
         return false;
@@ -250,6 +271,7 @@ int64 UUAPAgentRuntimeSubsystem::GetLogCursor() const
 FString UUAPAgentRuntimeSubsystem::GetLogsSince(
     int64 AfterCursor, int32 MaxLines, FString CategoryFilter, EAgentLogVerbosity MinVerbosity) const
 {
+    UAP_ACTIVITY(TEXT("log"), CategoryFilter);
     if (!LogCapture.IsValid())
     {
         return TEXT(R"({"cursor":0,"lines":[]})");
@@ -287,6 +309,7 @@ void UUAPAgentRuntimeSubsystem::RefreshHelperCache()
 
 TArray<FAgentHelperDescriptor> UUAPAgentRuntimeSubsystem::ListTestHelpers()
 {
+    UAP_ACTIVITY(TEXT("helpers"), FString());
     if (HelperCache.Num() == 0)
     {
         RefreshHelperCache();
@@ -301,6 +324,7 @@ FString UUAPAgentRuntimeSubsystem::ListTestHelpersJson()
 
 FString UUAPAgentRuntimeSubsystem::CallTestHelper(FString Name, FString JsonArgs)
 {
+    UAP_ACTIVITY(TEXT("helper"), Name);
     UClass* Cls = nullptr;
     UFunction* Fn = FAgentHelperDiscovery::Resolve(Name, Cls);
     if (!Fn)

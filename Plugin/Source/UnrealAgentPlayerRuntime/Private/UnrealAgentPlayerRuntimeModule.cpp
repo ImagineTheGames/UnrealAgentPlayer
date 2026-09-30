@@ -1,6 +1,7 @@
 #include "UnrealAgentPlayerRuntimeModule.h"
 #include "AgentInput.h"
 #include "AgentMotionController.h"
+#include "AgentOverlay.h"
 #include "AgentSampler.h"
 #include "Misc/CommandLine.h"
 #include "Misc/Parse.h"
@@ -42,6 +43,11 @@ void FUnrealAgentPlayerRuntimeModule::StartupModule()
     MotionController = MakeShared<FAgentMotionController>();
     MotionController->Register();
 
+    // In-viewport "what is uap doing" overlay (ClickUp 17tm466gqfj). Draw-only, registered with
+    // UDebugDrawService so it needs no actor, no widget and no tick; `uap.Overlay 0` unregisters
+    // the callback outright rather than early-outing inside it.
+    FUAPOverlay::Register();
+
 #if WITH_EDITOR
     // RemoteControl HTTP port management so several editors (and -game instances) can each
     // run RemoteControl at once -- required for parallel agent testing. The default port
@@ -69,6 +75,7 @@ void FUnrealAgentPlayerRuntimeModule::StartupModule()
 void FUnrealAgentPlayerRuntimeModule::ShutdownModule()
 {
     // Drop the per-frame tickers first: they hold statics that outlive the module otherwise.
+    FUAPOverlay::Unregister();
     FAgentInput::ShutdownHolds();
     FAgentSampler::Shutdown();
     if (MotionController.IsValid())
