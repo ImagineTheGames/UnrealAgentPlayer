@@ -382,6 +382,6 @@ def test_tail_still_reads_exactly_its_window_in_one_call(monkeypatch, capsys):
     assert cli.main(["log", "tail", "--lines", "50"]) == 0
     body = _out(capsys)
     assert body["count"] == 50 and body["listed"] == 50
-    assert [ln["cursor"] for ln in body["lines"]][0] == 451
+    assert body["lines"][0]["cursor"] == 451
     assert seen.count("GetLogsSince") == 1
     assert "omitted" not in body and "warning" not in body
