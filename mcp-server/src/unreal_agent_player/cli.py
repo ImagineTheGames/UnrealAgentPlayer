@@ -184,27 +184,34 @@ def _report_diag(args) -> int:
     s = _require_active(getattr(args, "agent", None))
     if s is None:
         return 2
+    # Read back through the command RESULT in a private namespace (quiet_expr), not print():
+    # a print is a LogPython line in the editor log, and the old top-level `ss`/`ws`/`w`
+    # bindings left a UWorld rooted in the shared remote-exec globals -- exactly what kills the
+    # editor on the next level load (ClickUp 17tm466jt8t, 17tm466g07m).
     code = (
         "import unreal, json\n"
         "ss = unreal.get_editor_subsystem(unreal.UAPAgentSubsystem)\n"
         "ws = unreal.get_editor_subsystem(unreal.UnrealEditorSubsystem)\n"
         "w = ws.get_game_world() or ws.get_editor_world()\n"
-        "print('UAPDIAG:' + json.dumps({"
+        "_uap_out = json.dumps({"
         "'plugin_version': ss.get_plugin_version(),"
         "'world': (w.get_name() if w else None),"
         "'is_in_pie': ss.is_in_pie(),"
         "'unit': ss.get_stat_group_text('unit'),"
-        "'fps': ss.get_stat_group_text('fps')}))\n"
+        "'fps': ss.get_stat_group_text('fps')})\n"
     )
     body: dict = {"ok": True}
     try:
         client = PythonRemoteExecClient(node_project_substr=args.project)
-        res = client.exec_python(code)
+        raw = client.eval_quiet(code)
         diag = None
-        for o in (res.get("output") or []):
-            line = o.get("output", "")
-            if "UAPDIAG:" in line:
-                diag = json.loads(line.split("UAPDIAG:", 1)[1].strip())
+        if isinstance(raw, str):
+            try:
+                diag = json.loads(raw)
+            except json.JSONDecodeError:
+                diag = None
+        if not isinstance(diag, dict):
+            diag = None
         if diag is None:
             body = {"ok": False, "error": "no diagnostics returned from editor"}
         else:
@@ -320,38 +327,30 @@ def _write_port_cache(project: str, port: int) -> None:
 def _exec_rc_port(project: str) -> int:
     """Ask the editor matching `project` (over Python remote-exec, which is addressed
     per-editor) for the RC HTTP port it actually bound. 0 if unreachable / no match."""
+    # Read back through the command RESULT, never print(): a print is a LogPython line in the
+    # editor's log on every call (ClickUp 17tm466jt8t). See PythonRemoteExecClient.quiet_expr.
     code = ("import unreal\n"
-            "print('UAPRCPORT:' + str("
-            "unreal.get_editor_subsystem(unreal.UAPAgentSubsystem).get_remote_control_port()))\n")
+            "_uap_out = int("
+            "unreal.get_editor_subsystem(unreal.UAPAgentSubsystem).get_remote_control_port())\n")
     try:
-        res = PythonRemoteExecClient(node_project_substr=project).exec_python(code)
+        port = PythonRemoteExecClient(node_project_substr=project).eval_quiet(code)
     except AgentError:
         return 0
-    for o in (res.get("output") or []):
-        line = o.get("output", "")
-        if "UAPRCPORT:" in line:
-            try:
-                return int(line.split("UAPRCPORT:", 1)[1].strip())
-            except ValueError:
-                return 0
-    return 0
+    return port if isinstance(port, int) and not isinstance(port, bool) else 0
 
 
 def _exec_project_name(project: str | None) -> str | None:
     """The project name of the editor matching `project` (via exec). Used to stamp a
     screenshot's provenance so a pass can't be proven with a shot of another editor."""
+    # Result, not print() -- see _exec_rc_port. This runs on every `uap screenshot`.
     code = ("import unreal\n"
-            "print('UAPPROJ:' + unreal.Paths.get_project_file_path()"
-            ".rsplit('/',1)[-1].rsplit('.',1)[0])\n")
+            "_uap_out = unreal.Paths.get_project_file_path()"
+            ".rsplit('/',1)[-1].rsplit('.',1)[0]\n")
     try:
-        res = PythonRemoteExecClient(node_project_substr=(project or "")).exec_python(code)
+        name = PythonRemoteExecClient(node_project_substr=(project or "")).eval_quiet(code)
     except AgentError:
         return None
-    for o in (res.get("output") or []):
-        line = o.get("output", "")
-        if "UAPPROJ:" in line:
-            return line.split("UAPPROJ:", 1)[1].strip()
-    return None
+    return name.strip() if isinstance(name, str) and name.strip() else None
 
 
 def _rc_port_for(project: str | None) -> int:

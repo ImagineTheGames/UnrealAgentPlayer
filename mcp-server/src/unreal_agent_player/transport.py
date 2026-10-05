@@ -10,6 +10,7 @@ Two channels:
 
 from __future__ import annotations
 
+import ast
 import json
 import os
 import pathlib
@@ -250,7 +251,15 @@ class PythonRemoteExecClient:
     # standalone client, its pid, and its command line. The project alone is not an identity --
     # `launch_2p_standalone.ps1` starts `UnrealEditor.exe -game` clients of the SAME project,
     # which answer this same discovery and report the same project file path.
-    NODE_PROBE = """import unreal, json, os
+    #
+    # The body leaves its answer in `_uap_out` and prints NOTHING. It used to `print()` it, and
+    # every print in remote-exec Python is a `LogPython:` line in the editor's Output Log and
+    # Saved/Logs -- one `UAPNODE:{...}` line per discovery, 235 of them in one day's
+    # SchoolsOut.log while several agents worked (ClickUp 17tm466jt8t). It is now read back
+    # through the command's RESULT instead: see quiet_expr. The "# UAPNODE" marker stays in the
+    # text so a fake node in the tests can recognise the probe.
+    NODE_PROBE_BODY = """# UAPNODE identity probe
+import unreal, json, os
 try:
     _editor = unreal.get_editor_subsystem(unreal.UnrealEditorSubsystem) is not None
 except Exception:
@@ -259,11 +268,46 @@ try:
     _cmdline = unreal.SystemLibrary.get_command_line()
 except Exception:
     _cmdline = ''
-print('UAPNODE:' + json.dumps({'project': unreal.Paths.get_project_file_path(),
-                              'role': 'editor' if _editor else 'game',
-                              'pid': os.getpid(),
-                              'cmdline': _cmdline[:400]}))
+_uap_out = json.dumps({'project': unreal.Paths.get_project_file_path(),
+                       'role': 'editor' if _editor else 'game',
+                       'pid': os.getpid(),
+                       'cmdline': _cmdline[:400]})
 """
+    # The old, LOGGED form. Used only when a node answered the quiet probe but its result
+    # could not be read -- so a node is never undiscoverable because of the quiet path.
+    NODE_PROBE = NODE_PROBE_BODY + "print('UAPNODE:' + _uap_out)\n"
+
+    @staticmethod
+    def quiet_expr(body: str, var: str = "_uap_out") -> str:
+        """A single EXPRESSION that runs `body` and evaluates to the value it left in `var`.
+
+        Sent with exec_mode "EvaluateStatement", which UE runs through RunString with
+        Py_eval_input and hands back as the command's `result` (the repr of the value) --
+        without writing anything to the Output Log. A `print()` would be a `LogPython:` line on
+        every call. `body` runs in a fresh, private namespace, so it also leaves nothing behind
+        in the remote-exec globals dict, which is shared by the whole editor session and is
+        where a stale UWorld can be rooted (see ClearRemoteExecGlobals in the plugin).
+        """
+        return f"(lambda _g: (exec({body!r}, _g), _g.get({var!r}))[1])({{}})"
+
+    @staticmethod
+    def decode_eval_result(res: dict[str, Any] | None) -> Any:
+        """The Python value behind an EvaluateStatement `result` (a repr), or None."""
+        raw = (res or {}).get("result")
+        if not isinstance(raw, str) or not raw:
+            return None
+        try:
+            return ast.literal_eval(raw)
+        except (ValueError, SyntaxError, MemoryError, RecursionError):
+            return None
+
+    def eval_quiet(self, body: str, var: str = "_uap_out") -> Any:
+        """Run `body` on the selected node and return the value it left in `var`, without a
+        single line reaching the editor's Output Log. None when the value could not be read."""
+        res = self.exec_python(self.quiet_expr(body, var), exec_mode="EvaluateStatement")
+        if res.get("success") is False:
+            return None
+        return self.decode_eval_result(res)
 
     def __init__(self, discovery_timeout: float = 3.0, exec_timeout: float = 30.0,
                  command_ip: str = "127.0.0.1", node_project_substr: str | None = None,
@@ -580,9 +624,37 @@ print('UAPNODE:' + json.dumps({'project': unreal.Paths.get_project_file_path(),
 
     def _probe_node(self, mcast: socket.socket, dest: tuple[str, int],
                     node: str) -> dict[str, Any] | None:
+        """Ask `node` who it is -- quietly first, so discovery writes nothing to its log."""
+        res = self._run_on_node(mcast, dest, node, self.quiet_expr(self.NODE_PROBE_BODY),
+                                True, "EvaluateStatement")
+        if not res:
+            return None          # did not answer at all: the logged form would not either
+        info = self._parse_node_info(self.decode_eval_result(res), node)
+        if info is not None:
+            return info
+        # It answered, but the quiet result could not be read. Fall back to the logged probe
+        # rather than leave a live node undiscoverable; this is the only path that prints.
         res = self._run_on_node(mcast, dest, node, self.NODE_PROBE, True, "ExecuteFile")
         if not res:
             return None
+        return self._parse_probe_output(res, node)
+
+    @staticmethod
+    def _parse_node_info(value: Any, node: str) -> dict[str, Any] | None:
+        if not isinstance(value, str):
+            return None
+        try:
+            info = json.loads(value)
+        except json.JSONDecodeError:
+            return None
+        if not isinstance(info, dict):
+            return None
+        info["node"] = node
+        info.setdefault("role", "unknown")
+        return info
+
+    @staticmethod
+    def _parse_probe_output(res: dict[str, Any], node: str) -> dict[str, Any] | None:
         lines = [o.get("output", "") for o in (res.get("output") or [])]
         lines.append(str(res.get("result") or ""))
         for line in lines:

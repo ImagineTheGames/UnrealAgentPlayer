@@ -100,7 +100,7 @@ class _FakeEditor:
 
     def __init__(self, node_id: str, allow: set[str], *, honour_dest: bool = True,
                  output: str | None = None, echo: bool = False, delay: float = 0.0,
-                 connect_delay: float = 0.0,
+                 connect_delay: float = 0.0, quiet_probe: bool = True,
                  project: str = FAKE_PROJECT, serve: bool = True):
         self.node_id = node_id
         self.allow = allow
@@ -109,6 +109,13 @@ class _FakeEditor:
         self.echo = echo
         self.delay = delay
         self.connect_delay = connect_delay
+        # True: answers the identity probe through the command RESULT, as a real editor does
+        # for exec_mode EvaluateStatement. False: an editor on which that quiet route fails, so
+        # the client has to fall back to the logged print() probe.
+        self.quiet_probe = quiet_probe
+        # (exec_mode, command, printed_output) for every command served. printed_output is
+        # what a real editor would have written to its Output Log as LogPython lines.
+        self.commands: list[tuple[str, str, str]] = []
         self.project = project
         self.serve = serve
         self._stop = threading.Event()
@@ -181,24 +188,36 @@ class _FakeEditor:
             return
         try:
             sent = conn.recv(65536)
-            command = ""
+            command, exec_mode = "", ""
             try:
-                command = (json.loads(sent.decode("utf-8")).get("data") or {}).get("command", "")
+                data = json.loads(sent.decode("utf-8")).get("data") or {}
+                command = data.get("command", "")
+                exec_mode = data.get("exec_mode", "")
             except Exception:
                 pass
+            success, result = True, "None"
             if "UAPNODE" in command:
-                out = "UAPNODE:" + json.dumps(
-                    {"project": self.project, "role": "editor", "pid": 4242,
-                     "cmdline": "UnrealEditor.exe Fake.uproject"}) + "\n"
+                ident = json.dumps({"project": self.project, "role": "editor", "pid": 4242,
+                                    "cmdline": "UnrealEditor.exe Fake.uproject"})
+                if exec_mode == "EvaluateStatement":
+                    # UE hands an evaluated value back as its repr, and prints nothing.
+                    out = ""
+                    if self.quiet_probe:
+                        result = repr(ident)
+                    else:
+                        success, result = False, "Traceback (most recent call last): ..."
+                else:
+                    out = "UAPNODE:" + ident + "\n"
             elif self.echo:
                 out = command            # echo the caller's own code back as its output
             else:
                 out = self.output if self.output is not None else "hello\n"
+            self.commands.append((exec_mode, command, out))
             if self.delay:
                 time.sleep(self.delay)
             conn.sendall(self._enc("command_result", dest=requester, data={
-                "success": True, "result": "None", "command": command,
-                "output": [{"type": "Info", "output": out}]}))
+                "success": success, "result": result, "command": command,
+                "output": [{"type": "Info", "output": out}] if out else []}))
         except OSError:
             pass
         finally:
@@ -331,3 +350,41 @@ def test_concurrent_callers_each_get_their_own_answer():
                 t.join(timeout=30)
 
     assert not failures, "crossed or wrong answers:\n" + "\n".join(failures)
+
+
+# --- the identity probe writes nothing to the editor's log (ClickUp 17tm466jt8t) -----------
+
+
+@pytest.mark.skipif(not _multicast_available(), reason="multicast port unavailable")
+def test_discovery_identifies_the_node_without_printing_anything(monkeypatch):
+    """The probe used to print `UAPNODE:{...}`, and every print in remote-exec Python is a
+    `LogPython:` line in the editor's Output Log: 235 of them in one day's SchoolsOut.log while
+    several agents worked. Discovery must still resolve the node, entirely through the
+    command RESULT, with zero printed output on the editor side."""
+    monkeypatch.setenv("UAP_NODE_CACHE", "0")      # force the full discovery + probe path
+    client = _new_client(discovery_timeout=4.0, exec_timeout=4.0, node_project_substr="Fake")
+    with _FakeEditor("quiet-node", {client._node_id}, echo=True) as fake:
+        client.exec_python("print('TOKEN-QUIET')")
+    assert client.last_target is not None and client.last_target["node"] == "quiet-node"
+    assert client.last_target["project"] == FAKE_PROJECT
+    probes = [c for c in fake.commands if "UAPNODE" in c[1]]
+    assert probes, "the identity probe never ran -- the test proves nothing"
+    assert all(mode == "EvaluateStatement" for mode, _cmd, _out in probes)
+    assert all(out == "" for _mode, _cmd, out in probes), \
+        "the identity probe printed -- that is a LogPython line in the editor log"
+    assert all("print(" not in cmd for _mode, cmd, _out in probes)
+
+
+@pytest.mark.skipif(not _multicast_available(), reason="multicast port unavailable")
+def test_a_node_whose_quiet_probe_fails_is_still_discovered_by_the_logged_one(monkeypatch):
+    """Never trade discoverability for a quiet log: if the quiet answer cannot be read, fall
+    back to the old printed probe rather than leave a live editor unreachable."""
+    monkeypatch.setenv("UAP_NODE_CACHE", "0")
+    client = _new_client(discovery_timeout=4.0, exec_timeout=4.0, node_project_substr="Fake")
+    with _FakeEditor("old-node", {client._node_id}, echo=True, quiet_probe=False) as fake:
+        result = client.exec_python("print('TOKEN-OLD')")
+    assert "TOKEN-OLD" in "".join(o["output"] for o in result["output"])
+    assert client.last_target is not None and client.last_target["node"] == "old-node"
+    modes = [mode for mode, cmd, _out in fake.commands if "UAPNODE" in cmd]
+    assert modes[0] == "EvaluateStatement"         # quiet first...
+    assert "ExecuteFile" in modes                  # ...logged only as the fallback
