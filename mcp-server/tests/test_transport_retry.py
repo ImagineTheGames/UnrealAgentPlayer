@@ -27,7 +27,7 @@ class _TimingOutConn:
 def test_read_command_result_maps_reset_to_agent_error():
     client = PythonRemoteExecClient()
     with pytest.raises(AgentError) as excinfo:
-        client._read_command_result(_ResettingConn())
+        client._read_command_result(_ResettingConn(), 'any-node')
     assert excinfo.value.code is ErrorCode.UE_CONNECTION_RESET
     assert excinfo.value.recoverable
     # Distinguishable by a caller without string-matching the message.
@@ -35,8 +35,10 @@ def test_read_command_result_maps_reset_to_agent_error():
 
 
 def test_read_command_result_still_returns_none_on_timeout():
-    # A timeout is NOT a reset: it keeps the pre-existing "no result" behaviour.
-    assert PythonRemoteExecClient()._read_command_result(_TimingOutConn()) is None
+    # A timeout is NOT a reset: it keeps the pre-existing "no result" behaviour. The second
+    # element of the pair says WHY there is no result -- None here means nothing answered at
+    # all, as opposed to somebody else having answered (ClickUp 17tm466ft7z).
+    assert PythonRemoteExecClient()._read_command_result(_TimingOutConn(), 'any-node') == (None, None)
 
 
 def test_exec_python_retries_a_reset_then_succeeds(monkeypatch):

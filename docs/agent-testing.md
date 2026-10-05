@@ -25,6 +25,21 @@ bone delta, log line) settle a question -- never a screenshot alone.
 
 ## `uap` verbs
 
+- `uap batch "<verb ...>" ["<verb ...>" ...]` / `--file <steps>` -- run several commands in ONE
+  process. A `uap` call costs about 0.6s before it reaches the editor (PowerShell host + the
+  project launcher's engine resolve + Python imports); a batch pays that once. Measured end to
+  end through `uap.ps1`: 20 steps as separate calls, 11.0s; the same 20 as one batch, 0.75s.
+  Each step runs through exactly the same guard path as a standalone invocation, so the lease,
+  the machine-wide foreground lock and every verb's own semantics are unchanged -- the saving is
+  in the setup, not the safety. One JSON line is streamed per step as it finishes, then a summary
+  line. A failing step stops the rest (a sequence normally assumes the one before it worked);
+  `--keep-going` overrides. The batch's `--project` / `--agent` are inherited by every step that
+  does not set its own, so a lease token cannot be forgotten on line 14 of 20. Steps are one
+  shell line per command, or -- when quoting is awkward -- a JSON array of argument arrays.
+
+      uap batch "pie start --mode vr" "exec print(1)" "rc GetPIEPhase" "pie stop"
+      uap batch --file steps.txt --agent mytoken
+
 - `uap status` -- preflight; `{ok, rc_reachable, plugin_version, rc_port, contract}`.
   **Read `contract`.** Every project vendors its own copy of the plugin while sharing one
   CLI, so a pulled CLI runs ahead of a project until that project rebuilds. `contract`

@@ -432,6 +432,16 @@ bool UUAPAgentSubsystem::InjectMouseButton(EAgentMouseButton Button, bool bPress
     return FAgentInput::InjectMouseButton(Button, bPressed);
 }
 
+FString UUAPAgentSubsystem::SetMousePosition(float X, float Y)
+{
+    return FAgentInput::SetMousePositionJson(X, Y);
+}
+
+FString UUAPAgentSubsystem::ClickMouse(EAgentMouseButton Button, FString X, FString Y)
+{
+    return FAgentInput::ClickMouseJson(Button, X, Y);
+}
+
 bool UUAPAgentSubsystem::InjectAxis(FString AxisName, float Value, FString SlateUser)
 {
     int32 User = INDEX_NONE;

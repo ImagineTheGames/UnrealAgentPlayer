@@ -2,11 +2,14 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import contextlib
+import io
 import itertools
 import json
 import os
 import pathlib
 import re
+import shlex
 import sys
 import time
 
@@ -766,7 +769,24 @@ def _pie_start(mode: str, project: str | None) -> dict:
 #      within a bounded timeout; on timeout say ok:false and that the editor is NOT free.
 # (1) without (2) still returns before teardown finishes; (2) without (1) can only observe the
 # race, not prevent it.
-_PIE_STOP_POLL_SECONDS = 0.5
+# --- how often to ask "has it happened yet?" ----------------------------------------------
+# Both PIE waits polled on a flat 0.5s. A start or a stop that the engine finishes in 0.2s was
+# still reported ~0.5s later, and an agent running start/stop around each check paid that twice
+# per iteration for nothing (ClickUp 17tm466ft35). The wait itself is correct and stays -- `pie
+# stop` confirming teardown rather than acking a queued request is NOT negotiable, and none of
+# this shortens the engine's actual work. It only stops rounding it up.
+#
+# So: ask often while the answer is plausibly about to change, then back off. RC is a separate
+# channel from the game-thread Python exec (which must NOT be tight-looped during a transition --
+# it re-enters the task graph and hard-crashes the editor), and each poll is a synchronous
+# request/response, so a faster interval cannot pile up requests.
+_PIE_POLL_FAST_SECONDS = 0.1
+_PIE_POLL_FAST_WINDOW = 3.0
+_PIE_POLL_SLOW_SECONDS = 0.5
+
+
+def _pie_poll_interval(elapsed: float) -> float:
+    return _PIE_POLL_FAST_SECONDS if elapsed < _PIE_POLL_FAST_WINDOW else _PIE_POLL_SLOW_SECONDS
 
 
 def _float_env(name: str, default: float) -> float:
@@ -882,7 +902,7 @@ def _pie_stop(project: str | None, timeout: float) -> dict:
                 "`uap pie stop`, or stop it in the editor by hand."
             )
             break
-        time.sleep(_PIE_STOP_POLL_SECONDS)
+        time.sleep(_pie_poll_interval(now - t0))
     out["waited_seconds"] = round(time.monotonic() - t0, 2)
     if restops:
         out["restops"] = restops
@@ -893,7 +913,6 @@ def _pie_stop(project: str | None, timeout: float) -> dict:
 # One implementation of "is PIE live", shared by `pie wait` and by the blocking `pie start`.
 # Two notions of it would drift, and the whole class of bug here is a caller acting on a
 # weaker signal than the one it thinks it has.
-_PIE_WAIT_POLL_SECONDS = 0.5
 
 
 def _pie_wait_for_live(project: str | None, seconds: float) -> dict:
@@ -913,7 +932,7 @@ def _pie_wait_for_live(project: str | None, seconds: float) -> dict:
     deadline = t0 + max(0.0, seconds)
     playing = bool(_rc_call("IsInPIE", {}, project))
     while not playing and time.monotonic() < deadline:
-        time.sleep(_PIE_WAIT_POLL_SECONDS)
+        time.sleep(_pie_poll_interval(time.monotonic() - t0))
         playing = bool(_rc_call("IsInPIE", {}, project))
     return {"playing": playing, "waited_seconds": round(time.monotonic() - t0, 2)}
 
@@ -1072,6 +1091,65 @@ def _input(args) -> int:
     return 0 if body.get("ok") else 1
 
 
+_NEEDS_MOUSE = ("positioning the mouse INSIDE a captured PIE viewport; the OS cursor cannot be "
+                "moved while PIE holds the mouse, so this has to happen engine-side")
+
+_MOUSE_BUTTONS = {"left": "Left", "right": "Right", "middle": "Middle",
+                  "xbutton1": "XButton1", "xbutton2": "XButton2"}
+
+
+def _input_mouse(args) -> int:
+    """Position and click the mouse inside a viewport that holds mouse capture.
+
+    Why this is not just SetCursorPos: while the PIE viewport has the mouse, the pointer cannot
+    be moved AT ALL. Win32 SetCursorPos is inert, and so is FSlateApplication::SetCursorPos --
+    measured live, SetCursorPos(1754, 989) left GetCursorPos() reading 0,0 while the call
+    reported success. The engine cannot cache a different position either: FSlateUser reads the
+    cursor straight back out of the platform cursor.
+
+    So the plugin does not move the cursor. Slate routes a pointer event by the position carried
+    ON THE EVENT, and that is what it stamps -- an "agent cursor". The old chain
+    (InjectMouseMove + InjectMouseButton) took its click position from GetCursorPos(), so every
+    injected click landed at 0,0 on nothing while reporting ok:true. ClickUp 17tm466fbyj.
+
+    x/y are ABSOLUTE SCREEN PIXELS -- the same space `read-ui` reports, so read-ui output feeds
+    straight in. The result carries `hit`: the Slate widgets actually found under the point. An
+    empty `hit` on a click is reported as a FAILURE, not a success, because clicking nothing is
+    exactly the outcome this verb exists to stop reporting as ok."""
+    sub = args.mouse_cmd
+    t0 = time.monotonic()
+    body: dict = {"ok": True, "action": f"mouse {sub}"}
+    try:
+        if sub == "move":
+            body.update(_rc_json("SetMousePosition", {"X": args.x, "Y": args.y},
+                                 args.project, needs=_NEEDS_MOUSE))
+        else:  # click
+            if (args.x is None) != (args.y is None):
+                _emit({"ok": False, "action": "mouse click", "clicked": False,
+                       "error": "give BOTH x and y or neither"})
+                return 1
+            # Strings on the wire, empty for "omitted". RemoteControl zero-initialises the
+            # argument struct, so an omitted float would arrive as 0.0 -- a valid position, and
+            # the top-left corner: the exact silent miss this verb replaces.
+            params = {"Button": _MOUSE_BUTTONS[args.button],
+                      "X": "" if args.x is None else str(args.x),
+                      "Y": "" if args.y is None else str(args.y)}
+            body.update(_rc_json("ClickMouse", params, args.project, needs=_NEEDS_MOUSE))
+            if body.get("ok") and not str(body.get("hit") or ""):
+                # The plugin delivered the events and says so; what it did NOT do is hit a
+                # widget. Reporting that as ok:true is the bug, not the click.
+                body["ok"] = False
+                body.setdefault("error", body.get("warning")
+                                or "the click landed on no Slate widget")
+    except (AgentError, json.JSONDecodeError) as exc:
+        body = _err(exc)
+    _capture(f"input:mouse:{sub}", {k: v for k, v in vars(args).items()
+                                    if k in ("x", "y", "button")},
+             body, int((time.monotonic() - t0) * 1000))
+    _emit(body)
+    return 0 if body.get("ok") else 1
+
+
 def _sample_stats(samples: list) -> dict:
     """Frame-to-frame movement of the sampled value: what a judder test actually asserts on.
     Works for numbers and for the {x,y,z} / {pitch,yaw,roll} objects the sampler emits."""
@@ -1173,11 +1251,14 @@ def _log(args) -> int:
             # every natural reading use the positional form, so rejecting it was a trap.
             positional = getattr(args, "cursor", None)
             after = positional if positional is not None else args.since
+            # `log tail 400` and `log tail --lines 400` are the same request.
+            count = getattr(args, "count", None)
+            lines = count if count is not None else args.lines
             if sub == "tail":
                 current = int(_rc_require("GetLogCursor", {}, args.project, _NEEDS_LOG) or 0)
-                after = max(0, current - args.lines)
+                after = max(0, current - lines)
             raw = _rc_require("GetLogsSince",
-                              {"AfterCursor": after, "MaxLines": args.lines,
+                              {"AfterCursor": after, "MaxLines": lines,
                                "CategoryFilter": args.category,
                                "MinVerbosity": args.verbosity},
                               args.project, _NEEDS_LOG)
@@ -1287,9 +1368,30 @@ def _click(args) -> int:
         else:
             x, y = float(match["x"]), float(match["y"])
             body.update({"matched": match.get("text"), "x": x, "y": y})
-            _rc_call("InjectMouseMove", {"X": x, "Y": y, "bAbsolute": True}, args.project)
-            _rc_call("InjectMouseButton", {"Button": "Left", "bPressed": True}, args.project)
-            _rc_call("InjectMouseButton", {"Button": "Left", "bPressed": False}, args.project)
+            # ClickMouse stamps the position onto the pointer events. The old chain below took
+            # its click position from the OS cursor, which cannot be moved while the PIE
+            # viewport holds the mouse -- so it clicked 0,0 and reported ok (ClickUp
+            # 17tm466fbyj). Degrade to it only on a plugin too old to have the new verb, and
+            # SAY SO, because on that path a success is not evidence of a click.
+            try:
+                res = _rc_json("ClickMouse", {"Button": "Left", "X": str(x), "Y": str(y)},
+                               args.project, needs=_NEEDS_MOUSE)
+                body.update({k: v for k, v in res.items() if k != "ok"})
+                if not str(res.get("hit") or ""):
+                    body["ok"] = False
+                    body.setdefault("error", res.get("warning")
+                                    or "the click landed on no Slate widget")
+            except AgentError as exc:
+                if not _is_missing_verb(exc) and "sync and rebuild" not in str(exc):
+                    raise
+                _rc_call("InjectMouseMove", {"X": x, "Y": y, "bAbsolute": True}, args.project)
+                _rc_call("InjectMouseButton", {"Button": "Left", "bPressed": True}, args.project)
+                _rc_call("InjectMouseButton", {"Button": "Left", "bPressed": False}, args.project)
+                body["degraded"] = (
+                    "this editor's plugin has no ClickMouse, so the click went out on the legacy "
+                    "chain, which takes its position from the OS cursor. If that viewport holds "
+                    "mouse capture the cursor cannot be moved and the click landed at 0,0 -- "
+                    "ok here is NOT evidence of a click. Rebuild the plugin for this project.")
     except (AgentError, ValueError, KeyError, json.JSONDecodeError) as exc:
         body = _err(exc)
     _capture("click", {"label": args.label}, body, int((time.monotonic() - t0) * 1000))
@@ -1545,6 +1647,27 @@ SUSTAINED INPUT (a single injected event CANNOT drive locomotion -- see below)
   reach Enhanced Input" has already cost another project several sessions -- it was the
   wrong verb, not a missing capability.
 
+MOUSE (a captured viewport pins the pointer -- the POSITION is the hard part, not the click)
+  uap input mouse move <x> <y>         put the agent cursor at an ABSOLUTE screen point
+  uap input mouse click [x y] [--button left]   press+release there (omit x y to use the
+                                       position `mouse move` left)
+  x/y are ABSOLUTE SCREEN PIXELS -- exactly what `read-ui` prints, so its output feeds in
+  unchanged. Read the element's x,y, move, click, then `read-ui` AGAIN to prove the UI
+  changed. A screenshot is not proof; a different read-ui is.
+  Why a verb at all: while PIE holds mouse capture the pointer CANNOT BE MOVED. Win32
+  SetCursorPos is inert and so is FSlateApplication::SetCursorPos (FSlateUser reads the
+  position straight back out of the platform cursor), so `SetCursorPos(1754,989)` then
+  `GetCursorPos()` still reads 0,0 -- while both calls report success. The plugin therefore
+  does not move the cursor: Slate routes a pointer event by the position carried ON THE EVENT,
+  so it stamps that instead. The legacy chain (`rc InjectMouseMove` + `rc InjectMouseButton`)
+  read the pinned OS cursor for its click position, so every click landed at 0,0, hit nothing
+  and reported ok:true. That is the whole of ClickUp 17tm466fbyj -- the LAYER was right all
+  along, the POSITION was the corner of the screen.
+  The result carries `hit`: the Slate widgets really found under the point. A click whose
+  `hit` is empty FAILS instead of returning ok. It also reports `os_cursor_moved` (usually
+  false, and that is fine) and `game_mouse_set` -- the separate PlayerController-side cache
+  that GetMousePosition / GetHitResultUnderCursor read, which IS settable under capture.
+
 SAMPLING + LOGS (sub-second truth; a ~1s exec round-trip cannot see judder or a 0.6s wind-up)
   uap sample start <object> <property> --seconds N   per-frame series + delta stats
       object: /Game/... path | actor name in the live world | PlayerPawn | PlayerController
@@ -1554,16 +1677,20 @@ SAMPLING + LOGS (sub-second truth; a ~1s exec round-trip cannot see judder or a 
   uap sample read [--summary]          read the series (use with `sample start --no-wait`)
   uap log cursor                       grab a cursor BEFORE driving the condition
   uap log since <cursor> --grep RE     what the editor logged since then
-  uap log tail --lines 200 --grep RE   the last N captured lines
+  uap log tail 200 [--grep RE]         the last N captured lines (or --lines 200)
 
 RECIPES
   Click an on-screen button by label (one call):
     uap click "VR TRAINING"
-  ...or the underlying chain (what `uap click` does), e.g. to click a precise spot:
+  ...or the underlying chain (what `uap click` does), e.g. to click a precise spot, and to
+  PROVE it landed -- the second read-ui showing different content is the evidence:
     uap read-ui                                   # find the element's x,y
-    uap rc InjectMouseMove X=<x> Y=<y> bAbsolute=true
-    uap rc InjectMouseButton Button=Left bPressed=true
-    uap rc InjectMouseButton Button=Left bPressed=false
+    uap input mouse move <x> <y>                  # `hit` names the widget really under it
+    uap input mouse click
+    uap read-ui                                   # MUST now show the new screen
+  Do NOT use `rc InjectMouseMove` + `rc InjectMouseButton` for this. Those take the click
+  position from the OS cursor, which a captured PIE viewport pins -- they report ok and click
+  the top-left corner (ClickUp 17tm466fbyj).
   Press a key once (routes through the real input path):
     uap rc InjectKey KeyName=E bPressed=true ; uap rc InjectKey KeyName=E bPressed=false
   WALK for 3 seconds and read state WHILE moving (this is what one-shot injection cannot do):
@@ -1596,6 +1723,19 @@ RECIPES
     uap nav down ; uap nav accept   # focus nav + activate
   Read game-truth (preferred over screenshots): uap rc CallTestHelper Name=... JsonArgs={}
     list helpers: uap helpers --names
+
+SPEED: a uap call costs ~0.6s before it reaches the editor (PowerShell host + the launcher's
+engine resolve + Python imports), and `exec` used to re-run the whole node-discovery handshake
+every time on top of that. Two things to know:
+  * `uap batch` runs many commands in ONE process and pays that once. 20 steps measured 11.0s as
+    separate calls and 0.75s as a batch. Same verbs, same lease/machine-lock guards, one JSON
+    line streamed per step plus a summary. Reach for it for any multi-step sequence.
+        uap batch "pie start --mode vr" "exec print(1)" "rc GetPIEPhase" "pie stop"
+        uap batch --file steps.txt      # one command per line, or a JSON array of arg arrays
+  * the editor `exec` talks to is remembered between calls, so discovery is one ping instead of
+    a ~1s handshake plus an identity probe per answering process. $UAP_NODE_CACHE=0 disables it.
+  Neither changes what any verb PROVES: `pie stop` still does not return until teardown is
+  confirmed, and `exec` still refuses to run against a process that does not match --project.
 
 FLAGS: --project <name>, --instance <sel> and --agent <token> are accepted by EVERY verb
 (ignored by the ones that don't touch the editor), so you can pass the same set on every call.
@@ -1667,6 +1807,20 @@ def _pie_state_for_lease(project: str | None) -> tuple[bool | None, str]:
 
 def _lease(args) -> int:
     """Multi-agent coordination lease for a shared editor. See docs/agent-coordination.md."""
+    try:
+        return _lease_inner(args)
+    except _coord.CoordinationError as exc:
+        # The lease could not be decided safely, so it was not decided. Say that as a structured
+        # refusal rather than a traceback: a traceback through a PowerShell tool comes back as
+        # NativeCommandError with the message stripped, which reads as a silent failure.
+        _emit({"ok": False, "coordination_unsafe": True, "cmd": f"lease {args.lease_cmd}",
+               "error": str(exc),
+               "hint": "nothing was granted or released. Retry; if it persists, `uap lease "
+                       "status` and check no agent is wedged holding the editor."})
+        return 1
+
+
+def _lease_inner(args) -> int:
     proj = getattr(args, "project", "") or _env_project()
     cmd = args.lease_cmd
     if cmd == "acquire":
@@ -1912,6 +2066,25 @@ def build_parser() -> argparse.ArgumentParser:
     inps.add_parser("status", parents=[proj],
                     help="what is currently held and for how much longer").set_defaults(func=_input)
 
+    # Mouse position inside a CAPTURED viewport. Not a hold -- a position, which is a different
+    # problem: while PIE holds the mouse the pointer cannot be moved at all (Win32 SetCursorPos
+    # and FSlateApplication::SetCursorPos are both inert), so the plugin stamps the position
+    # onto the injected pointer events instead. See _input_mouse.
+    im = inps.add_parser("mouse", help="position/click the mouse inside a captured PIE viewport")
+    ims = im.add_subparsers(dest="mouse_cmd", required=True)
+    imm = ims.add_parser("move", parents=[proj], help="move the agent cursor to x,y")
+    imm.add_argument("x", type=float, help="ABSOLUTE screen pixels -- what `read-ui` reports")
+    imm.add_argument("y", type=float)
+    imm.set_defaults(func=_input_mouse)
+    imc = ims.add_parser("click", parents=[proj],
+                         help="press+release at the agent cursor, or at x y if given")
+    imc.add_argument("x", type=float, nargs="?", default=None,
+                     help="optional; omit to click where `mouse move` left the cursor")
+    imc.add_argument("y", type=float, nargs="?", default=None)
+    imc.add_argument("--button", default="left",
+                     choices=["left", "right", "middle", "xbutton1", "xbutton2"])
+    imc.set_defaults(func=_input_mouse)
+
     # Frame-rate property sampling: sub-second behaviour a ~1s exec round-trip cannot see.
     smp = sub.add_parser("sample", help="record a property per-frame in-engine, return the series")
     smps = smp.add_subparsers(dest="sample_cmd", required=True)
@@ -1953,6 +2126,12 @@ def build_parser() -> argparse.ArgumentParser:
             # naturally; only accepting --since made the documented incantation an error.
             lp.add_argument("cursor", type=int, nargs="?", default=None,
                             help="cursor from `uap log cursor` (same as --since)")
+        if name == "tail":
+            # Same trap, other verb: `uap log tail 400` died with "unrecognized arguments: 400"
+            # and required `--lines 400`. `since` already accepted its positional; this did not,
+            # which makes the inconsistency itself the trap (ClickUp 17tm466ft7z).
+            lp.add_argument("count", type=int, nargs="?", default=None,
+                            help="how many lines (same as --lines)")
         lp.set_defaults(func=_log)
     lgs.add_parser("cursor", parents=[proj],
                    help="current log cursor -- grab one BEFORE driving the condition"
@@ -2011,7 +2190,129 @@ def build_parser() -> argparse.ArgumentParser:
                           "releasing and has not aged out yet -- check `lease machine-status` "
                           "first, because the other project may simply still be playing.")
     lzm.set_defaults(func=_lease)
+
+    # --- batch --------------------------------------------------------------------------
+    b = sub.add_parser(
+        "batch", parents=[proj],
+        help="run several uap commands in ONE process, paying the startup cost once",
+        description="Run several uap commands in one process. Each step is exactly the verb you "
+                    "would have typed, runs under the same lease/machine-lock guards, and emits "
+                    "its own JSON line as it finishes; a final line summarises the run. The "
+                    "batch's --project/--agent are inherited by every step that does not set "
+                    "its own. Steps come from arguments, --file, or stdin, as either one shell "
+                    "line per command or a JSON array of argument arrays.")
+    b.add_argument("steps", nargs="*",
+                   help='one command per argument, e.g. "exec print(1)" "rc GetPIEPhase"')
+    b.add_argument("--file", default=None,
+                   help="read the steps from this file ('-' for stdin)")
+    b.add_argument("--keep-going", action="store_true",
+                   help="run every step even after one fails (default: stop, because a sequence "
+                        "normally assumes the step before it worked)")
+    b.set_defaults(func=_batch)
     return p
+
+
+# --- batch: many commands, one process ---------------------------------------------------
+# The per-call price of `uap` is mostly fixed and mostly not the editor. Measured on this
+# workstation (ClickUp 17tm466ft35): ~195ms to start a PowerShell host, ~170ms for the launcher's
+# engine resolve, ~235ms for the Python interpreter plus this package's imports -- roughly 0.6s
+# before a single packet leaves the machine -- and then, for `exec`, a full discovery handshake.
+# An agent running a 20-step sequence paid every one of those 20 times.
+#
+# `uap batch` pays them once. It is deliberately NOT a daemon: no background process to leak, no
+# lifetime to manage, no new way for a session to be left running. Each step runs through exactly
+# the same guard path as a standalone invocation (`_run_parsed`), so the lease, the machine lock
+# and every verb's semantics are unchanged -- what is saved is the setup, not the safety.
+
+
+def _batch_steps(args) -> list[list[str]]:
+    """The steps to run, from --file / stdin / inline arguments.
+
+    Two accepted shapes, because quoting is where a batch format goes wrong. A JSON array of
+    argument arrays is unambiguous and is what a script should emit; plain lines are for a human
+    and are split with shell rules.
+    """
+    if args.steps:
+        raw = "\n".join(args.steps)
+    elif args.file and args.file != "-":
+        raw = pathlib.Path(args.file).read_text(encoding="utf-8")
+    else:
+        raw = sys.stdin.read()
+    raw = raw.strip()
+    if raw.startswith("["):
+        parsed = json.loads(raw)
+        return [list(s) if isinstance(s, list) else shlex.split(str(s)) for s in parsed]
+    return [shlex.split(line) for line in raw.splitlines()
+            if line.strip() and not line.lstrip().startswith("#")]
+
+
+def _batch_run_step(args) -> int:
+    """Run one batch step exactly as a standalone `uap` invocation would.
+
+    A named seam, not indirection for its own sake: it is what makes "a step is the same verb you
+    would have typed" testable, and it is the single place a step's guard path could ever diverge
+    from a standalone one -- so if it does, it does so visibly.
+    """
+    return _run_parsed(args)
+
+
+def _batch(args) -> int:
+    parser = build_parser()
+    try:
+        steps = _batch_steps(args)
+    except (OSError, ValueError) as exc:
+        _emit({"ok": False, "error": f"could not read the batch steps: {exc}"})
+        return 2
+    if not steps:
+        _emit({"ok": False, "error": "no steps to run"})
+        return 2
+
+    results: list[dict] = []
+    failed = 0
+    t0 = time.monotonic()
+    for i, argv in enumerate(steps):
+        # Inherit the batch's own --project/--agent unless the step names its own, so a caller
+        # does not have to repeat the lease token on all twenty lines (and cannot forget it on
+        # one, which is how an agent locks itself out of its own lease).
+        if "--project" not in argv and args.project:
+            argv = [*argv, "--project", args.project]
+        if "--agent" not in argv and args.agent:
+            argv = [*argv, "--agent", args.agent]
+        step: dict = {"step": i + 1, "argv": argv}
+        buf = io.StringIO()
+        try:
+            with contextlib.redirect_stdout(buf):
+                code = _batch_run_step(parser.parse_args(argv))
+        except SystemExit as exc:            # argparse refused the step's own arguments
+            code = int(exc.code or 2)
+        except Exception as exc:             # a bad step must not kill the whole batch
+            code = 1
+            step["error"] = str(exc)
+        out = [ln for ln in buf.getvalue().splitlines() if ln.strip()]
+        step["exit_code"] = code
+        step["seconds"] = round(time.monotonic() - t0, 2)
+        try:
+            step["body"] = json.loads(out[-1]) if out else None
+        except (ValueError, IndexError):
+            step["body"] = None
+            step["output"] = out
+        results.append(step)
+        _emit(step)                          # stream, so a long batch is never silent
+        if code != 0:
+            failed += 1
+            if not args.keep_going:
+                break
+    summary = {"ok": failed == 0, "batch": True, "steps": len(steps), "ran": len(results),
+               "failed": failed, "seconds": round(time.monotonic() - t0, 2),
+               "results": results}
+    if failed and not args.keep_going and len(results) < len(steps):
+        summary["stopped_early"] = True
+        summary["not_run"] = len(steps) - len(results)
+        summary["hint"] = ("a step failed and the rest were NOT run, because a sequence normally "
+                           "assumes the step before it worked. Pass --keep-going to run them all "
+                           "regardless.")
+    _emit(summary)
+    return 0 if failed == 0 else 1
 
 
 def _lease_wait_cap() -> float:
@@ -2030,7 +2331,10 @@ def _lease_wait_cap() -> float:
 
 
 def main(argv: list[str] | None = None) -> int:
-    args = build_parser().parse_args(argv)
+    return _run_parsed(build_parser().parse_args(argv))
+
+
+def _run_parsed(args) -> int:
     cmd = getattr(args, "cmd", None)
     project = getattr(args, "project", "") or _env_project()
     # Coordination: if another agent is rebuilding this editor (it's down), wait it out instead of

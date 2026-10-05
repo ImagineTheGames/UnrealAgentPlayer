@@ -1020,3 +1020,82 @@ Item 29 is covered by unit tests (`tests/test_cli_pie_start_waits.py`, plus the 
 machine were in use, and verifying it means starting PIE. The live check is one command --
 `uap pie start` must return `playing: true` with a non-zero `waited_seconds` a few seconds later,
 and `uap pie start --no-wait` must return at once with `queued: true`.
+
+## 32. `uap exec` returned ANOTHER caller's output, with `ok: true` -- FIXED
+
+On 2026-09-25, twice, on a workstation running five agents against one editor, `uap exec`
+returned this for a script that printed nothing of the sort:
+
+```json
+{"ok": true, "output": ["hello\n"]}
+```
+
+An identical re-run was correct. The call did not fail; it succeeded with somebody else's
+answer, which is worse than any error -- an agent reading engine state to decide whether a fix
+worked gets handed a different call's result and believes it.
+
+**Why it was possible.** Remote-execution discovery is machine-wide multicast on UDP 6766, and
+`open_connection` is a multicast datagram advertising a TCP port for the editor to connect back
+to. Every remote-exec node on the box sees it. The real editor honours the datagram's `dest`
+(engine `PythonScriptRemoteExecution.cpp`, `PassesReceiveFilter`), but nothing on the wire
+forces that, and the connect-back is an ordinary TCP connection to an advertised port. So
+"the first process that connected to my port" was never the same fact as "the editor I
+selected" -- and `_read_command_result` returned the first `command_result` it read without
+checking who sent it.
+
+**What crossed them was this repo's own test suite.** `tests/test_python_remote_exec.py` used
+to start a fake editor bound to the real multicast port that answered every ping on the machine
+and every `open_connection` regardless of `dest`, replying `success: true` with the canned
+output `"hello\n"`. Running `pytest` here therefore raced every concurrent `uap exec` on the
+box and won whenever its in-process connect-back beat the editor's game-thread tick.
+
+**Fixed** by checking the correlation that was already on the wire in both directions: the
+reply's `source` must be the node we addressed and its `dest` must be us. A foreign reply is
+refused, never returned, and `UE_CROSSED_RESPONSE` names what answered. The fake editors in the
+tests now answer only an allowlist of node ids the test created, so the suite can never again
+answer another process's discovery.
+
+This also closed a hole in TARGETING, not just in reading: `_probe_node` is a command exchange,
+so a node that hijacked a connect-back could answer the identity probe addressed to a different
+node and have its project/role recorded as that node's.
+
+**If you see `UE_CROSSED_RESPONSE`:** something else on the machine is answering remote
+execution. Check with `uap nodes`, and check whether anyone is running this repo's test suite.
+
+## 33. The exclusive lease was not exclusive -- FIXED
+
+Agent `skylight` held the exclusive lease with ttl 600; `ladderproof` was granted exclusive 147s
+later, while that lease was live and unexpired, and skylight's PIE session died under it. It
+found out only because a later `pie stop` reported `was_playing: false`.
+
+The FIFO wait queue (`18b4fdc`) did NOT cause this. Every line of `_acquire_filelock`, `_load`
+and `_save` dates from the original lease commit `f558f19`, and a probe against pre-FIFO and
+post-FIFO checkouts grants the intruder identically on both.
+
+**Cause.** Two reads that could not tell "the answer is no" from "I could not read the answer":
+`_save` used `write_text`, which truncates then writes, so a reader could catch the file empty
+or half-written; and `_load` turned any parse error into a blank state whose `exclusive` is
+None -- "the lease is free". The reader then granted itself the lease and saved that over the
+real holder. The holder's lease did not expire, it was deleted.
+
+Note the shape it shares with issue 32: a lookup that fails OPEN where it must fail closed.
+
+**Fixed**: `_save` is atomic (`os.replace`); `_load` retries a present-but-unparseable file and
+then raises `LeaseStateUnreadable` (a MISSING file still means genuinely free);
+`_acquire_filelock` raises `LeaseUnavailable` instead of giving up the mutex and proceeding
+unprotected; `_release_filelock` removes the lock only while it is still ours, so one broken
+lock no longer cascades. `uap lease` renders these as a structured `coordination_unsafe`
+refusal stating that nothing was granted or released.
+
+## 34. A uap traceback can be swallowed entirely by the PowerShell tool -- GUIDANCE
+
+Running `uap` through an agent harness's PowerShell tool can wrap native stderr into a
+`NativeCommandError` and discard the message, so a Python traceback from the CLI arrives as an
+empty failure. It looks exactly like a silent hang or a broken editor, and it has already cost
+one investigation.
+
+`AGENTS.md` in School's Out VR warns about this for builds; it applies to every `uap` call.
+
+**If a `uap` command fails with no output, re-run it through a shell that does not reinterpret
+stderr** -- e.g. Bash invoking `powershell -NoProfile -File uap.ps1 ...` -- and the traceback
+appears. Do not conclude the editor is down, or the verb missing, from an empty failure.

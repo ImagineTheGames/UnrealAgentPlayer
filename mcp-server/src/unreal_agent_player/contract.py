@@ -84,6 +84,10 @@ PURPOSE = {
     "GetLogCursor": "`log cursor` -- reading the editor log ring buffer through the plugin",
     "GetLogsSince": "`log since` / `log tail`",
     "DumpViewportUI": "`read-ui` / `click` -- reading on-screen UMG text and focus",
+    "SetMousePosition": "`input mouse move` -- positioning the pointer INSIDE a captured PIE "
+                        "viewport, which the OS cannot do (SetCursorPos is inert under capture)",
+    "ClickMouse": "`input mouse click` / `click` -- a click stamped with a real position; the "
+                  "legacy chain took its position from the pinned OS cursor and hit 0,0",
     "SelectTab": "`tab` -- selecting a CommonUI tab",
     "NavigateUI": "`nav` -- Slate focus navigation",
     "CaptureViewportWithUI": "`screenshot` -- capturing the composited game+UMG frame",
