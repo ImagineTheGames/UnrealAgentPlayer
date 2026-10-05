@@ -154,8 +154,11 @@ def _stub_diag(monkeypatch, unit, fps):
         def __init__(self, node_project_substr=None):
             pass
 
-        def exec_python(self, code):
-            return {"output": [{"output": "UAPDIAG:" + json.dumps(payload)}]}
+        def eval_quiet(self, code):
+            # `report diag` reads its answer back through the command result, not a print
+            # (ClickUp 17tm466jt8t), so the stub answers the quiet route.
+            assert "print(" not in code
+            return json.dumps(payload)
 
     monkeypatch.setattr(cli, "PythonRemoteExecClient", _Client)
 

@@ -30,11 +30,42 @@ def _load_active() -> sess.ReportSession | None:
     return sess.ReportSession.load(run)
 
 
-def _require_active():
-    """Return the active session, or None after emitting the no-session error."""
+def _require_active(agent: str | None = None):
+    """Return the active session, or None after emitting the no-session error.
+
+    Two failures used to arrive as the same bare `no active report`, and neither said what
+    happened. The slot is ONE per machine: a second `report start` took it, so a first agent's
+    later note/assert either wrote into a STRANGER'S report or, once that one finished and
+    cleared the pointer, got told there was no report at all -- as if it had forgotten to start
+    one. Both are now named.
+    """
     s = _load_active()
     if s is None:
-        _emit({"ok": False, "error": "no active report; run `uap report start` first"})
+        body = {"ok": False, "error": "no active report; run `uap report start` first"}
+        lost = sess.find_superseded_run(agent)
+        if lost:
+            by = lost.get("superseded_by") or {}
+            body["error"] = (
+                f"no active report. NOTE: run {lost['run_dir']} (task {lost.get('task')!r}, "
+                f"agent {lost.get('agent')!r}) LOST the machine-wide report slot at "
+                f"{by.get('at')} to a `report start` from agent {by.get('agent')!r} -- there is "
+                f"one slot per machine. If that was your report, its evidence up to that point "
+                f"is in that directory; anything after it was never recorded. Start a fresh "
+                f"report and pass --agent <your-token> so the slot cannot be taken silently.")
+            body["superseded"] = lost
+        _emit(body)
+        return None
+    holder = sess.get_active_owner() or {}
+    held_agent = (holder.get("agent") or "").strip()
+    mine = (agent or "").strip()
+    if held_agent and mine and held_agent != mine:
+        _emit({"ok": False, "error": (
+            f"the active report belongs to agent {held_agent!r} (task {getattr(s, 'task', '')!r}, "
+            f"run_dir {holder.get('run_dir')}), not to you ({mine!r}). There is ONE report slot "
+            f"per machine, so writing here would put your evidence in their report. Wait for "
+            f"them to finish, then `uap report start` your own."),
+            "held_by": held_agent, "run_dir": holder.get("run_dir")})
+        return None
     return s
 
 
@@ -58,15 +89,45 @@ def _err(exc: Exception) -> dict:
 # --- report verbs ---
 
 def _report_start(args) -> int:
-    s = sess.start_session(task=args.task, project=args.project,
-                           requires_screenshot=args.require_screenshot)
-    _emit({"ok": True, "run_dir": str(s.run_dir),
-           "requires_screenshot": s.requires_screenshot})
+    """Claim the machine-wide report slot.
+
+    It REFUSES when a running report is held by a different --agent token. Before this it
+    overwrote the pointer unconditionally, so two agents verifying at once collided quietly:
+    the first agent's evidence stopped being recorded and it found out through a bare `no
+    active report` some calls later. With no token on either side there is no identity to
+    compare, so the take still proceeds -- but the displaced run is closed as `incomplete`,
+    rendered, and named here rather than abandoned mid-write.
+    """
+    try:
+        s = sess.start_session(task=args.task, project=args.project,
+                               requires_screenshot=args.require_screenshot,
+                               agent=args.agent, takeover=getattr(args, "takeover", False))
+    except sess.ReportSlotConflict as exc:
+        _emit({"ok": False, "error": str(exc), "busy": True,
+               "held_by": exc.holder.get("agent"), "run_dir": exc.holder.get("run_dir")})
+        return 1
+    out = {"ok": True, "run_dir": str(s.run_dir),
+           "requires_screenshot": s.requires_screenshot, "agent": s.agent}
+    displaced = getattr(s, "displaced", None)
+    if displaced:
+        out["displaced"] = displaced
+        out["warning"] = (
+            f"this start TOOK the machine-wide report slot from a still-running report "
+            f"({displaced['run_dir']}, task {displaced.get('task')!r}, agent "
+            f"{displaced.get('agent')!r}). There is one slot per machine. That run has been "
+            f"closed as `incomplete` and rendered, so its evidence so far is not lost -- but "
+            f"if another agent is verifying right now, it just stopped being able to record. "
+            f"Pass --agent <your-token> on every report call so this is refused instead.")
+    if not s.agent:
+        out["hint"] = ("no --agent token on this report, so nothing can stop another agent's "
+                       "`report start` from taking the slot from you. Pass --agent <token> "
+                       "(or set $UAP_AGENT_ID) on every report call.")
+    _emit(out)
     return 0
 
 
 def _report_assert(args) -> int:
-    s = _require_active()
+    s = _require_active(getattr(args, "agent", None))
     if s is None:
         return 2
     s.add_assertion(args.label, args.verdict == "pass", args.evidence)
@@ -75,7 +136,7 @@ def _report_assert(args) -> int:
 
 
 def _report_note(args) -> int:
-    s = _require_active()
+    s = _require_active(getattr(args, "agent", None))
     if s is None:
         return 2
     s.add_note(args.text)
@@ -87,7 +148,7 @@ def _report_screenshot(args) -> int:
     """Attach an EXISTING image file to the active report (vs the top-level `screenshot`
     verb, which captures from the editor via RC and attaches). Useful when the image was
     produced another way (e.g. `uap exec` HighResShot from an editor RC can't reach)."""
-    s = _require_active()
+    s = _require_active(getattr(args, "agent", None))
     if s is None:
         return 2
     rel = s.add_screenshot(args.file, args.caption)
@@ -120,30 +181,37 @@ def _report_diag(args) -> int:
     via `exec` (targets the editor by project name) so it is accurate even when another editor
     squats the RC port -- unlike `status`, which only ever reaches whatever holds :30010. Call
     it while PIE is live to record the game's frame rate, not the idle editor's."""
-    s = _require_active()
+    s = _require_active(getattr(args, "agent", None))
     if s is None:
         return 2
+    # Read back through the command RESULT in a private namespace (quiet_expr), not print():
+    # a print is a LogPython line in the editor log, and the old top-level `ss`/`ws`/`w`
+    # bindings left a UWorld rooted in the shared remote-exec globals -- exactly what kills the
+    # editor on the next level load (ClickUp 17tm466jt8t, 17tm466g07m).
     code = (
         "import unreal, json\n"
         "ss = unreal.get_editor_subsystem(unreal.UAPAgentSubsystem)\n"
         "ws = unreal.get_editor_subsystem(unreal.UnrealEditorSubsystem)\n"
         "w = ws.get_game_world() or ws.get_editor_world()\n"
-        "print('UAPDIAG:' + json.dumps({"
+        "_uap_out = json.dumps({"
         "'plugin_version': ss.get_plugin_version(),"
         "'world': (w.get_name() if w else None),"
         "'is_in_pie': ss.is_in_pie(),"
         "'unit': ss.get_stat_group_text('unit'),"
-        "'fps': ss.get_stat_group_text('fps')}))\n"
+        "'fps': ss.get_stat_group_text('fps')})\n"
     )
     body: dict = {"ok": True}
     try:
         client = PythonRemoteExecClient(node_project_substr=args.project)
-        res = client.exec_python(code)
+        raw = client.eval_quiet(code)
         diag = None
-        for o in (res.get("output") or []):
-            line = o.get("output", "")
-            if "UAPDIAG:" in line:
-                diag = json.loads(line.split("UAPDIAG:", 1)[1].strip())
+        if isinstance(raw, str):
+            try:
+                diag = json.loads(raw)
+            except json.JSONDecodeError:
+                diag = None
+        if not isinstance(diag, dict):
+            diag = None
         if diag is None:
             body = {"ok": False, "error": "no diagnostics returned from editor"}
         else:
@@ -174,7 +242,7 @@ def _report_diag(args) -> int:
 
 
 def _report_finish(args) -> int:
-    s = _require_active()
+    s = _require_active(getattr(args, "agent", None))
     if s is None:
         return 2
 
@@ -259,38 +327,30 @@ def _write_port_cache(project: str, port: int) -> None:
 def _exec_rc_port(project: str) -> int:
     """Ask the editor matching `project` (over Python remote-exec, which is addressed
     per-editor) for the RC HTTP port it actually bound. 0 if unreachable / no match."""
+    # Read back through the command RESULT, never print(): a print is a LogPython line in the
+    # editor's log on every call (ClickUp 17tm466jt8t). See PythonRemoteExecClient.quiet_expr.
     code = ("import unreal\n"
-            "print('UAPRCPORT:' + str("
-            "unreal.get_editor_subsystem(unreal.UAPAgentSubsystem).get_remote_control_port()))\n")
+            "_uap_out = int("
+            "unreal.get_editor_subsystem(unreal.UAPAgentSubsystem).get_remote_control_port())\n")
     try:
-        res = PythonRemoteExecClient(node_project_substr=project).exec_python(code)
+        port = PythonRemoteExecClient(node_project_substr=project).eval_quiet(code)
     except AgentError:
         return 0
-    for o in (res.get("output") or []):
-        line = o.get("output", "")
-        if "UAPRCPORT:" in line:
-            try:
-                return int(line.split("UAPRCPORT:", 1)[1].strip())
-            except ValueError:
-                return 0
-    return 0
+    return port if isinstance(port, int) and not isinstance(port, bool) else 0
 
 
 def _exec_project_name(project: str | None) -> str | None:
     """The project name of the editor matching `project` (via exec). Used to stamp a
     screenshot's provenance so a pass can't be proven with a shot of another editor."""
+    # Result, not print() -- see _exec_rc_port. This runs on every `uap screenshot`.
     code = ("import unreal\n"
-            "print('UAPPROJ:' + unreal.Paths.get_project_file_path()"
-            ".rsplit('/',1)[-1].rsplit('.',1)[0])\n")
+            "_uap_out = unreal.Paths.get_project_file_path()"
+            ".rsplit('/',1)[-1].rsplit('.',1)[0]\n")
     try:
-        res = PythonRemoteExecClient(node_project_substr=(project or "")).exec_python(code)
+        name = PythonRemoteExecClient(node_project_substr=(project or "")).eval_quiet(code)
     except AgentError:
         return None
-    for o in (res.get("output") or []):
-        line = o.get("output", "")
-        if "UAPPROJ:" in line:
-            return line.split("UAPPROJ:", 1)[1].strip()
-    return None
+    return name.strip() if isinstance(name, str) and name.strip() else None
 
 
 def _rc_port_for(project: str | None) -> int:
@@ -1037,15 +1097,126 @@ _NEEDS_SAMPLE = "per-frame property sampling; an exec round-trip cannot see a su
 _NEEDS_LOG = "reading the editor log ring buffer through the plugin"
 
 
+def _hold_ledger_path(project) -> pathlib.Path:
+    """Where the CLI records its own outstanding holds, per project.
+
+    A hold outlives the process that started it, and every CLI call is a fresh process, so the
+    only way one call can know about another's hold is on disk. Lives beside the leases, which
+    solve the same cross-process problem for the editor itself.
+    """
+    return _coord.hold_ledger_path(project)
+
+
+def _hold_ledger_read(project) -> dict:
+    try:
+        return json.loads(_hold_ledger_path(project).read_text(encoding="utf-8")) or {}
+    except (OSError, json.JSONDecodeError, TypeError):
+        return {}
+
+
+def _hold_ledger_note(project, key: str, seconds: float, agent: str | None) -> None:
+    led = _hold_ledger_read(project)
+    led[str(key).lower()] = {"key": key, "ends_at": time.time() + float(seconds),
+                             "agent": agent or None}
+    try:
+        p = _hold_ledger_path(project)
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text(json.dumps(led), encoding="utf-8")
+    except OSError:
+        pass        # the ledger is an advisory optimisation; losing it must not fail a hold
+
+
+def _hold_ledger_clear(project, key: str = "") -> None:
+    led = _hold_ledger_read(project)
+    if key:
+        led.pop(str(key).lower(), None)
+    else:
+        led = {}
+    try:
+        _hold_ledger_path(project).write_text(json.dumps(led), encoding="utf-8")
+    except OSError:
+        pass
+
+
+def _hold_conflict(key: str, project, *, allow: bool) -> dict | None:
+    """Refuse a hold that would OVERLAP one already running, unless it was asked for.
+
+    `hold` / `axis` return as soon as the plugin has latched the input -- deliberately, because
+    the whole point is to read game state WHILE it is held, and the CLI round-trip is ~1s. What
+    was NOT deliberate is that consecutive holds then overlap in silence: the plugin keeps a
+    hold per FKey (`UAPFindOrAddHold`, AgentInput.cpp) and a second `hold` on a different key
+    simply starts alongside the first. A caller reading the docs as "hold W for 3s, then hold A
+    for 3s" gets 3 seconds of W+A, and the pawn keeps moving after the caller believes the hold
+    ended. That contaminated a session -- a pawn drifted ~3500 cm off the plaza and the run was
+    discarded -- and it looks like the pawn being odd, not like a tool fault.
+
+    Re-issuing the SAME key is not a conflict: `UAPFindOrAddHold` finds the existing entry and
+    pushes its EndRealTime out, which is a re-assert and is what `input hold` is for. Only a
+    DIFFERENT key already held is the silent-overlap case.
+
+    Two stages, so the common path costs NOTHING. The on-disk ledger says whether a hold could
+    still be running; only if it might does this pay for one `GetHeldInput` to check engine
+    ground truth, because the ledger can be stale in the safe-to-proceed direction (PIE stopped,
+    a FlushPressedKeys, another agent's `input release`) and a refusal on a hold that is not
+    really there would be its own false failure.
+
+    Returns a refusal body, or None to proceed. A plugin too old to report held state (or an
+    unreadable answer) is not a reason to refuse: proceed rather than invent a conflict.
+    """
+    if allow:
+        return None
+    now = time.time()
+    suspects = [e for k, e in _hold_ledger_read(project).items()
+                if k != str(key).lower() and float(e.get("ends_at") or 0) > now]
+    if not suspects:
+        return None
+    try:
+        state = _rc_json("GetHeldInput", {}, project, needs=_NEEDS_HOLD)
+    except (AgentError, json.JSONDecodeError):
+        return None
+    others = [h for h in (state.get("held") or [])
+              if str(h.get("key", "")).lower() != str(key).lower()
+              and float(h.get("remaining_seconds") or 0) > 0]
+    if not others:
+        _hold_ledger_clear(project)     # the ledger was stale; do not keep refusing on it
+        return None
+    listed = ", ".join(f"{h.get('key')} ({float(h.get('remaining_seconds') or 0):.2f}s left, "
+                       f"route {h.get('route')})" for h in others)
+    return {
+        "ok": False, "pressed": False, "held": others, "overlap_refused": True,
+        "error": (f"another hold is still running, so this one would OVERLAP it: {listed}. "
+                  f"`input hold`/`axis` return as soon as the input is latched -- the hold "
+                  f"itself keeps running in-engine -- so a hold issued back-to-back with "
+                  f"another one runs ON TOP of it and the pawn keeps moving after you think "
+                  f"it stopped. Wait for it (`--wait` blocks for the duration, `uap input "
+                  f"status` shows remaining_seconds), end it (`uap input release`), or say "
+                  f"you meant them simultaneous with `--overlap`."),
+    }
+
+
 def _input(args) -> int:
     """Sustained input. A single injected event cannot drive locomotion: the CLI round-trip is
     ~1s and a latched key is silently dropped by any FlushPressedKeys, so the plugin re-asserts
     the input every frame in-engine for the requested duration. `axis` is the VR locomotion
-    verb -- thumbsticks are analog axis FKeys, not buttons."""
+    verb -- thumbsticks are analog axis FKeys, not buttons.
+
+    Returning before the hold expires is deliberate (read state WHILE it is held), but it is no
+    longer silent: the result carries `ends_in_seconds` / `ends_at_epoch` so the end is
+    knowable, and a hold that would overlap one already running is REFUSED unless --overlap.
+    See _hold_conflict."""
     sub = args.input_cmd
     t0 = time.monotonic()
     body: dict = {"ok": True, "action": sub}
     try:
+        if sub in ("hold", "axis"):
+            clash = _hold_conflict(args.key, args.project,
+                                   allow=getattr(args, "overlap", False))
+            if clash is not None:
+                clash["action"] = sub
+                _capture(f"input:{sub}", {"key": args.key}, clash,
+                         int((time.monotonic() - t0) * 1000))
+                _emit(clash)
+                return 1
         # The plugin returns a JSON envelope carrying the REAL reason for a refusal. The CLI
         # must not invent one: a guessed "unknown key name" (for a key that was in fact valid,
         # and had already been pressed) sent a live investigation after a validation table
@@ -1073,14 +1244,33 @@ def _input(args) -> int:
         elif sub == "release":
             body.update(_rc_json("ReleaseHeldInput", {"KeyName": args.key or ""}, args.project,
                                  needs=_NEEDS_HOLD))
+            _hold_ledger_clear(args.project, args.key or "")
         else:  # status
             body.update(_rc_json("GetHeldInput", {}, args.project, needs=_NEEDS_HOLD))
 
         # Non-blocking by default: the hold runs IN-ENGINE, so the point is to sample game
         # state while it is still held. --wait blocks until it expires instead.
-        if body.get("ok") and sub in ("hold", "axis") and getattr(args, "wait", False):
-            time.sleep(args.seconds)
-            body["waited"] = True
+        #
+        # Either way the caller is told WHEN it ends. Before this the result said only
+        # `seconds`, which reads as "it took that long" rather than "it is still going", and
+        # nothing in the answer was awaitable -- so back-to-back holds overlapped and the
+        # overlap was invisible until the pawn ended up somewhere it should not be.
+        if body.get("ok") and sub in ("hold", "axis"):
+            if getattr(args, "wait", False):
+                time.sleep(args.seconds)
+                body["waited"] = True
+                body["ends_in_seconds"] = 0.0
+                _hold_ledger_clear(args.project, args.key)
+            else:
+                _hold_ledger_note(args.project, args.key, args.seconds,
+                                  getattr(args, "agent", None))
+                body["ends_in_seconds"] = round(float(args.seconds), 3)
+                body["ends_at_epoch"] = round(time.time() + float(args.seconds), 3)
+                body["note"] = (f"STILL HELD for ~{float(args.seconds):.2f}s after this call "
+                                f"returned -- that is the point (read state while it holds). "
+                                f"Do not issue another hold until it ends: use --wait to block, "
+                                f"`uap input status` to poll remaining_seconds, or `uap input "
+                                f"release` to end it now.")
     except (AgentError, json.JSONDecodeError) as exc:
         body = _err(exc)
     _capture(f"input:{sub}", {k: v for k, v in vars(args).items()
@@ -1233,13 +1423,157 @@ def _sample_read(args) -> int:
     return 0 if body["ok"] else 1
 
 
+#: A cursor that is AHEAD of the capture's head did not come from this capture. The ring is
+#: rebuilt from scratch on every editor start, so a cursor taken before a restart (or from a
+#: different instance) points past the end of the current one -- and `log since` then answers
+#: `count: 0, ok: true`, which is the same false "clean log" shape by another route. The editor
+#: is shared and any agent may rebuild it via Restart-Editor.ps1 mid-task, so this is not exotic.
+_LOG_STALE_CURSOR_NOTE = (
+    "STALE CURSOR: {after} is ahead of this capture's head ({head}), so it was not taken from "
+    "the editor process now running -- the log ring is rebuilt on every editor start, and the "
+    "editor is shared, so a restart by another agent resets it. This read covered NONE of the "
+    "window you meant; count=0 says nothing about it. Take a fresh `uap log cursor`, or read "
+    "Saved/Logs/<Project>.log (and its SchoolsOut-backup-*.log for the pre-restart process)."
+)
+
+#: What a caller must be told when the window it asked for no longer exists in full. The
+#: point of the wording is that `count: 0` is NOT evidence of a clean log -- see _log_dropped.
+_LOG_TRUNCATED_NOTE = (
+    "log window TRUNCATED: the plugin's capture is a fixed-size ring buffer and the oldest "
+    "{dropped} record(s) of the range you asked for had already been evicted when this read "
+    "ran, so they were NOT searched. A low count -- and count=0 in particular -- is UNPROVEN "
+    "here, not a clean log. Either re-read a narrower window ending sooner after the action, "
+    "raise LogBufferCapacity under [/Script/UnrealAgentPlayer.UAPAgentSettings] in the "
+    "project's Config/DefaultEditor.ini and restart the editor, or read "
+    "Saved/Logs/<Project>.log for the evicted span."
+)
+
+#: `--lines` used to bound the PLUGIN read, and the plugin fills its quota from the OLDEST
+#: surviving record forward -- so the cap threw away the NEWEST end of the window, which is
+#: exactly the end holding the records the agent had just caused. It is now a display cap
+#: applied AFTER the whole window has been scanned and filtered, so `count` is complete and
+#: only the listing is shortened. Say which end was dropped, because that is the part that
+#: silently produced wrong answers.
+_LOG_OMITTED_NOTE = (
+    "listing shortened by --lines: {total} record(s) matched and the {listed} {kept_end} "
+    "are listed; {omitted} {dropped_end} one(s) are NOT shown. `count` above is the COMPLETE "
+    "match count for the window -- the whole window was scanned and filtered before this cap "
+    "was applied, so nothing was missed by the search, only by the listing. Raise --lines to "
+    "see the rest."
+)
+
+#: A scan that hit its own record bound examined only part of the window, so `count` is a
+#: floor rather than a total. Distinct from ring eviction: the records exist, we stopped.
+_LOG_SCAN_BOUND_NOTE = (
+    "scan BOUND at {scanned} record(s) before reaching the head of the log, so the window was "
+    "only partly examined and `count` is a FLOOR, not a total. Re-read a narrower window, or "
+    "raise --max-scan."
+)
+
+#: Records pulled per RC round-trip while paging a window. The plugin's ReadSince fills its
+#: MaxLines quota from the oldest surviving record forward, so one call can never return the
+#: newest end of a long window -- the window has to be paged. 4096 was the ring's own original
+#: capacity and is a comfortable single payload.
+_LOG_SCAN_CHUNK = 4096
+
+#: Hard bound on a single `log since` scan. The ring cannot hold more than its capacity, so in
+#: practice this is never reached; it exists so a runaway cannot page forever.
+_LOG_SCAN_MAX = 200000
+
+
+def _log_scan(after: int, category: str, verbosity: str, project,
+              chunk: int, max_records: int) -> tuple[list, bool]:
+    """Every retained record past `after` that passes the plugin-side filters, oldest first.
+
+    One `GetLogsSince` cannot answer this. `FAgentLogCapture::ReadSince`
+    (Plugins/UnrealAgentPlayer/Source/UnrealAgentPlayerRuntime/Private/AgentLogCapture.cpp)
+    walks the ring from the OLDEST surviving record forward and stops the moment it has
+    collected `MaxLines` matches -- so a cap smaller than the window silently returns the
+    OLDEST slice of it and drops the newest. Measured over a 667-record window: `--lines 200`
+    answered 1870..2131, `--lines 500` answered 1870..2527, and a `--grep` whose 10 matches
+    all sat past 2131 answered `count: 0`. The window is therefore paged here, and the caller's
+    `--lines` becomes a display cap applied afterwards.
+
+    Termination is exact, not a heuristic: ReadSince scans the entire ring and only breaks
+    early on a filled quota, so a page holding FEWER than `chunk` records proves the scan
+    reached the newest record. Returns (records, scan_complete, resume_cursor) -- the resume
+    cursor is the plugin's OWN reported cursor from the last page, which is what a follow-up
+    `log since` should be given, not something re-derived from the records.
+    """
+    records: list = []
+    cursor = after
+    while True:
+        raw = _rc_require("GetLogsSince",
+                          {"AfterCursor": cursor, "MaxLines": chunk,
+                           "CategoryFilter": category, "MinVerbosity": verbosity},
+                          project, _NEEDS_LOG)
+        parsed = json.loads(raw) if isinstance(raw, str) else (raw or {})
+        page = parsed.get("lines") or []
+        records.extend(page)
+        reported = int(parsed.get("cursor") or cursor)
+        if len(page) < chunk:
+            return records, True, reported
+        if reported <= cursor:
+            # No forward progress -- a plugin that does not advance OutCursor would spin here.
+            # Bail rather than loop, and report the scan as incomplete so the count is a floor.
+            return records, False, reported
+        cursor = reported
+        if len(records) >= max_records:
+            return records, False, reported
+
+
+def _log_dropped(after: int, first_returned: int | None, project) -> tuple[int, int | None]:
+    """How many records between `after` and the oldest SURVIVING record were evicted.
+
+    Capture cursors are handed out by a single `NextCursor++` per log record, so they are
+    contiguous: if the oldest retained record with cursor > `after` is K, then exactly
+    K - after - 1 records were dropped. That is an exact count, not an estimate.
+
+    `first_returned` is the lowest cursor the main read gave back. When it is already
+    after + 1 the window is provably intact and this costs nothing; otherwise it takes ONE
+    extra RC call, unfiltered and MaxLines=1, to find the true floor -- the main read cannot
+    reveal it because its own verbosity/category filter also skips records.
+
+    An empty probe means dropped=0 and is not a blind spot: eviction only ever removes the
+    OLDEST records, so if anything at all had been logged past `after` the newest of it would
+    still be there. No lines past the cursor therefore means nothing was logged past it.
+    """
+    if first_returned is not None and first_returned <= after + 1:
+        return 0, first_returned
+    probe = _rc_require("GetLogsSince",
+                        {"AfterCursor": after, "MaxLines": 1,
+                         "CategoryFilter": "", "MinVerbosity": "VeryVerbose"},
+                        project, _NEEDS_LOG)
+    parsed = json.loads(probe) if isinstance(probe, str) else (probe or {})
+    probe_lines = parsed.get("lines") or []
+    if not probe_lines:
+        return 0, None
+    oldest = int(probe_lines[0].get("cursor", after + 1))
+    return max(0, oldest - after - 1), oldest
+
+
 def _log(args) -> int:
     """Read the editor's log through the plugin's in-process capture, so log evidence lands in
     the report instead of being tailed out-of-band with shell tools -- and so it targets the
     SAME editor as every other verb (this machine runs two).
 
-    Note: this is the plugin's 4096-line ring buffer, populated from subsystem init onward. It
-    is not Saved/Logs/<Project>.log; for a whole-session history read that file directly."""
+    Note: this is the plugin's ring buffer (LogBufferCapacity, 4096 records by default),
+    populated from subsystem init onward. It is not Saved/Logs/<Project>.log; for a
+    whole-session history read that file directly.
+
+    The ring is why a sweep over a long window used to lie. A PIE session logs far more than
+    4096 records, so `log since <old cursor> --verbosity Error` searched only the surviving
+    tail and answered `count: 0, ok: true` -- indistinguishable from a clean log, while the
+    startup errors the caller was told to sweep for had been overwritten hours earlier. Every
+    read now reports `oldest_cursor` / `dropped`, and sets `truncated` + `warning` when the
+    requested window is not retained in full, so silence is provable rather than assumed.
+
+    `--lines` is a DISPLAY cap, not a read bound. It used to be passed straight through as
+    MaxLines, and the plugin fills that quota from the oldest surviving record forward, so the
+    cap silently discarded the newest end of the window -- the end holding whatever the agent
+    had just caused. The window is now paged in full (see _log_scan), filtered, and only then
+    shortened for display, so `count` is the complete match count and `--grep` can no longer
+    miss a match that a small `--lines` had thrown away."""
     sub = args.log_cmd
     t0 = time.monotonic()
     body: dict = {"ok": True}
@@ -1253,27 +1587,79 @@ def _log(args) -> int:
             after = positional if positional is not None else args.since
             # `log tail 400` and `log tail --lines 400` are the same request.
             count = getattr(args, "count", None)
-            lines = count if count is not None else args.lines
+            limit = count if count is not None else args.lines
             if sub == "tail":
                 current = int(_rc_require("GetLogCursor", {}, args.project, _NEEDS_LOG) or 0)
-                after = max(0, current - lines)
-            raw = _rc_require("GetLogsSince",
-                              {"AfterCursor": after, "MaxLines": lines,
-                               "CategoryFilter": args.category,
-                               "MinVerbosity": args.verbosity},
-                              args.project, _NEEDS_LOG)
-            parsed = json.loads(raw) if isinstance(raw, str) else (raw or {})
-            lines = parsed.get("lines") or []
+                after = max(0, current - limit)
+            max_scan = max(1, getattr(args, "max_scan", None) or _LOG_SCAN_MAX)
+            # `tail N` asks for a window exactly N records wide, so one page of N covers it and
+            # the general chunk would only make the payload bigger than the request.
+            # limit + 1 for tail so a window that is full to the brim still proves itself
+            # exhausted in ONE call (a page of exactly `chunk` cannot).
+            chunk = min(max(limit, 1) + 1, _LOG_SCAN_CHUNK) if sub == "tail" \
+                else max(_LOG_SCAN_CHUNK, limit)
+            scanned, scan_complete, resume = _log_scan(after, args.category, args.verbosity,
+                                                       args.project, chunk, max_scan)
+            cursors = [int(ln.get("cursor", 0)) for ln in scanned
+                       if ln.get("cursor") is not None]
+            lines = scanned
             if args.grep:
                 try:
                     rx = re.compile(args.grep, re.IGNORECASE)
                 except re.error as exc:
                     _emit({"ok": False, "error": f"bad --grep regex: {exc}"})
                     return 2
-                lines = [ln for ln in lines if rx.search(str(ln.get("message", "")))]
-            body["cursor"] = parsed.get("cursor", after)
-            body["count"] = len(lines)
-            body["lines"] = lines
+                # Match the record, not just its message text. `--grep "Error|Warning"` is the
+                # documented broad sweep and it used to match only `message`, so a record whose
+                # VERBOSITY is Error but whose text does not contain the word was missed: over
+                # one real window, 15 of 19 Error records were invisible to it. Verbosity and
+                # category are part of what an agent means when it greps for "Error" or for
+                # "LogJanitorAI", so they are part of what is searched. Over-matching a prose
+                # "error" is harmless in a sweep; under-matching a real one is the whole defect.
+                lines = [ln for ln in lines
+                         if rx.search(f"{ln.get('verbosity', '')} {ln.get('category', '')}: "
+                                      f"{ln.get('message', '')}")]
+            total = len(lines)
+            # Keep the NEWEST by default. An agent asking "what happened since cursor X" means
+            # the records its own action produced, which are the most recent ones; the old
+            # behaviour handed back the oldest slice, which is the opposite.
+            keep_end = getattr(args, "keep", "newest") or "newest"
+            listed = lines if total <= limit else (
+                lines[-limit:] if keep_end == "newest" else lines[:limit])
+            warnings: list[str] = []
+            body["cursor"] = resume
+            body["count"] = total
+            body["listed"] = len(listed)
+            body["lines"] = listed
+            body["scanned"] = len(scanned)
+            if total > len(listed):
+                body["omitted"] = total - len(listed)
+                body["listed_end"] = keep_end
+                warnings.append(_LOG_OMITTED_NOTE.format(
+                    total=total, listed=len(listed), omitted=total - len(listed),
+                    kept_end="newest" if keep_end == "newest" else "oldest",
+                    dropped_end="oldest" if keep_end == "newest" else "newest"))
+            if not scan_complete:
+                body["truncated"] = True
+                body["scan_incomplete"] = True
+                warnings.append(_LOG_SCAN_BOUND_NOTE.format(scanned=len(scanned)))
+            dropped, oldest = _log_dropped(after, min(cursors) if cursors else None,
+                                           args.project)
+            body["oldest_cursor"] = oldest
+            body["dropped"] = dropped
+            if dropped:
+                body["truncated"] = True
+                warnings.append(_LOG_TRUNCATED_NOTE.format(dropped=dropped))
+            elif oldest is None and not scanned:
+                # Nothing at all past the cursor. Honest when the cursor is at the head, a lie
+                # when it is past it -- so only here, where it can matter, pay for the head.
+                head = int(_rc_require("GetLogCursor", {}, args.project, _NEEDS_LOG) or 0)
+                body["head_cursor"] = head
+                if after > head:
+                    body["stale_cursor"] = True
+                    warnings.append(_LOG_STALE_CURSOR_NOTE.format(after=after, head=head))
+            if warnings:
+                body["warning"] = "\n\n".join(warnings)
     except (AgentError, json.JSONDecodeError) as exc:
         body = _err(exc)
     _capture(f"log:{sub}", {"grep": getattr(args, "grep", None)}, body,
@@ -1620,7 +2006,17 @@ DRIVE + OBSERVE
 
 SUSTAINED INPUT (a single injected event CANNOT drive locomotion -- see below)
   uap input hold <Key> --seconds N     hold a digital key; returns at once, held in-engine
+                                       The hold OUTLIVES the call by design (read state while
+                                       it holds), so the result carries `ends_in_seconds` +
+                                       `ends_at_epoch` and a `note` saying it is still down.
+                                       `--wait` blocks for the duration instead. A hold on a
+                                       DIFFERENT key while one is still running is REFUSED --
+                                       back-to-back holds used to overlap in silence and the
+                                       pawn kept moving after the caller thought it had
+                                       stopped (one session was discarded over a ~3500 cm
+                                       drift). `--overlap` says you meant them simultaneous.
   uap input axis <AxisKey> <v> --seconds N   drive an analog axis -- THE VR LOCOMOTION VERB
+                                       Two axes at once (stick X + Y) needs `--overlap`.
   uap input axis <AxisKey> <v> --user N      ...on the SLATE route as Slate user N, which is
                                        the only route an analog/virtual cursor or any
                                        RegisterInputPreProcessor handler can see. Without it
@@ -1678,6 +2074,20 @@ SAMPLING + LOGS (sub-second truth; a ~1s exec round-trip cannot see judder or a 
   uap log cursor                       grab a cursor BEFORE driving the condition
   uap log since <cursor> --grep RE     what the editor logged since then
   uap log tail 200 [--grep RE]         the last N captured lines (or --lines 200)
+    The capture is a fixed-size ring (LogBufferCapacity, 4096 records), so a long window does
+    not fit and a low count can mean "not looked at" rather than "not there". Every read now
+    carries `dropped` / `oldest_cursor`, and sets `truncated` + `warning` when part of the
+    window you asked for had already been evicted, or `stale_cursor` when the cursor predates
+    an editor restart. Treat either one as a sweep that did not happen.
+    `--grep` matches verbosity + category + message, so `--grep "Error|Warning"` finds records
+    CLASSIFIED that way, not just ones whose text happens to say the word.
+    On `log since`, `--lines` is a DISPLAY cap (default 2000), not a read bound: the whole
+    window is paged and filtered first, so `count` is the complete match count and `--grep`
+    cannot miss a match. If more matched than are listed you get `omitted` + a warning, and
+    the NEWEST are the ones kept (`--keep oldest` to flip it). Before this, `--lines` went
+    straight to the plugin, which fills its quota from the OLDEST record forward -- so the
+    default 200 discarded the newest end of the window and a grep over it answered `count: 0`
+    while 10 matches sat in it.
 
 RECIPES
   Click an on-screen button by label (one call):
@@ -1942,6 +2352,13 @@ def build_parser() -> argparse.ArgumentParser:
                     default=True, help="(default) require a screenshot for a passing report")
     rs.add_argument("--no-require-screenshot", dest="require_screenshot", action="store_false",
                     help="rare: allow a pass with no screenshot (justify in the summary)")
+    # The report slot is ONE per machine. Starting a report while ANOTHER agent's is running is
+    # refused, because the take used to be silent and the first agent's evidence simply stopped
+    # being recorded. --takeover is the deliberate override for a slot left by a dead session.
+    rs.add_argument("--takeover", action="store_true",
+                    help="take the report slot even though another agent's report is still "
+                         "running (closes theirs as `incomplete` and renders it). Only for a "
+                         "slot left behind by a session that is gone")
     rs.set_defaults(func=_report_start)
     ra = rep.add_parser("assert", parents=[common])
     ra.add_argument("label")
@@ -2043,7 +2460,13 @@ def build_parser() -> argparse.ArgumentParser:
     ih.add_argument("--seconds", type=float, default=1.0)
     ih.add_argument("--wait", action="store_true",
                     help="block until the hold expires (default: return immediately so you can "
-                         "read game state WHILE it is held)")
+                         "read game state WHILE it is held; the result then carries "
+                         "ends_in_seconds / ends_at_epoch)")
+    ih.add_argument("--overlap", action="store_true",
+                    help="allow this hold to run ALONGSIDE one already active (e.g. two stick "
+                         "axes at once). Without it a hold on a DIFFERENT key while another is "
+                         "still running is refused, because back-to-back holds used to overlap "
+                         "silently and the pawn kept moving after the caller thought it stopped")
     ih.set_defaults(func=_input)
     ia = inps.add_parser("axis", parents=[proj],
                          help="drive an analog axis FKey for N seconds (VR/gamepad sticks)")
@@ -2051,6 +2474,10 @@ def build_parser() -> argparse.ArgumentParser:
     ia.add_argument("value", type=float, help="-1.0 .. 1.0")
     ia.add_argument("--seconds", type=float, default=1.0)
     ia.add_argument("--wait", action="store_true", help="block until the hold expires")
+    ia.add_argument("--overlap", action="store_true",
+                    help="allow this hold to run ALONGSIDE one already active -- which is the "
+                         "normal thing for two stick axes (X and Y together). Without it a hold "
+                         "on a DIFFERENT key while another is still running is refused")
     # Slate DISCARDS an input event whose user index does not match the handler's owning user
     # (FAnalogCursor::IsRelevantInput -- engine AnalogCursor.cpp:192). Without --user the sample
     # takes the game-viewport route, which never enters the Slate pre-processor chain at all, so
@@ -2112,8 +2539,28 @@ def build_parser() -> argparse.ArgumentParser:
     for name, helptext in (("tail", "the last N captured lines"),
                            ("since", "lines after a cursor from an earlier call")):
         lp = lgs.add_parser(name, parents=[proj], help=helptext)
-        lp.add_argument("--lines", type=int, default=200)
-        lp.add_argument("--grep", default="", help="case-insensitive regex over the message")
+        # For `tail` this is the WINDOW WIDTH ("the last N records") and always has been.
+        # For `since` the window is fixed by the cursor, so it is only how many of the matches
+        # to LIST -- it no longer bounds what is searched, and `count` is complete either way.
+        # 2000 rather than 200 because a whole-session sweep is the documented use and the old
+        # default silently hid the newest end of the window; agents had taken to passing
+        # `--lines 30000` to defend against that, which should not have been necessary.
+        lp.add_argument("--lines", type=int, default=200 if name == "tail" else 2000,
+                        help=("how many of the last N records to read (window width)"
+                              if name == "tail" else
+                              "how many matching records to LIST (display cap, default 2000). "
+                              "The whole window is scanned and filtered first, so `count` is "
+                              "complete regardless of this."))
+        if name == "since":
+            lp.add_argument("--keep", choices=["newest", "oldest"], default="newest",
+                            help="which end to list when more records match than --lines "
+                                 "(default newest -- the records your action just caused)")
+            lp.add_argument("--max-scan", dest="max_scan", type=int, default=_LOG_SCAN_MAX,
+                            help="hard bound on how many records one scan will page through; "
+                                 "hitting it sets scan_incomplete and makes `count` a floor")
+        lp.add_argument("--grep", default="",
+                        help="case-insensitive regex over verbosity + category + message, "
+                             "so `--grep 'Error|Warning'` finds records CLASSIFIED that way")
         lp.add_argument("--category", default="", help="exact log category, e.g. LogUAP")
         lp.add_argument("--verbosity", default="Log",
                         choices=["Fatal", "Error", "Warning", "Display", "Log",

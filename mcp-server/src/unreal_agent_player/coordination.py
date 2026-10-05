@@ -130,6 +130,17 @@ def _lock_path(project: str | None) -> pathlib.Path:
     return _leases_dir() / f"{_scope_key(project)}.lock"
 
 
+def hold_ledger_path(project: str | None) -> pathlib.Path:
+    """Per-project record of input holds the CLI has started but not waited out.
+
+    Not a lease: it grants nothing and blocks nothing. It exists because a hold keeps running
+    in-engine after the process that started it has exited, so without a note on disk no later
+    call can tell that one is still live -- which is how consecutive `input hold` calls came to
+    overlap in silence. Lives beside the leases because it is the same cross-process problem.
+    """
+    return _leases_dir() / f"{_scope_key(project)}.holds.json"
+
+
 def default_agent_id() -> str:
     """Identity token for a lease.
 

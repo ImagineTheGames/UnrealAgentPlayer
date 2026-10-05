@@ -1099,3 +1099,201 @@ one investigation.
 **If a `uap` command fails with no output, re-run it through a shell that does not reinterpret
 stderr** -- e.g. Bash invoking `powershell -NoProfile -File uap.ps1 ...` -- and the traceback
 appears. Do not conclude the editor is down, or the verb missing, from an empty failure.
+
+## 35. The mandatory broad log sweep answered "clean" for a window it never read -- FIXED
+
+`AGENTS.md` in School's Out VR makes a broad Error/Warning sweep MANDATORY before an agent
+finishes a task, and says silence reads as "did not look". Both documented ways into that sweep
+returned zero for a window that really did contain errors, and both returned `ok: true` while
+doing it, so an agent following the documented method made a FALSE statement while doing exactly
+as instructed. The project's `AGENTS.md` had to suspend its own rule against shell-tailing logs
+and tell agents to read `Saved/Logs/<Project>.log` instead (ClickUp 17tm466fydg).
+
+Measured over one PIE session, cursor 2779 to 27740: `log since <c> --verbosity Error` returned
+0, `--verbosity Warning` returned 0, and re-sweeping in 4000-line chunks returned 0. The raw log
+for that period held 35 Warning and 13 Error records, including `M_JanitorSkin` failing material
+translation and six `LogClass` uninitialised-property errors.
+
+**Three independent causes, not one.** The verbosity filter itself is correct -- that was ruled
+out first, live: against a fresh editor `--verbosity Error` returned 14 records and
+`--verbosity Warning` 46.
+
+1. **The capture is a fixed-size ring and truncation was invisible.** `FAgentLogCapture` keeps
+   `LogBufferCapacity` records (4096 by default, `UAPAgentSettings.h:17`) and `ReadSince`
+   silently returns only what survives; `GetLogsSince` reports no floor, and `OutCursor` is the
+   last MATCHING record, so nothing in the answer hints that 21,000 records of the requested
+   range had been overwritten. A PIE session logs several times the capacity, so a cursor taken
+   before the action always points below the floor. Checked against a real 17,793-line session
+   log: of 143 Error and 246 Warning lines, only 38 and 139 fall inside the last 4096 lines --
+   and `M_JanitorSkin` (line 1284) and all six `LogClass` errors (1392-1404) fall outside, which
+   is exactly the set the sweep reported as absent.
+2. **`--grep` matched only `message`.** `--grep "Error|Warning"` is the documented broad sweep,
+   but a record whose VERBOSITY is Error and whose text does not contain the word was invisible
+   to it. Measured live on one window of 35 Error/Warning records: message-only matching found
+   17 and missed 18, e.g. `[Warning] LogFileManager: DeleteFile was unable to delete ...`.
+3. **A cursor does not survive an editor restart.** The ring is rebuilt at subsystem init, the
+   editor is shared, and any agent may bounce it with `Restart-Editor.ps1` mid-task -- after
+   which the old cursor is past the head of the new capture and `log since` answers `count: 0`
+   for a window it never looked at. Observed live during the fix: the capture's cursor went 3413
+   to 1798 across a restart another agent performed.
+
+A fourth defect kept even a SUCCESSFUL sweep out of the evidence: `record_call` harvested log
+lines only for the MCP tool names `log_since` / `log_tail`, while the CLI records the same read
+as `log:since` / `log:tail`, so the report's "Log warnings/errors" panel stayed empty for every
+`uap log` an agent ran -- the opposite of the reason `AGENTS.md` tells agents to use it.
+
+**Fixed (CLI-side, live on pull -- no plugin rebuild).** `log since` / `log tail` now report
+`dropped` and `oldest_cursor` on every read, and set `truncated` + a `warning` when part of the
+requested window had been evicted, or `stale_cursor` + a `warning` when the cursor is ahead of
+the capture's head. `dropped` is exact rather than estimated: cursors come from a single
+`NextCursor++` so they are contiguous, and the oldest surviving record with cursor > `after`
+gives the count directly. It costs one extra RC call only when the main read cannot already
+prove contiguity. `--grep` now matches verbosity + category + message. `record_call` accepts
+both spellings of the log verbs.
+
+**Not fixed by that, and deliberately so: the ring is still 4096 records, so a whole-session
+sweep still does not fit.** The fix makes the gap VISIBLE, not absent. Raising
+`LogBufferCapacity` under `[/Script/UnrealAgentPlayer.UAPAgentSettings]` in the project's
+`Config/DefaultEditor.ini` needs no rebuild (it is a `config=Editor` `UDeveloperSettings`), only
+an editor restart, and 32768 covers the session measured above.
+
+**Still open, plugin-side (each needs a rebuild):** `GetLogsSince` should report the retained
+floor and the true head itself, so the CLI needs no probe round-trip; `OutCursor` should be the
+head rather than the last matching record, because a filtered read hands back a cursor BEHIND
+the head and a chained sweep then re-reads lines it already reported; and
+`UAPAgentSettings::bCaptureVerboseAndBelow` is declared but never read, so `FAgentLogCapture`
+stores Verbose and VeryVerbose records unconditionally -- measured at 798 of 3413 records, 23%
+of the ring spent on records no default read will ever return.
+
+## 36. `--lines` truncated the log window from the NEWEST end, in silence -- FIXED
+
+The second way the mandatory broad sweep lied, found immediately after #35 shipped and worse
+than any single cause in it, because it **hides the records an agent just caused** (ClickUp
+17tm466fz6a).
+
+`--lines` was passed straight through as `GetLogsSince`'s `MaxLines`, and
+`FAgentLogCapture::ReadSince`
+(`Plugins/UnrealAgentPlayer/Source/UnrealAgentPlayerRuntime/Private/AgentLogCapture.cpp`) fills
+that quota walking the ring from the **oldest surviving record forward**:
+
+```cpp
+for (int32 i = 0; i < Size && OutEntries.Num() < MaxLines; ++i)
+```
+
+So the cap does not narrow the window, it **decapitates it**. Measured over a 667-record window
+(cursor 1869..2536):
+
+| `--lines` | records returned |
+| --- | --- |
+| 200 | 1870..2131 |
+| 300 | 1870..2491 |
+| 500 | 1870..2527 |
+
+**Every one reported `dropped: 0`, with no `truncated`, no `stale_cursor` and no `warning`** --
+so it also partly voided the guarantee #35 had just established, which is that a clean read with
+`dropped: 0` is worth what it says. The default was **200**.
+
+The interaction with `--grep` is what makes it dangerous rather than merely surprising. `--grep`
+runs CLI-side, AFTER the plugin has already applied the cap, so it searched only the oldest slice
+of the window. A `--grep "PATROL ROUTE AUDIT"` over that window answered **`count: 0` while 10
+matches sat in it** -- they were at cursors 2527..2536, past where the quota ran out. Agents had
+taken to passing `--lines 30000` as a workaround, which is a sign the default was wrong, not a
+sign they should type more.
+
+**Fixed (CLI-side, live on pull -- no plugin rebuild).** `--lines` is now a **display cap**, not
+a read bound:
+
+* the window is **paged** (`_log_scan`) until the ring is exhausted, so one quota can no longer
+  decide what is searched. Termination is exact rather than heuristic: `ReadSince` walks the
+  whole ring and only breaks early on a filled quota, so a page holding FEWER records than the
+  chunk **proves** the scan reached the newest record;
+* `--grep` and `--verbosity` are applied across the **whole** window, so `count` is the complete
+  match count and a filtered search cannot miss a match that the cap had thrown away;
+* if more matched than are listed, the answer carries `count`, `listed`, `omitted` and
+  `listed_end` plus a `warning` naming which end was dropped. The **newest** are kept by default
+  -- an agent asking "what happened since cursor X" means the records its own action produced --
+  and `--keep oldest` is there to say otherwise on purpose;
+* `--lines` defaults to **2000** on `log since` (it stays 200 on `log tail`, where it is the
+  window width and always was, and where the window cannot be decapitated because it is exactly
+  N records wide);
+* `--max-scan` bounds a runaway. Hitting it sets `scan_incomplete` **and** `truncated`, because
+  that genuinely is a window only partly examined, and says `count` is a FLOOR.
+
+Note the distinction the fix rests on: `truncated` still means **the sweep did not happen** (ring
+eviction, a stale cursor, a bounded scan) and sends you to `Saved/Logs/<Project>.log`. `omitted`
+means only the LISTING was shortened -- nothing was missed by the search -- and conflating the two
+would send agents to the raw log for nothing and teach them to ignore the flag.
+
+Cost: a sweep whose window fits in one page still costs one RC call. Paging is paid only when a
+window really holds more matching records than a page, which is exactly when the old behaviour
+was silently wrong.
+
+## 37. `uap input hold` returned at once, so consecutive holds OVERLAPPED in silence -- FIXED
+
+`uap input hold <Key> --seconds N` returns before the hold expires, and `AGENTS.md` tells agents
+to use it **instead of** repeated `rc InjectKey` -- so the documented correct way to drive
+sustained input misbehaved (ClickUp 17tm466fz3p).
+
+**The non-blocking return is deliberate and stays.** The hold runs in-engine precisely so game
+state can be read WHILE it is held, and the CLI round-trip is ~1s, so a blocking call could never
+see the middle of a short window; `--wait` has always been there for the other case. What was NOT
+deliberate is what happened next: the plugin keeps one hold per FKey (`UAPFindOrAddHold`,
+`AgentInput.cpp`) and a second `hold` on a DIFFERENT key simply started alongside the first. A
+caller reading the docs as "hold W for 3s, then hold A for 3s" got 3 seconds of W+A. It
+contaminated a session -- a pawn drifted ~3500 cm off the plaza and the run was discarded -- and
+it reads as the pawn being odd, not as a tool fault, because every call reported `ok`.
+
+**Fixed (CLI-side).** Two changes, and silent overlap is the specific behaviour removed:
+
+* the result says when the hold ends -- `ends_in_seconds`, `ends_at_epoch`, and a `note` saying
+  it is STILL HELD. Before this it said only `seconds`, which reads as "it took that long";
+* a hold on a different key while one is still running is **refused**, `overlap_refused: true`,
+  naming what is down and its `remaining_seconds`. `--overlap` says you meant them simultaneous,
+  which is a real request for two stick axes. Re-issuing the SAME key is not a conflict: that is
+  the re-assert the verb exists for.
+
+The check is two-stage so the normal path costs nothing. An on-disk ledger
+(`<leases>/<project>.holds.json` -- a hold outlives the process that started it, so there is
+nowhere else to put this) decides whether a conflict is even possible; only then is one
+`GetHeldInput` paid for to check engine ground truth. The ledger can be stale in the
+safe-to-proceed direction (PIE stopped, a `FlushPressedKeys`, another agent's `input release`),
+and refusing a hold that is not really there would be its own false failure -- so when the two
+disagree the engine wins and the ledger is dropped.
+
+## 38. The report slot could be taken mid-run, and nothing said so -- FIXED
+
+The report slot is **one per machine**: a single `~/.uap-reports/.active` pointer, and every CLI
+call is a fresh process, so that file is the only thing saying which run is being written to.
+`report start` overwrote it unconditionally and recorded nothing about who claimed it (part of
+ClickUp 17tm466fz3v).
+
+So when a second agent started a report over the same window, the first agent's later
+`report note` / `assert` / `screenshot` resolved the pointer to the SECOND agent's run -- putting
+one agent's evidence in another's report -- and once that one finished and cleared the pointer, to
+nothing at all. Observed: a call answering a bare `no active report` partway through a session,
+with nothing announcing it, and the report had to be restarted while another agent held the editor
+for about an hour running its own report over the same window. The displaced run was never even
+marked: it sat `status: running` for good with its pointer gone. **Two agents verifying at once did
+not collide loudly, they collided quietly.**
+
+**Fixed (CLI-side).**
+
+* The pointer is JSON and records the claiming `--agent` token, pid and time. An old bare-path
+  pointer is still read, so a checkout mid-upgrade does not mistake one for an empty slot.
+* `report start` **refuses** when a RUNNING report is held by a different agent token:
+  `ok: false, busy: true, held_by: <token>`, and the holder's report is left untouched.
+  `--takeover` is the deliberate override for a slot left behind by a dead session.
+* A take that does go through -- `--takeover`, or no token on either side, since this harness has
+  no reliable auto-identity and refusing would break the single-agent case -- **closes** the
+  displaced run as `incomplete`, stamps `superseded_by`, appends a note saying nothing below that
+  line was recorded, and renders its HTML. Its evidence survives, and the take is declared in the
+  `warning` of the answer.
+* A write against someone else's slot is refused by name rather than misfiled, and a stranded call
+  gets `superseded` plus an error naming the run that lost the slot, when it lost it and to whom
+  -- instead of a bare `no active report`, which reads as "you forgot to start one".
+* A start with no `--agent` token carries a `hint`, because without one nothing can stop the next
+  agent's start from taking the slot.
+
+**Still open:** identity is only as good as the token. With no `--agent` on either side there is
+nothing to compare, so the take proceeds. `AGENTS.md` should say to pass one on every report call,
+the same way it already does for the editor lease.

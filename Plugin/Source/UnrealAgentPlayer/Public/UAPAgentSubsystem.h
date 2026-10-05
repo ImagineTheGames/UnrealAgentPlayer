@@ -162,6 +162,17 @@ public:
     UFUNCTION(BlueprintCallable, Category="Agent|Input")
     FString GetHeldInput();
 
+    // Release a Slate POINTER capture, which ReleaseHeldInput does not touch -- it is a
+    // different thing from a held key. While a captor is held, every mouse event is routed to
+    // the captor instead of hit-tested under the cursor, so UI clicks report handled and do
+    // nothing; that is the state a click on a disabled widget used to leave behind
+    // [17tm466g0jf]. Deliberately NOT folded into ReleaseHeldInput: the game viewport holds
+    // this capture legitimately during normal play, so clearing it is an explicit recovery,
+    // not something a routine input reset should do.
+    // {"ok":true,"released":bool,"holder":str}
+    UFUNCTION(BlueprintCallable, Category="Agent|Input")
+    FString ReleaseSlatePointerCapture();
+
     UFUNCTION(BlueprintCallable, Category="Agent|Input")
     bool InjectXRControllerPose(EAgentXRHand Hand, FVector Position, FRotator Orientation, bool bTracked);
 
@@ -222,7 +233,34 @@ public:
     UFUNCTION(BlueprintCallable, Category="Agent|Capture")
     bool CaptureViewportWithUI(FString Filename);
 
+    // --- Python remote-exec hygiene --------------------------------------------------------
+    // Drops every global in the Python remote-exec interpreter that could root a UObject.
+    //
+    // WHY IT EXISTS: the interpreter keeps ONE globals dict for the whole editor session
+    // (FPythonScriptPlugin::PyConsoleGlobalDict -- every RunString shares it), so a
+    // `w = unreal...get_editor_world()` left behind by one `uap exec` is still rooted by
+    // FPyReferenceCollector when a LATER call loads a different level. The editor then dies on
+    // "Fatal error: ... World Memory Leaks: 1 leaks objects and packages". It is not an
+    // exception Python can catch, and the editor is shared with other agents.
+    //
+    // WHAT IT KEEPS: names starting with '_', scalars (bool/int/float/str/bytes/None),
+    // callables (functions, classes, builtins) and modules -- none of those can hold a UObject
+    // reference. Everything else is popped, which covers unreal.Object wrappers, unreal structs,
+    // and the lists/dicts/tuples that hide them.
+    //
+    // This runs automatically from FEditorDelegates::OnMapLoad; it is also a verb so an agent
+    // can sweep on demand before driving a level change itself.
+    // {"ok":true,"cleared":["w","pawn"],"count":2} | {"ok":false,"error":"..."}
+    UFUNCTION(BlueprintCallable, Category="Agent|Python")
+    FString ClearRemoteExecGlobals();
+
 private:
+    // Bound to FEditorDelegates::OnMapLoad, which UnrealEd broadcasts from
+    // FEditorFileUtils::LoadMap BEFORE anything is torn down. Deliberately does NOT touch the
+    // FCanLoadMap out-param: the level change the agent asked for still happens. See
+    // ClearRemoteExecGlobals.
+    void OnPreMapLoad(const FString& Filename, struct FCanLoadMap& OutCanLoadMap);
+
     void OnPostPIEStarted(bool bSimulating);
     void OnPrePIEEnded(bool bSimulating);
     void OnEndPIE(bool bSimulating);
@@ -239,6 +277,7 @@ private:
     FDelegateHandle HPausePIE;
     FDelegateHandle HResumePIE;
     FDelegateHandle HCancelPIE;
+    FDelegateHandle HPreMapLoad;
 
     TSharedPtr<class FAgentLogCapture> LogCapture;
 

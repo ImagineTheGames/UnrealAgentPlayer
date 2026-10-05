@@ -85,8 +85,24 @@ public:
      * argument struct zero-initialised, so an omitted float would arrive as 0.0 -- a VALID
      * screen position -- and silently click the top-left corner, which is the exact failure
      * this verb exists to end. Empty means "use the agent cursor".
+     *
+     * REFUSES (ok:false, nothing injected, `disabled_widget` naming it) when a DISABLED widget
+     * is in the way. Slate would neither skip it nor swallow the click: it truncates the hit
+     * path at the disabled widget and routes the press to the parent container, which ignores
+     * it, while ProcessMouseButtonDownEvent returns true regardless -- so clicking anyway
+     * reports clicked/down_handled/up_handled and proves nothing. Use `read-ui`'s `enabled`
+     * field to pick a target; the raw InjectMouseMove + InjectMouseButton primitives are
+     * unchanged and remain the way to drive a disabled target deliberately. [17tm466g0jf]
      */
     static FString ClickMouseJson(EAgentMouseButton Btn, const FString& XStr, const FString& YStr);
+
+    /**
+     * Clear a Slate POINTER capture for the resolved user. Separate from ReleaseHeldJson on
+     * purpose: a captor is not a held key, and the game viewport holds one legitimately during
+     * normal play, so this is an explicit recovery rather than part of a routine input reset.
+     * Reports the holder it released, or released:false when there was nothing to release.
+     */
+    static FString ReleaseSlatePointerCaptureJson();
 
     /** Pointer button event stamped with an EXPLICIT position instead of the real cursor's. */
     static bool InjectMouseButtonAt(EAgentMouseButton Btn, bool bPressed, FVector2D ScreenPos,
