@@ -39,6 +39,8 @@
 #include "Engine/GameViewportClient.h"
 #include "ImageUtils.h"
 #include "GenericPlatform/GenericWindow.h"
+#include "IPythonScriptPlugin.h"
+#include "PythonScriptTypes.h"
 #if PLATFORM_WINDOWS
 #include "Windows/AllowWindowsPlatformTypes.h"
 #include <Windows.h>
@@ -68,6 +70,7 @@ void UUAPAgentSubsystem::Initialize(FSubsystemCollectionBase& Collection)
     HPausePIE      = FEditorDelegates::PausePIE.AddUObject(this, &UUAPAgentSubsystem::OnPausePIE);
     HResumePIE     = FEditorDelegates::ResumePIE.AddUObject(this, &UUAPAgentSubsystem::OnResumePIE);
     HCancelPIE     = FEditorDelegates::CancelPIE.AddUObject(this, &UUAPAgentSubsystem::OnCancelPIE);
+    HPreMapLoad    = FEditorDelegates::OnMapLoad.AddUObject(this, &UUAPAgentSubsystem::OnPreMapLoad);
     const UUAPAgentSettings* Settings = GetDefault<UUAPAgentSettings>();
     LogCapture = MakeShared<FAgentLogCapture>(Settings ? Settings->LogBufferCapacity : 4096);
     GLog->AddOutputDevice(LogCapture.Get());
@@ -94,6 +97,7 @@ void UUAPAgentSubsystem::Deinitialize()
     FEditorDelegates::PausePIE.Remove(HPausePIE);
     FEditorDelegates::ResumePIE.Remove(HResumePIE);
     FEditorDelegates::CancelPIE.Remove(HCancelPIE);
+    FEditorDelegates::OnMapLoad.Remove(HPreMapLoad);
     UE_LOG(LogUAP, Log, TEXT("UAPAgentSubsystem deinitialized."));
     Super::Deinitialize();
 }
@@ -523,6 +527,12 @@ FString UUAPAgentSubsystem::GetHeldInput()
     return FAgentInput::GetHeldJson();
 }
 
+FString UUAPAgentSubsystem::ReleaseSlatePointerCapture()
+{
+    UAP_ACTIVITY(TEXT("input release-capture"), FString());
+    return FAgentInput::ReleaseSlatePointerCaptureJson();
+}
+
 FString UUAPAgentSubsystem::StartPropertySample(FString ObjectPath, FString PropertyPath,
                                                 float Seconds, int32 MaxSamples)
 {
@@ -826,4 +836,145 @@ FString UUAPAgentSubsystem::GetStatGroupText(FString GroupName)
         return FString::Printf(TEXT("Draw: %.2f ms"), RenderMs);
     }
     return TEXT("");
+}
+
+FString UUAPAgentSubsystem::ClearRemoteExecGlobals()
+{
+    UAP_ACTIVITY(TEXT("py clear-globals"), FString());
+    auto MakeError = [](const FString& Error) -> FString
+    {
+        TSharedRef<FJsonObject> Obj = MakeShared<FJsonObject>();
+        Obj->SetBoolField(TEXT("ok"), false);
+        Obj->SetStringField(TEXT("error"), Error);
+        FString Out;
+        TSharedRef<TJsonWriter<>> W = TJsonWriterFactory<>::Create(&Out);
+        FJsonSerializer::Serialize(Obj, W);
+        return Out;
+    };
+
+    IPythonScriptPlugin* Python = IPythonScriptPlugin::Get();
+    if (!Python || !Python->IsPythonAvailable() || !Python->IsPythonInitialized())
+    {
+        // Guarded rather than attempted: ExecPythonCommandEx itself does
+        // ensureAlwaysMsgf(false) when Python is unavailable, which would fire an ensure on
+        // every map load in a -NoPython editor.
+        return MakeError(TEXT("python not available or not initialized"));
+    }
+
+    // ONE EXPRESSION, on purpose.
+    //
+    // EvaluateStatement is the only execution mode that hands the result back in
+    // FPythonCommandEx::CommandResult, and it routes through FPythonScriptPlugin::RunString ->
+    // EvalString(..., PyConsoleGlobalDict, PyConsoleLocalDict) -- the SAME dict the remote
+    // execution channel uses for `uap exec`. So globals() inside this expression IS the dict an
+    // agent's snippets write into; `import __main__` would NOT be (the console dict is a copy of
+    // __main__'s, made once at startup).
+    //
+    // The inner comprehension is materialised into a list of names before the outer one runs, so
+    // nothing mutates the dict it is walking. The (pop, True)[1] idiom pops as a side effect
+    // while letting the outer comprehension yield the NAME rather than the popped value.
+    FPythonCommandEx Cmd;
+    Cmd.ExecutionMode = EPythonCommandExecutionMode::EvaluateStatement;
+    Cmd.Flags = EPythonCommandFlags::Unattended;
+    Cmd.Command = TEXT(
+        "','.join([n for n in ["
+        "n for n, v in list(globals().items()) "
+        "if not n.startswith('_') "
+        "and not isinstance(v, (bool, int, float, str, bytes, type(None))) "
+        "and not callable(v) "
+        "and not isinstance(v, __import__('types').ModuleType)"
+        "] if (globals().pop(n, None), True)[1]])");
+
+    if (!Python->ExecPythonCommandEx(Cmd))
+    {
+        return MakeError(FString::Printf(TEXT("python error: %s"), *Cmd.CommandResult));
+    }
+
+    // CommandResult is the REPR of the returned str, i.e. "'w,pawn'" -- or "''" when nothing was
+    // dropped -- so peel the quotes before splitting.
+    FString Joined = Cmd.CommandResult;
+    Joined.TrimStartAndEndInline();
+    if (Joined.Len() >= 2
+        && ((Joined.StartsWith(TEXT("'")) && Joined.EndsWith(TEXT("'")))
+            || (Joined.StartsWith(TEXT("\"")) && Joined.EndsWith(TEXT("\"")))))
+    {
+        Joined = Joined.Mid(1, Joined.Len() - 2);
+    }
+
+    TArray<FString> Names;
+    Joined.ParseIntoArray(Names, TEXT(","), /*InCullEmpty=*/true);
+
+    TArray<TSharedPtr<FJsonValue>> NameValues;
+    NameValues.Reserve(Names.Num());
+    for (FString& Name : Names)
+    {
+        Name.TrimStartAndEndInline();
+        NameValues.Add(MakeShared<FJsonValueString>(Name));
+    }
+
+    TSharedRef<FJsonObject> Obj = MakeShared<FJsonObject>();
+    Obj->SetBoolField(TEXT("ok"), true);
+    Obj->SetArrayField(TEXT("cleared"), NameValues);
+    Obj->SetNumberField(TEXT("count"), NameValues.Num());
+    FString Out;
+    TSharedRef<TJsonWriter<>> W = TJsonWriterFactory<>::Create(&Out);
+    FJsonSerializer::Serialize(Obj, W);
+    return Out;
+}
+
+void UUAPAgentSubsystem::OnPreMapLoad(const FString& Filename, FCanLoadMap& /*OutCanLoadMap*/)
+{
+    // CLEAR, never veto. OutCanLoadMap is left untouched on purpose: the level change the agent
+    // asked for still happens. Refusing it would trade a crash for a dead end, and the dead end
+    // would be indistinguishable from a broken load_level.
+    //
+    // The cost of clearing is that a snippet which loads a level and THEN reads a global it set
+    // earlier in the same snippet gets a NameError instead of a crash. That is the intended
+    // trade, and the warning below names exactly which globals went, so the NameError is
+    // explainable rather than mysterious.
+    const FString Result = ClearRemoteExecGlobals();
+
+    // PARSE the payload, never substring-match it. This first shipped as
+    // Result.Contains("\"count\":0"), which matches the SUCCESS-with-nothing-dropped payload only,
+    // and only at its current spacing. The error payload therefore fell through to the Warning
+    // below -- and it fires on every editor launch, because OnMapLoad broadcasts for the startup
+    // map BEFORE Python is initialised, so the verb answers
+    // {"ok":false,"error":"python not available or not initialized"}. The log then asserted a clear
+    // that had never happened, once per start. A whitespace change in the writer would have
+    // reintroduced it, hence the parse.
+    bool bOk = false;
+    double Count = 0.0;
+    TSharedPtr<FJsonObject> Parsed;
+    const TSharedRef<TJsonReader<>> Reader = TJsonReaderFactory<>::Create(Result);
+    if (!FJsonSerializer::Deserialize(Reader, Parsed) || !Parsed.IsValid()
+        || !Parsed->TryGetBoolField(TEXT("ok"), bOk))
+    {
+        // Unreadable: state that it could not be read, and claim nothing about what was swept.
+        UE_LOG(LogUAP, Verbose,
+            TEXT("OnMapLoad('%s'): ClearRemoteExecGlobals returned an unreadable payload: %s"),
+            *Filename, *Result);
+        return;
+    }
+
+    if (!bOk)
+    {
+        // Nothing was cleared and nothing needed to be. The normal instance is editor startup:
+        // no Python interpreter yet means no remote-exec globals dict, so nothing can be rooted
+        // in it. Deliberately quiet, and deliberately worded as a no-op.
+        UE_LOG(LogUAP, Verbose,
+            TEXT("OnMapLoad('%s'): no sweep performed, ClearRemoteExecGlobals unavailable: %s"),
+            *Filename, *Result);
+        return;
+    }
+
+    if (!Parsed->TryGetNumberField(TEXT("count"), Count) || Count <= 0.0)
+    {
+        UE_LOG(LogUAP, Verbose, TEXT("OnMapLoad('%s'): no remote-exec globals to clear."), *Filename);
+        return;
+    }
+
+    UE_LOG(LogUAP, Warning,
+        TEXT("OnMapLoad('%s'): cleared Python remote-exec globals that could root a UObject: %s. ")
+        TEXT("A stale UWorld reference there would have killed the editor with 'World Memory Leaks'."),
+        *Filename, *Result);
 }

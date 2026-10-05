@@ -38,6 +38,11 @@ public class UnrealAgentPlayer : ModuleRules
             "BlueprintGraph",
             "PropertyEditor",
             "CommonUI",
+            // Needed by ClearRemoteExecGlobals, which sweeps the Python remote-exec globals dict
+            // on a level change. The .uplugin already lists PythonScriptPlugin as a required
+            // plugin (remote exec is how the agent CLI talks to the editor), so this adds no new
+            // plugin requirement -- only a module dependency on its public interface.
+            "PythonScriptPlugin",
         });
     }
 }
