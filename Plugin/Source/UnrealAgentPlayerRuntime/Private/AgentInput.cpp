@@ -928,6 +928,84 @@ namespace
         }
     }
 
+    FString UAPDescribeSlateWidget(const TSharedRef<SWidget>& W)
+    {
+        const FName Tag = W->GetTag();
+        return Tag.IsNone() ? W->GetType().ToString()
+                            : FString::Printf(TEXT("%s[%s]"), *W->GetType().ToString(),
+                                              *Tag.ToString());
+    }
+
+    /**
+     * Is a DISABLED widget in the way of a click at this point?
+     *
+     * Slate does not refuse a click on a disabled widget and it does not skip past it to
+     * whatever is behind. FHittestGrid::GetBubblePath (engine
+     * SlateCore/Private/Input/HittestGrid.cpp:228) TRUNCATES the hit path at the outermost
+     * widget whose IsEnabled() is false, so the down/up are routed to that widget's PARENT
+     * container. The container ignores them, nothing happens, and
+     * FSlateApplication::ProcessMouseButtonDownEvent has no unhandled exit -- it returns true
+     * unconditionally (SlateApplication.cpp:5193-5308) -- so the caller is told the event was
+     * handled. That is why a click on a greyed Equip reported
+     * clicked/down_handled/up_handled and did nothing [17tm466g0jf].
+     *
+     * Detected by doing the lookup BOTH ways: with the enabled gate the path is shorter, and
+     * the first widget the gate dropped IS the disabled one.
+     */
+    bool UAPFindDisabledBlocker(FVector2D ScreenPos, int32 User, FString& OutBlocker,
+                                FString& OutUngatedLeaf)
+    {
+        OutBlocker.Reset();
+        OutUngatedLeaf.Reset();
+        if (!FSlateApplication::IsInitialized()) { return false; }
+        FSlateApplication& App = FSlateApplication::Get();
+
+        FWidgetPath Ungated = App.LocateWindowUnderMouse(
+            ScreenPos, App.GetInteractiveTopLevelWindows(), /*bIgnoreEnabledStatus*/ true, User);
+        if (!Ungated.IsValid() || Ungated.Widgets.Num() == 0) { return false; }
+
+        FWidgetPath Gated = App.LocateWindowUnderMouse(
+            ScreenPos, App.GetInteractiveTopLevelWindows(), /*bIgnoreEnabledStatus*/ false, User);
+        const int32 GatedNum = (Gated.IsValid() ? Gated.Widgets.Num() : 0);
+        if (GatedNum >= Ungated.Widgets.Num()) { return false; }
+
+        OutBlocker = UAPDescribeSlateWidget(Ungated.Widgets[GatedNum].Widget);
+        OutUngatedLeaf = UAPDescribeSlateWidget(Ungated.Widgets.Last().Widget);
+        return true;
+    }
+
+    /**
+     * Report an EXISTING pointer capture. While a captor is held,
+     * ProcessMouseButtonDownEvent takes the HasCapture branch and routes to the captor path
+     * instead of hit-testing under the cursor (SlateApplication.cpp:5236), so a click goes
+     * wherever the captor is regardless of where it was aimed -- and still reports true.
+     * Reported rather than refused: a legitimate drag holds capture too.
+     */
+    void UAPReportPointerCapture(int32 User, const TSharedRef<FJsonObject>& O)
+    {
+        if (!FSlateApplication::IsInitialized()) { return; }
+        TSharedPtr<FSlateUser> SlateUser = FSlateApplication::Get().GetUser(User);
+        if (!SlateUser.IsValid() || !SlateUser->HasAnyCapture()) { return; }
+
+        TArray<FWidgetPath> Captors = SlateUser->GetCaptorPaths();
+        FString Holder = TEXT("<unresolved>");
+        for (const FWidgetPath& P : Captors)
+        {
+            if (P.IsValid() && P.Widgets.Num() > 0)
+            {
+                Holder = UAPDescribeSlateWidget(P.Widgets.Last().Widget);
+                break;
+            }
+        }
+        O->SetStringField(TEXT("pointer_capture_holder"), Holder);
+        O->SetStringField(TEXT("pointer_capture_warning"), FString::Printf(
+            TEXT("Slate user %d already holds a POINTER CAPTURE ('%s'), so this event is routed ")
+            TEXT("to the captor instead of to whatever is under the cursor -- and it will still ")
+            TEXT("report handled. If UI clicks have gone inert, this is why. `uap input release` ")
+            TEXT("does NOT clear a Slate captor (measured: it reports released 0 and the captor ")
+            TEXT("survives); use `uap rc ReleaseSlatePointerCapture`."), User, *Holder));
+    }
+
     /** Shared body of `mouse move` and the implicit move inside `mouse click`. */
     FString UAPMoveAgentCursor(FVector2D Target, int32 User, const TSharedRef<FJsonObject>& O)
     {
@@ -964,6 +1042,16 @@ namespace
         //    rather than let a bare ok:true read as "the element was clicked".
         const FString Hit = FAgentInput::DescribeWidgetsAt(Target, User);
         O->SetStringField(TEXT("hit"), Hit);
+
+        // WHY the chain ends where it does. A path that stops at a layout panel because
+        // something disabled sits in front of it looks identical to a path that simply has no
+        // button there, and that ambiguity is the whole of 17tm466g0jf.
+        FString Blocker, UngatedLeaf;
+        if (UAPFindDisabledBlocker(Target, User, Blocker, UngatedLeaf))
+        {
+            O->SetStringField(TEXT("disabled_widget"), Blocker);
+            O->SetStringField(TEXT("would_hit_if_enabled"), UngatedLeaf);
+        }
         return Hit;
     }
 
@@ -1010,6 +1098,7 @@ FString FAgentInput::SetMousePositionJson(float X, float Y)
 
     TSharedRef<FJsonObject> O = MakeShared<FJsonObject>();
     O->SetBoolField(TEXT("ok"), true);
+    UAPReportPointerCapture(User, O);
     const FString Hit = UAPMoveAgentCursor(FVector2D(X, Y), User, O);
     O->SetNumberField(TEXT("user_index"), User);
     if (Hit.IsEmpty())
@@ -1051,9 +1140,40 @@ FString FAgentInput::ClickMouseJson(EAgentMouseButton Btn, const FString& XStr, 
     const int32 User = ResolveSlateUserIndex(INDEX_NONE, UserError);
     if (User == INDEX_NONE) { return UAPMouseRefuse(UserError); }
 
+    // A DISABLED TARGET IS A REFUSAL, and it is checked here -- before the cursor is moved and
+    // before anything is injected -- so a refused call has zero side effects, like every other
+    // refusal in this file. Clicking anyway is strictly worse than refusing: the events land on
+    // the disabled widget's parent container, nothing happens, and the result says
+    // clicked/down_handled/up_handled because ProcessMouseButtonDownEvent always returns true.
+    // See UAPFindDisabledBlocker for the engine mechanism. [17tm466g0jf]
+    const FVector2D Aim = (bHasX ? FVector2D(PX, PY) : GetAgentCursorPos());
+    FString Blocker, UngatedLeaf;
+    if (UAPFindDisabledBlocker(Aim, User, Blocker, UngatedLeaf))
+    {
+        TSharedRef<FJsonObject> R = MakeShared<FJsonObject>();
+        R->SetBoolField(TEXT("ok"), false);
+        R->SetBoolField(TEXT("clicked"), false);
+        R->SetStringField(TEXT("disabled_widget"), Blocker);
+        R->SetStringField(TEXT("would_hit_if_enabled"), UngatedLeaf);
+        R->SetNumberField(TEXT("x"), Aim.X);
+        R->SetNumberField(TEXT("y"), Aim.Y);
+        R->SetNumberField(TEXT("user_index"), User);
+        R->SetStringField(TEXT("error"), FString::Printf(
+            TEXT("refusing to click %.0f,%.0f: a DISABLED widget ('%s') is in the way of '%s'. ")
+            TEXT("Slate would not skip it and would not swallow the click -- it truncates the ")
+            TEXT("hit path at the disabled widget and routes the press to its PARENT container, ")
+            TEXT("which ignores it, while the call still reports clicked/down_handled/up_handled. ")
+            TEXT("Nothing was injected. Read `enabled` on each `read-ui` entry and aim at an ")
+            TEXT("enabled one; to drive it anyway for diagnosis, call InjectMouseMove then ")
+            TEXT("InjectMouseButton directly."),
+            Aim.X, Aim.Y, *Blocker, *UngatedLeaf));
+        return UAPJson(R);
+    }
+
     TSharedRef<FJsonObject> O = MakeShared<FJsonObject>();
     O->SetBoolField(TEXT("ok"), true);
     O->SetStringField(TEXT("button"), Key.ToString());
+    UAPReportPointerCapture(User, O);
 
     FString Hit;
     if (bHasX)
@@ -1096,5 +1216,44 @@ FString FAgentInput::ClickMouseJson(EAgentMouseButton Btn, const FString& XStr, 
                  "activate anything. Verify with a second `read-ui` that the UI changed."),
             *Hit));
     }
+    return UAPJson(O);
+}
+
+FString FAgentInput::ReleaseSlatePointerCaptureJson()
+{
+    if (!FSlateApplication::IsInitialized())
+    {
+        return UAPMouseRefuse(TEXT("Slate is not initialised in this process, so there is no "
+                                   "pointer layer holding a capture."));
+    }
+    FString UserError;
+    const int32 User = ResolveSlateUserIndex(INDEX_NONE, UserError);
+    if (User == INDEX_NONE) { return UAPMouseRefuse(UserError); }
+
+    TSharedRef<FJsonObject> O = MakeShared<FJsonObject>();
+    O->SetBoolField(TEXT("ok"), true);
+    O->SetNumberField(TEXT("user_index"), User);
+
+    TSharedPtr<FSlateUser> SlateUser = FSlateApplication::Get().GetUser(User);
+    if (!SlateUser.IsValid() || !SlateUser->HasAnyCapture())
+    {
+        O->SetBoolField(TEXT("released"), false);
+        O->SetStringField(TEXT("holder"), FString());
+        return UAPJson(O);
+    }
+
+    FString Holder = TEXT("<unresolved>");
+    for (const FWidgetPath& P : SlateUser->GetCaptorPaths())
+    {
+        if (P.IsValid() && P.Widgets.Num() > 0)
+        {
+            Holder = UAPDescribeSlateWidget(P.Widgets.Last().Widget);
+            break;
+        }
+    }
+    SlateUser->ReleaseAllCapture();
+    O->SetBoolField(TEXT("released"), true);
+    O->SetStringField(TEXT("holder"), Holder);
+    O->SetBoolField(TEXT("still_captured"), SlateUser->HasAnyCapture());
     return UAPJson(O);
 }
