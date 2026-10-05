@@ -89,10 +89,18 @@ class _FakeEditor:
     `honour_dest=False` reproduces the hijack: it answers an `open_connection` that was
     addressed to a DIFFERENT node, which is what lets a stray process return its own output
     as the answer to somebody else's command.
+
+    `delay` holds the REPLY back after the connection is made; `connect_delay` holds back the
+    CONNECTION itself. They are not interchangeable: the client accepts connect-backs in the
+    order they arrive, so only `connect_delay` decides who is accepted first. A test that needs
+    the hijacker to get in first must say so with `connect_delay` on the real node -- `delay`
+    alone leaves the connect order to thread scheduling, and on a CI runner the real node won
+    that race and the hijack this test exists for never happened.
     """
 
     def __init__(self, node_id: str, allow: set[str], *, honour_dest: bool = True,
                  output: str | None = None, echo: bool = False, delay: float = 0.0,
+                 connect_delay: float = 0.0,
                  project: str = FAKE_PROJECT, serve: bool = True):
         self.node_id = node_id
         self.allow = allow
@@ -100,6 +108,7 @@ class _FakeEditor:
         self.output = output
         self.echo = echo
         self.delay = delay
+        self.connect_delay = connect_delay
         self.project = project
         self.serve = serve
         self._stop = threading.Event()
@@ -164,6 +173,8 @@ class _FakeEditor:
                 w.start()
 
     def _serve(self, requester: str, d: dict):
+        if self.connect_delay:
+            time.sleep(self.connect_delay)
         try:
             conn = socket.create_connection((d["command_ip"], d["command_port"]), timeout=3)
         except OSError:
@@ -218,7 +229,9 @@ def test_a_node_that_hijacks_the_connect_back_is_refused_not_returned():
     client = _new_client(discovery_timeout=4.0, exec_timeout=4.0,
                          node_project_substr="Fake")
     allow = {client._node_id}
-    with _FakeEditor("real-node", allow, delay=0.30, echo=True), \
+    # connect_delay, not just delay: the hijacker has to be ACCEPTED first for there to be a
+    # hijack to refuse. See _FakeEditor.
+    with _FakeEditor("real-node", allow, delay=0.30, connect_delay=0.30, echo=True), \
             _FakeEditor("rogue-node", allow, honour_dest=False,
                         output="i am not your editor\n", project="/rogue/Rogue.uproject"):
         result = client.exec_python("print('TOKEN-REAL')")
@@ -269,7 +282,7 @@ def test_a_hijacker_cannot_forge_another_nodes_identity():
     """
     client = _new_client(discovery_timeout=4.0, exec_timeout=4.0, node_project_substr="Fake")
     allow = {client._node_id}
-    with _FakeEditor("real-node", allow, delay=0.30, echo=True), \
+    with _FakeEditor("real-node", allow, delay=0.30, connect_delay=0.30, echo=True), \
             _FakeEditor("rogue-node", allow, honour_dest=False,
                         project="/rogue/Rogue.uproject"):
         client.exec_python("print('x')")
