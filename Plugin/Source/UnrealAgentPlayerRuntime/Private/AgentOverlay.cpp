@@ -34,7 +34,20 @@
 // overlay is not merely early-outing per frame -- it is not called at all.
 static TAutoConsoleVariable<int32> CVarUAPOverlay(
     TEXT("uap.Overlay"), 1,
-    TEXT("Draw the uap activity overlay in the editor viewport and in PIE. 0 unregisters it."),
+    TEXT("uap activity overlay. 1 (default) = drawn ONLY while an agent is actually driving this "
+         "editor: an unexpired lease, a CLI verb in flight, or within uap.Overlay.IdleGraceSeconds "
+         "of the last verb - so a human's idle editor stays clean. 0 = never. 2 = always on, for "
+         "working on the overlay itself. It defaulted to 0 for a while, which skipped the "
+         "driving gate entirely and the title never appeared at all (Reinaldo, 2026-10-02)."),
+    ECVF_Default);
+
+// How long the overlay lingers after the last verb finishes. Most verbs complete in well under
+// a frame, so a strict "only while running" rule would make it flicker and be unreadable - the
+// grace is what keeps the tail of a call on screen long enough to read. It is NOT a reason to
+// keep showing an idle editor: once this elapses and no lease is held, the overlay goes away.
+static TAutoConsoleVariable<float> CVarUAPOverlayIdleGrace(
+    TEXT("uap.Overlay.IdleGraceSeconds"), 20.0f,
+    TEXT("Seconds the uap overlay stays up after the last verb finishes, when no lease is held."),
     ECVF_Default);
 
 // Reinaldo picked top right, 2026-09-30. Kept as a CVar because it is a one-line change of mind.
@@ -86,6 +99,7 @@ namespace
     {
         FString LeaseAgent;
         FString LeaseReason;
+        bool    bLeaseStale = false;   // held past its TTL with no heartbeat -- holder is gone
         FString Waiters;
         FString CliVerb;        // machine-lock reason, e.g. "input:hold" -- the CLI-side verb
         FString CliAgent;
@@ -155,6 +169,21 @@ namespace
             {
                 (*Excl)->TryGetStringField(TEXT("agent"), Next.LeaseAgent);
                 (*Excl)->TryGetStringField(TEXT("reason"), Next.LeaseReason);
+
+                // A LEASE OUTLIVES THE AGENT THAT TOOK IT. It is a file on disk, so it
+                // survives an editor restart and every refresh of this overlay, and a holder
+                // that stopped calling (or died) leaves it sitting there. Showing it anyway
+                // is how the overlay came to read 'lease chairs16' with nothing running, on
+                // every restart. The CLI already ages a lease out on TTL; read the same two
+                // fields and do not light up for one that has expired.
+                double Heartbeat = 0.0, Ttl = 0.0;
+                (*Excl)->TryGetNumberField(TEXT("heartbeat_at"), Heartbeat);
+                (*Excl)->TryGetNumberField(TEXT("ttl"), Ttl);
+                if (Heartbeat > 0.0 && Ttl > 0.0)
+                {
+                    const double NowUnix = FDateTime::UtcNow().ToUnixTimestamp();
+                    Next.bLeaseStale = (NowUnix - Heartbeat) > Ttl;
+                }
             }
             const TArray<TSharedPtr<FJsonValue>>* Waiters = nullptr;
             if (Lease->TryGetArrayField(TEXT("waiters"), Waiters) && Waiters)
@@ -291,8 +320,13 @@ namespace
         //    moving, and it is drawn in the alarm colour for that reason.
         if (!GCoord.LeaseAgent.IsEmpty())
         {
-            Out.Add({ FString::Printf(TEXT("lease  %s (%s)"),
-                                      *Trim(GCoord.LeaseAgent, 26), *GCoord.LeaseReason), CInfo });
+            // A stale one is still worth NAMING when the overlay is up for another reason --
+            // it is exactly what you need to see to know the lease is safe to break -- but it
+            // is not on its own a reason to put the overlay on screen. See ShouldShowOverlay.
+            Out.Add({ FString::Printf(TEXT("lease  %s (%s)%s"),
+                                      *Trim(GCoord.LeaseAgent, 26), *GCoord.LeaseReason,
+                                      GCoord.bLeaseStale ? TEXT(" EXPIRED") : TEXT("")),
+                      GCoord.bLeaseStale ? CAlarm : CInfo });
         }
         if (!GCoord.Waiters.IsEmpty())
         {
@@ -311,6 +345,57 @@ namespace
         return CVarUAPOverlay.GetValueOnAnyThread() != 0;
     }
 
+    /**
+     * Is an AGENT actually driving this editor right now? If not, it is a human's screen and
+     * the overlay has no business being on it.
+     *
+     * Reinaldo, on seeing it during a PIE session he had started himself: "i dont think uap
+     * should always show if im not using it, like i just started pie myself, that doesnt seem
+     * right."
+     *
+     * It used to draw unconditionally, because `idle` is a RENDERED STATE here rather than an
+     * absence - so the block sat on the viewport forever showing "idle  no verb yet this
+     * session", or a stale "last: ...", plus whatever the lease and report files happened to
+     * hold. Two real consequences: it branded an editor nobody was driving, and because the
+     * overlay is deliberately composited into `uap screenshot`, a run that was not happening
+     * still landed in other runs' evidence - the sixteen-chair verification shipped two
+     * screenshots carrying a DIFFERENT agent's report title in the corner.
+     *
+     * Shown when any of these holds, which is exactly "a tool is driving this editor":
+     *   - somebody holds this project's exclusive lease;
+     *   - a CLI verb is in flight. The machine lock names it BEFORE it reaches the editor,
+     *     which is the case that reads as a hung tool and is the most important to show;
+     *   - a verb is executing in-engine;
+     *   - a verb finished within the grace window, so the tail of a call stays readable
+     *     rather than vanishing the instant it completes.
+     */
+    bool ShouldShowOverlay()
+    {
+        if (!OverlayEnabled())
+        {
+            return false;
+        }
+        if (CVarUAPOverlay.GetValueOnAnyThread() >= 2)
+        {
+            return true;   // forced on - how you work on the overlay without fighting this rule
+        }
+
+        // Internally throttled, and BuildLines calls it anyway, so this costs nothing extra.
+        PollCoordination();
+        if ((!GCoord.LeaseAgent.IsEmpty() && !GCoord.bLeaseStale) || !GCoord.CliVerb.IsEmpty())
+        {
+            return true;
+        }
+
+        const FUAPActivitySnapshot Act = FUAPActivity::Read();
+        if (Act.bActive)
+        {
+            return true;
+        }
+        const float Grace = FMath::Max(0.0f, CVarUAPOverlayIdleGrace.GetValueOnAnyThread());
+        return !Act.LastVerb.IsEmpty() && Act.LastEndedSecondsAgo <= (double)Grace;
+    }
+
     bool DrawOnRight()
     {
         return CVarUAPOverlayCorner.GetValueOnAnyThread() != 0;
@@ -326,7 +411,7 @@ namespace
     // =========================================================================================
     void DrawCanvas(UCanvas* Canvas, APlayerController* /*PC*/)
     {
-        if (!Canvas || !GEngine || !OverlayEnabled())
+        if (!Canvas || !GEngine || !ShouldShowOverlay())
         {
             return;
         }
@@ -424,7 +509,7 @@ namespace
                               FSlateWindowElementList& Out, int32 LayerId,
                               const FWidgetStyle&, bool) const override
         {
-            if (!OverlayEnabled() || !FSlateApplication::IsInitialized())
+            if (!ShouldShowOverlay() || !FSlateApplication::IsInitialized())
             {
                 return LayerId;
             }
