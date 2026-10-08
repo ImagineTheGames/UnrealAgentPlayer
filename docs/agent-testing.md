@@ -96,6 +96,9 @@ bone delta, log line) settle a question -- never a screenshot alone.
 - `uap rc <FunctionName> [key=value ...]` -- call a UAP_Preset UFUNCTION (use `uap exec` for nested args).
 - `uap read-ui` -- dump viewport UMG text. `uap screenshot <file> [--caption ...]` -- capture
   (requires a live PIE frame; reports `ok:false` if no file lands), auto-attached.
+  `uap screenshot <abs.png> --window <Context_N|pid:N|title> [--frames N --interval-ms M]` --
+  capture a STANDALONE `-game` client's window instead (PrintWindow, works unfocused or paused),
+  stamped with its process/project/context; blank frames are refused; counts as pass proof.
 - `uap input hold <Key> --seconds N` / `uap input axis <AxisKey> <v> --seconds N` /
   `uap input release [<Key>]` / `uap input status` -- **sustained** input. `rc InjectKey` is ONE
   event: the round-trip is ~1s so re-injecting per poll cannot cover a sub-second window, and any

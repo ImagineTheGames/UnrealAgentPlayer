@@ -6,6 +6,7 @@ from typing import Any
 
 from unreal_agent_player.reporting.viewer import TITLE_PREFIX
 from unreal_agent_player.throttle import THROTTLE_NOTE, is_throttled
+from unreal_agent_player.window_capture import describe_source
 
 _CSS = """
 *{box-sizing:border-box}body{margin:0;font:14px/1.5 system-ui,Segoe UI,sans-serif;background:#0f1115;color:#e6e6e6}
@@ -23,6 +24,8 @@ _CSS = """
 .grid{display:flex;flex-wrap:wrap;gap:12px}.thumb{width:240px;cursor:pointer}
 .thumb img{width:100%;border:1px solid #2a2f3a;border-radius:6px;display:block}
 .cap{font-size:12px;opacity:.8;margin-top:4px}
+.src{font-size:11px;margin-top:2px;color:#8fb8ff;font-family:Consolas,monospace;word-break:break-word}
+.src.unverified{color:#e0b060}
 table{border-collapse:collapse;width:100%}td,th{padding:6px 10px;border-bottom:1px solid #232833;text-align:left;font-size:13px}
 tr.err td{background:#2a1414}.badge{font-size:11px;padding:1px 6px;border-radius:4px}
 .badge.ok{background:#173d24;color:#7fe0a0}.badge.no{background:#3d1717;color:#e08f8f}
@@ -67,6 +70,17 @@ def _overview(d: dict) -> str:
     return "".join(parts)
 
 
+def _source_line(sh: dict) -> str:
+    """Where a picture came from: editor, or which standalone client (context, pid, project).
+    A shot with no stamp is a manual attach of unknown origin -- say so rather than say nothing."""
+    text = describe_source(sh.get("source"))
+    if not text and sh.get("provenance"):
+        text = f"editor | {sh['provenance']}"
+    if not text:
+        return "<div class='src unverified'>source unknown (manual attach - not pass proof)</div>"
+    return f"<div class='src'>{_e(text)}</div>"
+
+
 def _shots(d: dict) -> str:
     cells = []
     for sh in d.get("screenshots", []):
@@ -75,7 +89,8 @@ def _shots(d: dict) -> str:
             continue
         f = _e(sh["file"])
         cells.append(f"<div class='thumb' onclick=\"lb('{f}')\"><img src='{f}'>"
-                     f"<div class='cap'>{_e(sh.get('caption'))} <span class='evi'>{_e(sh.get('t'))}</span></div></div>")
+                     f"<div class='cap'>{_e(sh.get('caption'))} <span class='evi'>{_e(sh.get('t'))}</span></div>"
+                     f"{_source_line(sh)}</div>")
     return f"<div class='grid'>{''.join(cells) or 'No screenshots.'}</div>"
 
 

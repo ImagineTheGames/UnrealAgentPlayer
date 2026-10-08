@@ -54,15 +54,19 @@ class ReportSession:
         self._persist()
 
     def add_screenshot(self, src_path: str, caption: str = "",
-                       provenance: str | None = None) -> str | None:
-        # provenance = the project of the editor the shot was captured FROM (stamped by
-        # `uap screenshot`). Used to reject a pass whose only proof is a shot of another editor.
+                       provenance: str | None = None,
+                       source: dict[str, Any] | None = None) -> str | None:
+        # provenance = the project of the editor (or standalone client) the shot was captured
+        # FROM, stamped by `uap screenshot` / `uap screenshot --window`. Used to reject a pass
+        # whose only proof is a shot of another editor. `source` is the full stamp (process,
+        # pid, client context, time) the report renders under the image, so a reader can see
+        # which client each picture came from.
         idx = len(self.screenshots)
         src = Path(src_path)
         if not src.exists():
             self.screenshots.append({
                 "file": None, "caption": caption, "provenance": provenance,
-                "t": self._hms(datetime.now()), "missing": True,
+                "source": source, "t": self._hms(datetime.now()), "missing": True,
             })
             self._persist()
             return None
@@ -70,7 +74,7 @@ class ReportSession:
         shutil.copyfile(src, self.run_dir / rel)
         self.screenshots.append({
             "file": rel, "caption": caption, "provenance": provenance,
-            "t": self._hms(datetime.now()), "missing": False,
+            "source": source, "t": self._hms(datetime.now()), "missing": False,
         })
         self._persist()
         return rel
@@ -131,7 +135,8 @@ class ReportSession:
         provs = [s.get("provenance") for s in real]
         return False, (f"screenshot(s) are not verified from the editor under test "
                        f"(report project={self.project!r}, shot provenance={provs}). Capture "
-                       f"with `uap screenshot <abs.png>` via THIS project's uap.ps1 -- a shot of "
+                       f"with `uap screenshot <abs.png>` via THIS project's uap.ps1 (a standalone "
+                       f"game client: add `--window <Context_N|pid:N>`) -- a shot of "
                        f"another editor (or a manual attach) is not proof.")
 
     def finish(self, status: str, summary: str) -> None:

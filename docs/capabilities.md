@@ -282,6 +282,23 @@ Use it to read a prompt's required key (`"Press E"` → inject `E`), enumerate m
 
 ## Screenshots
 
+### `uap screenshot <abs.png> --window <selector>` (CLI)
+Captures a **standalone game client's** window (e.g. the `-game` clients a two-player test
+launches) from the OS side with `PrintWindow(PW_CLIENTONLY | PW_RENDERFULLCONTENT)`, so it works
+while the window is unfocused, behind other windows, or the game is paused. No editor or plugin is
+involved, and it does not wait on the editor lease or machine lock.
+
+- **Selector:** a Dev Auth context (`Context_2`, matched exactly against `-DevAuthToolName=`),
+  `pid:<n>` (or a bare number), or a window-title substring. Zero or several matches are refused
+  with the candidates listed -- never guessed.
+- **Stamp:** every image carries `source` = {pid, exe, uproject, project, context, game_client,
+  title, size, frame, captured_at}. The report renders it under the image, and `project` is the
+  shot's provenance for the pass gate (same rule as an editor shot).
+- **Blank check:** a frame that is >=99.5% black or one flat colour fails the call and is not
+  attached. A minimised window is refused (restore it; focus is not needed).
+- **Burst:** `--frames N --interval-ms M` (N <= 60) writes `<stem>_f01.png`...; the result reports
+  `changed_from_previous` per frame and warns when every frame is identical.
+
 ### `screenshot_viewport`
 **Inputs:** `resolution` (e.g. `1920x1080`), filename, flags.
 **Captures** the game viewport via `HighResShot`.
