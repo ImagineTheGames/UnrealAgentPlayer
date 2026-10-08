@@ -40,6 +40,10 @@ These are the errors agents make every time. Don't.
    (`uap read-ui` / a state read) and assert on it -- never attach pixels you didn't verify.
    (`report finish pass` with no verified shot auto-downgrades to FAIL. Opt out only for a
    genuinely headless check: `report start --no-require-screenshot`.)
+   A standalone `-game` client is not in the editor viewport: capture it with
+   `uap screenshot <abs.png> --window <Context_N | pid:N | title>` (add `--frames N --interval-ms M`
+   for a motion burst). It is stamped with the client's process, project and Dev Auth context and
+   counts as pass proof for that project.
 6. **Discover verbs with `uap help`** -- do not reverse-engineer by dumping `dir()` on the subsystem.
 7. **"this editor's plugin has no `<Verb>` ... sync and rebuild `<project>`" is a TOOLING version
    gap, not a broken editor and not a product bug.** The `uap` CLI is shared by every project while
@@ -166,9 +170,13 @@ wrote it down -- no cleverness involved.")
 - **Failure mode:** you screenshot to verify something in a separate **Standalone** PIE window and
   get the editor viewport instead -- often a plausible-looking but WRONG image, which is worse than
   a blank one, because you will believe it.
-- **Do instead:** an OS `PrintWindow` capture of the target window (find the window by title, then
-  `PrintWindow` it). Project Broken Wings keeps a `Tools/Capture-Window.ps1` for exactly this; the
-  technique is the portable part, not the script.
+- **Do instead:** `uap screenshot <abs.png> --window <selector>` -- an OS `PrintWindow`
+  (PW_RENDERFULLCONTENT) capture of that window, selected by Dev Auth context (`Context_2`, read
+  from the client's `-DevAuthToolName=`), `pid:<n>`, or a title substring. An ambiguous selector
+  is refused with the candidates listed; a black / flat frame is refused and never attached; the
+  image is stamped with process, pid, project, context and time, and the report shows which client
+  each picture came from. `--frames N --interval-ms M` saves a stamped burst and says whether any
+  two frames differ (motion proof).
 - **Worth knowing:** `PrintWindow` also works while the game is **PAUSED**, which the viewport path
   does not -- useful when you need to freeze a frame to inspect it.
 

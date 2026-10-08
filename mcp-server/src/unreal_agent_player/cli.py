@@ -12,6 +12,8 @@ import re
 import shlex
 import sys
 import time
+from datetime import datetime as datetime_cls
+from datetime import timezone
 
 from unreal_agent_player import contract as _contract
 from unreal_agent_player import coordination as _coord
@@ -513,8 +515,9 @@ def _capture(tool: str, args: dict, body: dict, ms: int) -> None:
         ok = bool(body.get("ok", True)) and "error" not in body
         s.add_tool_call(tool, args, ok=ok, ms=ms, error=body.get("error"))
         if tool == "screenshot" and body.get("path") and body.get("exists"):
-            s.add_screenshot(body["path"], body.get("caption", ""),
-                             provenance=body.get("provenance"))
+            prov = body.get("provenance")
+            s.add_screenshot(body["path"], body.get("caption", ""), provenance=prov,
+                             source={"kind": "editor", "project": prov} if prov else None)
     except Exception:
         pass
 
@@ -1844,7 +1847,176 @@ def _screenshot_body(file: str, exists: bool) -> dict:
     }
 
 
+_MAX_FRAMES = 60
+
+
+def _window_frame_paths(file: str, frames: int) -> list[str]:
+    """`shot.png` for one frame; `shot_f01.png`..`shot_fNN.png` for a burst."""
+    if frames <= 1:
+        return [file]
+    stem, ext = os.path.splitext(file)
+    ext = ext or ".png"
+    width = max(2, len(str(frames)))
+    return [f"{stem}_f{i:0{width}d}{ext}" for i in range(1, frames + 1)]
+
+
+def _report_for_attach(agent: str | None):
+    """The active report, unless it belongs to a DIFFERENT agent (then attaching would put
+    this agent's frames in a stranger's report). Returns (session|None, refusal|None)."""
+    s = _load_active()
+    if s is None:
+        return None, None
+    held = ((sess.get_active_owner() or {}).get("agent") or "").strip()
+    mine = (agent or os.environ.get("UAP_AGENT_ID") or "").strip()
+    # Stricter than the editor path on purpose: a tokenless capture does NOT drop frames into a
+    # report someone else owns. Two-client tests are exactly when several agents are working.
+    if held and held != mine:
+        return None, (f"not attached: the active report belongs to agent {held!r}, not "
+                      f"{mine or '(no --agent token)'!r}. Pass --agent <your-token> if it is "
+                      f"yours; the image files are still written.")
+    return s, None
+
+
+def _window_screenshot(args) -> int:
+    """`uap screenshot <file> --window <sel>`: capture a standalone game client's window from
+    the OS side (PrintWindow), stamp its source, refuse a blank frame, attach to the report.
+    Touches no editor -- see window_capture.py for why this exists."""
+    from unreal_agent_player import window_capture as wc
+
+    t0 = time.monotonic()
+    frames = getattr(args, "frames", None)
+    frames = 1 if frames is None else int(frames)
+    interval_ms = getattr(args, "interval_ms", None)
+    interval_ms = 500 if interval_ms is None else int(interval_ms)
+    call_args = {"file": args.file, "window": args.window, "frames": frames,
+                 "interval_ms": interval_ms}
+    body: dict = {"ok": False, "window": args.window}
+
+    def _done(b: dict) -> int:
+        s, _ = _report_for_attach(getattr(args, "agent", None))
+        if s is not None:
+            try:
+                s.add_tool_call("screenshot", call_args, ok=bool(b.get("ok")),
+                                ms=int((time.monotonic() - t0) * 1000), error=b.get("error"))
+            except Exception:
+                pass
+        _emit(b)
+        return 0 if b.get("ok") else 1
+
+    if not os.path.isabs(args.file):
+        body["error"] = f"pass an ABSOLUTE path for the image, got {args.file!r}"
+        return _done(body)
+    if frames < 1 or frames > _MAX_FRAMES:
+        body["error"] = f"--frames must be 1..{_MAX_FRAMES}, got {frames}"
+        return _done(body)
+    if interval_ms < 0:
+        body["error"] = f"--interval-ms must be >= 0, got {interval_ms}"
+        return _done(body)
+
+    try:
+        cands = wc.list_candidates()
+        target, matched_by = wc.select(cands, args.window)
+    except wc.SelectError as exc:
+        body["error"] = str(exc)
+        body["candidates"] = [c.summary() for c in exc.candidates]
+        return _done(body)
+    except wc.CaptureError as exc:
+        body["error"] = str(exc)
+        return _done(body)
+
+    # Grab every frame FIRST and encode afterwards, so PNG encoding (~100 ms a frame) does not
+    # stretch the interval -- a motion burst is only evidence if its spacing is what was asked.
+    raw: list[tuple[int, int, bytes, datetime_cls, int]] = []
+    start = time.monotonic()
+    try:
+        for i in range(frames):
+            due = start + i * interval_ms / 1000.0
+            delay = due - time.monotonic()
+            if delay > 0:
+                time.sleep(delay)
+            at = datetime_cls.now(timezone.utc).astimezone()
+            off = int((time.monotonic() - start) * 1000)
+            w, h, px = wc.capture_bgra(target.hwnd)
+            raw.append((w, h, px, at, off))
+    except wc.CaptureError as exc:
+        body["error"] = f"{exc} (after {len(raw)} of {frames} frame(s))"
+        body["target"] = target.summary()
+        return _done(body)
+
+    paths = _window_frame_paths(args.file, frames)
+    out_frames = []
+    blank_frames = []
+    prev = None
+    for i, ((w, h, px, at, off), path) in enumerate(zip(raw, paths), start=1):
+        stats = wc.image_stats(w, h, px)
+        stamp = wc.make_stamp(target, matched_by=matched_by, selector=args.window,
+                              width=w, height=h, frame=i, frames=frames, offset_ms=off,
+                              captured_at=at)
+        os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+        with open(path, "wb") as fh:
+            fh.write(wc.bgra_to_png(w, h, px))
+        row = {"path": path, "frame": i, "offset_ms": off, "size": [w, h],
+               "blank": stats["blank"], "stats": stats, "source": stamp}
+        if stats["blank"]:
+            row["reason"] = stats.get("reason")
+            blank_frames.append(i)
+        if prev is not None and prev[0] == w and prev[1] == h:
+            row["changed_from_previous"] = wc.frame_difference(w, h, prev[2], px)
+        prev = (w, h, px)
+        out_frames.append(row)
+
+    body.update({"target": target.summary(), "matched_by": matched_by,
+                 "provenance": target.info.get("project"),
+                 "source": wc.describe_source(out_frames[0]["source"]),
+                 "frames": out_frames, "path": out_frames[0]["path"],
+                 "exists": True})
+    if frames > 1:
+        diffs = [f["changed_from_previous"] for f in out_frames if "changed_from_previous" in f]
+        body["motion"] = {"max_changed": max(diffs) if diffs else None,
+                          "identical_pairs": sum(1 for d in diffs if d == 0.0)}
+        if diffs and max(diffs) == 0.0:
+            body["warning"] = ("every frame in the burst is IDENTICAL -- no motion was captured. "
+                               "If you meant to show animation, the client may be paused, "
+                               "frozen or not rendering.")
+    if not target.info.get("project"):
+        body["warning_provenance"] = (
+            "could not tell which project this window belongs to (no .uproject on its command "
+            "line), so these frames are attached but do NOT count as pass proof.")
+
+    # Attach every non-blank frame; a blank frame is never proof of anything.
+    s, refusal = _report_for_attach(getattr(args, "agent", None))
+    attached = []
+    if refusal:
+        body["report"] = refusal
+    elif s is not None:
+        for row in out_frames:
+            if row["blank"]:
+                continue
+            cap = args.caption or ""
+            if frames > 1:
+                cap = f"{cap} (frame {row['frame']}/{frames}, +{row['offset_ms']} ms)".strip()
+            rel = s.add_screenshot(row["path"], cap, provenance=target.info.get("project"),
+                                   source=row["source"])
+            if rel:
+                attached.append(rel)
+        body["attached"] = attached
+
+    if blank_frames:
+        body["ok"] = False
+        body["blank_frames"] = blank_frames
+        body["error"] = (
+            f"BLANK capture: frame(s) {blank_frames} of {frames} came back black or one flat "
+            f"colour ({out_frames[blank_frames[0] - 1].get('reason')}), so they were NOT attached "
+            f"as proof. The window may be minimised, still loading, or not presenting frames. "
+            f"Look at the file, fix the cause, and capture again.")
+    else:
+        body["ok"] = True
+    return _done(body)
+
+
 def _screenshot(args) -> int:
+    if getattr(args, "window", None):
+        return _window_screenshot(args)
     t0 = time.monotonic()
     try:
         _rc_require("CaptureViewportWithUI", {"Filename": args.file}, args.project,
@@ -1877,6 +2049,9 @@ COMMON MISTAKES (don't)
   * read-ui x/y are screen pixels for screen-space UMG/CommonUI; for a WORLD-SPACE VR menu
     (WidgetComponent) they're render-target coords -> a screen click misses (needs the laser).
   * Not done until `uap report finish` emits the HTML report. Read concrete state, not pixels.
+  * Standalone `-game` clients (launch_2p_standalone.ps1) are NOT in the editor viewport: capture
+    them with `uap screenshot <abs.png> --window Context_2` (or pid:<n> / a title substring);
+    `--frames 8 --interval-ms 250` saves a stamped burst as motion proof.
   * A PASS requires a screenshot FROM THE EDITOR UNDER TEST -- `uap screenshot <abs.png>` via this
     project's uap.ps1 (it stamps the source editor). A shot of ANOTHER editor, or a manual attach
     of unknown origin, auto-FAILS the pass. And pixels aren't proof unless you read what they show
@@ -2002,6 +2177,10 @@ DRIVE + OBSERVE
   uap tab "<TabId>"               select a CommonUI tab by id (menus are tab-driven)
   uap nav up|down|left|right|accept|back   move UI focus / activate (Slate nav path)
   uap screenshot <file>           capture composited game+UMG frame (needs live PIE)
+  uap screenshot <abs.png> --window <Context_2|pid:N|title> [--frames N --interval-ms M]
+                                  capture a STANDALONE -game client's window (PrintWindow; works
+                                  unfocused/paused), stamped with its process/project/context;
+                                  blank frames refused; counts as pass proof for its project
   uap helpers [--grep RE] [--names]   list the project's test helpers with their arg schemas
 
 SUSTAINED INPUT (a single injected event CANNOT drive locomotion -- see below)
@@ -2448,6 +2627,16 @@ def build_parser() -> argparse.ArgumentParser:
     sc = sub.add_parser("screenshot", parents=[proj])
     sc.add_argument("file")
     sc.add_argument("--caption", default="")
+    # --window: capture a STANDALONE game client's window (launch_2p_standalone.ps1) from the OS
+    # side instead of the editor viewport. No editor is touched, so no lease is consulted.
+    sc.add_argument("--window", default=None,
+                    help="capture a standalone client's window instead of the editor viewport: "
+                         "a Dev Auth context (Context_2), pid:<n>, or a window-title substring. "
+                         "Ambiguous matches are refused with the candidates listed.")
+    sc.add_argument("--frames", type=int, default=1,
+                    help=f"with --window: capture N frames (1..{_MAX_FRAMES}) as motion proof")
+    sc.add_argument("--interval-ms", dest="interval_ms", type=int, default=500,
+                    help="with --window --frames: milliseconds between frames (default 500)")
     sc.set_defaults(func=_screenshot)
 
     # Sustained input. The plugin re-asserts the input every frame in-engine for the duration,
@@ -2784,6 +2973,12 @@ def main(argv: list[str] | None = None) -> int:
 def _run_parsed(args) -> int:
     cmd = getattr(args, "cmd", None)
     project = getattr(args, "project", "") or _env_project()
+    # `screenshot --window` captures a standalone game client from the OS side. It touches no
+    # editor, takes no input and needs no foreground, so it must not queue behind a rebuild, an
+    # exclusive lease or the machine lock -- a two-client test holding its own lease would
+    # otherwise wait on itself, and a rebuild of the editor has nothing to do with the client.
+    if cmd == "screenshot" and getattr(args, "window", None):
+        return args.func(args)
     # Coordination: if another agent is rebuilding this editor (it's down), wait it out instead of
     # hard-failing, then proceed against the relaunched editor. Fail-open; only editor-touching
     # verbs are guarded (lease/report verbs manage or don't need the editor).
