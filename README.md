@@ -92,6 +92,8 @@ Full reference with parameters and return shapes: **[docs/capabilities.md](docs/
 - **Reproducing and verifying bug fixes** — script the exact input sequence that triggers a bug, confirm the fix, keep the script as a check.
 - **Multi-editor workflows** — drive two projects/editors at once; input routing is in-process per editor, addressed by Remote Control port.
 
+What we want to point all of this at next — and what each candidate game would cost in tooling we do not yet have: **[docs/game-ideas.md](docs/game-ideas.md)**.
+
 ---
 
 ## Quickstart
@@ -187,7 +189,7 @@ The plugin and Remote Control / Python bridges are cross-platform in principle, 
 Plugin/        UE editor plugin (C++) -- every project vendors its OWN COPY
 mcp-server/    Python MCP server + `uap` CLI + tests -- every project SHARES THIS ONE
 agent-testing/ The kit installed into a project (uap.ps1 template, command + AGENTS snippets)
-docs/          Setup, architecture, capabilities, use cases, writing test helpers
+docs/          Setup, architecture, capabilities, use cases, game ideas, writing test helpers
 examples/      Example project-side test helpers
 ```
 
