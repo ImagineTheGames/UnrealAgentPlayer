@@ -3,6 +3,7 @@ import webbrowser
 import pytest
 
 from unreal_agent_player import cli
+from unreal_agent_player import coordination as _coordination
 from unreal_agent_player.reporting import viewer
 
 
@@ -53,3 +54,19 @@ def _no_live_contract(monkeypatch):
     monkeypatch `cli._live_contract` themselves.
     """
     monkeypatch.setattr(cli, "_live_contract", lambda project=None: None)
+
+
+@pytest.fixture(autouse=True)
+def _no_live_editor_probe(monkeypatch):
+    """Default the dead-editor probe to "cannot tell" (None), which never evicts.
+
+    The probe looks at the REAL process list, so without this a developer with no editor open would
+    see every test that takes a `pie`/`level` lease have it voided on the next poll, and one with
+    an editor open would see different results again. Tests of the eviction itself set their own
+    `coordination._editor_probe` (or fake `_enumerate_editors`).
+    """
+    monkeypatch.setattr(_coordination, "_editor_probe", lambda project: None)
+    # ...and for child processes, which inherit the environment but not the monkeypatch above
+    # (the lease-contention tests spawn real workers that take `pie` leases).
+    monkeypatch.setenv("UAP_EDITOR_LIVENESS", "0")
+    _coordination._EDITOR_CACHE.clear()

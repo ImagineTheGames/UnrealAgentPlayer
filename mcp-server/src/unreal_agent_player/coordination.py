@@ -15,6 +15,9 @@ Two scopes, because two different resources are contended:
      * crash-safe: each poll evicts holders whose owning process is gone OR whose heartbeat is
        stale (TTL), and waiters that stopped polling, so neither a dead agent nor a dead waiter
        ever wedges the editor.
+     * a `pie`/`level` exclusive lease protects a live editor session; when no editor process for
+       the project is running (and it is not mid-rebuild) there is nothing left to protect, so
+       the hold is void and evicted at once rather than after its TTL (`_evict_dead_editor`).
 
 2. **Machine-wide foreground lock** (`<reports>/.leases/_machine.json`). A project lease is
    scoped to its own project, so it says nothing about the OTHER project's editor -- and one
@@ -39,6 +42,7 @@ import os
 import pathlib
 import time
 import uuid
+from collections.abc import Callable
 
 POLL_SECONDS = 2.0
 DEFAULT_WAIT_CAP = 900          # 15 min -- covers a full rebuild
@@ -283,7 +287,8 @@ def _release_filelock(project: str | None) -> None:
 
 
 def _blank() -> dict:
-    return {"generation": 0, "exclusive": None, "shared": [], "waiters": []}
+    return {"generation": 0, "exclusive": None, "shared": [], "waiters": [], "evicted": {},
+            "last_eviction": None}
 
 
 _LOAD_RETRIES = 5
@@ -324,6 +329,8 @@ def _load(project: str | None) -> dict:
                     state.setdefault("exclusive", None)
                     state.setdefault("shared", [])
                     state.setdefault("waiters", [])
+                    state.setdefault("evicted", {})
+                    state.setdefault("last_eviction", None)
                     return state
                 detail = f"top level is {type(state).__name__}, not an object"
         if attempt < _LOAD_RETRIES - 1:
@@ -369,6 +376,248 @@ def _evict_stale(state: dict) -> dict:
         state["exclusive"] = None
     state["shared"] = [h for h in state.get("shared", []) if _holder_alive(h)]
     return state
+
+
+# --- dead-editor eviction ---------------------------------------------------------------------
+# A `pie` / `level` exclusive lease protects a LIVE editor session: the level that is loaded, the
+# PIE world that is running. If the editor process itself is gone, that session cannot exist any
+# more and the lease protects nothing -- yet it kept blocking everyone for its full TTL, and the
+# holder's own `uap` calls (which wait for the editor to come back) refreshed the heartbeat so it
+# never even aged out. 2026-10-22: the PBW editor died (out of memory) under agent `respawnfix`'s
+# `pie` lease, and the queued Restart-Editor, the one thing that could bring the editor back,
+# waited on a lease whose entire reason for existing had just crashed.
+#
+# So these holds are void when no editor process for the project is running. Fail SAFE throughout:
+# only a probe that positively says "no editor for this project" evicts. An unreadable process
+# list, a protected process whose command line cannot be read, a non-Windows host or an unknown
+# project all answer None, and None never evicts (the TTL still reclaims a genuinely abandoned hold).
+EVICT_EDITOR_NOT_RUNNING = "editor_not_running"
+_EDITOR_BOUND_REASONS = ("pie", "level")
+_EDITOR_PROBE_OFF = {"0", "false", "no", "off"}
+# "Running" is cached longer than "not running": a stale "running" only delays an eviction by a few
+# seconds, but a stale "not running" would void a hold taken just after the editor came up.
+_EDITOR_UP_CACHE_SECONDS = 5.0
+_EDITOR_DOWN_CACHE_SECONDS = 1.0
+_EDITOR_CACHE: dict[str, tuple[float, bool]] = {}
+_EVICTION_NOTICE_TTL = 3600.0        # how long an evicted holder can still be told why
+
+
+def _enumerate_editors() -> list[dict]:
+    """Every `UnrealEditor.exe` process: [{pid, exe, cmdline}] (`cmdline` None if unreadable).
+
+    Windows only and dependency-free: a Toolhelp snapshot for the process list and the command
+    line read that window_capture already does. Far cheaper than a WMI/CIM query (no PowerShell
+    spawn), which matters because lease status gets polled. Raises on any failure; the caller
+    turns that into "unknown".
+    """
+    if os.name != "nt":
+        raise OSError("editor process enumeration is only implemented on Windows")
+    import ctypes
+    from ctypes import wintypes
+
+    from unreal_agent_player import window_capture as wc
+
+    class PROCESSENTRY32W(ctypes.Structure):
+        _fields_ = [("dwSize", wintypes.DWORD), ("cntUsage", wintypes.DWORD),
+                    ("th32ProcessID", wintypes.DWORD), ("th32DefaultHeapID", ctypes.c_size_t),
+                    ("th32ModuleID", wintypes.DWORD), ("cntThreads", wintypes.DWORD),
+                    ("th32ParentProcessID", wintypes.DWORD), ("pcPriClassBase", ctypes.c_long),
+                    ("dwFlags", wintypes.DWORD), ("szExeFile", ctypes.c_wchar * 260)]
+
+    k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    k32.CreateToolhelp32Snapshot.restype = ctypes.c_void_p
+    k32.CreateToolhelp32Snapshot.argtypes = [wintypes.DWORD, wintypes.DWORD]
+    k32.Process32FirstW.argtypes = [ctypes.c_void_p, ctypes.POINTER(PROCESSENTRY32W)]
+    k32.Process32NextW.argtypes = [ctypes.c_void_p, ctypes.POINTER(PROCESSENTRY32W)]
+    k32.CloseHandle.argtypes = [ctypes.c_void_p]
+    TH32CS_SNAPPROCESS = 0x2
+    snap = k32.CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0)
+    if not snap or snap == ctypes.c_void_p(-1).value:
+        raise OSError("CreateToolhelp32Snapshot failed")
+    pids: list[int] = []
+    try:
+        entry = PROCESSENTRY32W()
+        entry.dwSize = ctypes.sizeof(PROCESSENTRY32W)
+        ok = k32.Process32FirstW(snap, ctypes.byref(entry))
+        while ok:
+            if entry.szExeFile.lower() == "unrealeditor.exe":
+                pids.append(int(entry.th32ProcessID))
+            ok = k32.Process32NextW(snap, ctypes.byref(entry))
+    finally:
+        k32.CloseHandle(snap)
+    out = []
+    for pid in pids:
+        exe, cmdline = wc._process_info(pid)
+        out.append({"pid": pid, "exe": exe, "cmdline": cmdline})
+    return out
+
+
+def editor_running(project: str | None) -> bool | None:
+    """Is an EDITOR process for `project` running? True / False, or None when it cannot be told.
+
+    Only `UnrealEditor.exe` whose command line names `<project>.uproject` counts (case-insensitive
+    on the .uproject stem, which is the lease's project key), so School's Out's editor is never
+    Project Broken Wings' and vice versa. A standalone `-game` client of the same project is NOT the
+    editor: it has no level or PIE session for a lease to protect.
+
+    None (never False) when the answer is uncertain -- the process list failed, an editor's command
+    line was unreadable (protected / other user), the host is not Windows, or the project is
+    unknown -- because callers evict on False. `$UAP_EDITOR_LIVENESS=0` forces None.
+    """
+    raw = os.environ.get("UAP_EDITOR_LIVENESS")
+    if raw is not None and raw.strip().lower() in _EDITOR_PROBE_OFF:
+        return None
+    key = _scope_key(project)
+    if key in ("_default", MACHINE_SCOPE):
+        return None
+    hit = _EDITOR_CACHE.get(key)
+    if hit is not None:
+        age = _now() - hit[0]
+        if age < (_EDITOR_UP_CACHE_SECONDS if hit[1] else _EDITOR_DOWN_CACHE_SECONDS):
+            return hit[1]
+    try:
+        from unreal_agent_player import window_capture as wc
+
+        found = unreadable = False
+        for p in _enumerate_editors():
+            cmd = p.get("cmdline")
+            if cmd is None:
+                unreadable = True
+                continue
+            info = wc.parse_cmdline(cmd)
+            if info.get("game_client"):
+                continue
+            if (info.get("project") or "").lower() == key:
+                found = True
+    except Exception:
+        return None
+    if not found and unreadable:
+        return None                  # an editor we could not identify might be this project's
+    _EDITOR_CACHE[key] = (_now(), found)
+    return found
+
+
+# The seam the eviction logic goes through. Tests (and the suite-wide conftest, which must not let
+# the developer's real running editors decide what a test asserts) replace this one name.
+_editor_probe: Callable[[str | None], bool | None] = editor_running
+
+
+def _is_rebuild_reason(reason) -> bool:
+    return str(reason or "").strip().lower().startswith(("rebuild", "relaunch"))
+
+
+def _mid_rebuild(state: dict) -> bool:
+    """Is a rebuild/relaunch hold on this project right now? Then the editor being down is the
+    plan, not a fault, and nothing here is ours to void."""
+    held = [state.get("exclusive"), *state.get("shared", [])]
+    return any(h and _is_rebuild_reason(h.get("reason")) for h in held)
+
+
+def _evict_dead_editor(state: dict, project: str | None) -> dict | None:
+    """Void a `pie`/`level` exclusive lease whose editor is gone. Returns the eviction record.
+
+    Leaves a note for the evicted holder (`evicted`, consumed by `take_eviction_notice`) and a
+    lasting `last_eviction` for `uap lease status`, so the reason is never a silent mystery.
+    Project scopes only: the machine lock's holders are not editor sessions.
+    """
+    ex = state.get("exclusive")
+    if not ex or isinstance(project, _MachineScope):
+        return None
+    if str(ex.get("reason", "")).strip().lower().split(":")[0] not in _EDITOR_BOUND_REASONS:
+        return None
+    if _mid_rebuild(state):
+        return None
+    try:
+        running = _editor_probe(project)
+    except Exception:
+        return None                  # fail safe: a broken probe never evicts
+    if running is not False:
+        return None
+    key = _scope_key(project)
+    rec = {"agent": ex.get("agent"), "held_reason": ex.get("reason"),
+           "why": EVICT_EDITOR_NOT_RUNNING, "evicted_at": _now(),
+           "acquired_at": ex.get("acquired_at"), "project": key,
+           "message": (f"lease_evicted: {EVICT_EDITOR_NOT_RUNNING} -- the {key} editor process is "
+                       f"gone, so your '{ex.get('reason')}' lease protected nothing and was "
+                       f"voided. Any PIE session or loaded level died with the editor. "
+                       f"Re-acquire once the editor is back.")}
+    state["exclusive"] = None
+    now = _now()
+    notes = {a: n for a, n in state.get("evicted", {}).items()
+             if now - float(n.get("evicted_at", 0)) < _EVICTION_NOTICE_TTL}
+    if rec["agent"]:
+        notes[str(rec["agent"])] = rec
+    state["evicted"] = notes
+    state["last_eviction"] = rec
+    return rec
+
+
+def _rebuild_first(state: dict, project: str | None) -> None:
+    """With the editor down, move queued `rebuild*` requests ahead of pie/level (and other) waiters.
+
+    FIFO is right while the editor is up: everyone is waiting for the same live session. With it
+    down, a rebuild is the only thing that can end the outage and every other waiter needs the
+    editor back first, so letting an earlier pie waiter go ahead would just hand it a corpse.
+    Stable within each group. Only acts on a positive "editor not running".
+    """
+    q = state.get("waiters", [])
+    first = [w for w in q if _is_rebuild_reason(w.get("reason"))]
+    if not first or len(first) == len(q):
+        return
+    if all(_is_rebuild_reason(w.get("reason")) for w in q[:len(first)]):
+        return                       # already at the head: nothing to reorder, no need to probe
+    try:
+        running = _editor_probe(project)
+    except Exception:
+        return
+    if running is False:
+        state["waiters"] = first + [w for w in q if not _is_rebuild_reason(w.get("reason"))]
+
+
+def _refresh(project: str | None) -> tuple[dict, dict | None]:
+    """Load the project's state with every kind of dead entry settled. Call with the lock held.
+
+    Returns (state, eviction record or None); the caller saves, and after releasing the lock hands
+    the record to `_after_eviction`.
+    """
+    state = _evict_stale(_load(project))
+    evicted = _evict_dead_editor(state, project)
+    _evict_stale_waiters(state)
+    _rebuild_first(state, project)
+    return state, evicted
+
+
+def _after_eviction(project: str | None, evicted: dict | None) -> None:
+    """A voided PIE/level hold must not leave the machine-wide foreground lock behind it.
+
+    The same hold usually took the machine turn too (`lease acquire ... --reason pie`), and that
+    would keep the OTHER project out for its own TTL for a session that no longer exists. Best
+    effort, outside the project lock; it only ever frees this project's own hold.
+    """
+    if not evicted:
+        return
+    try:
+        release_machine(agent=str(evicted.get("agent")), project=project)
+    except Exception:
+        pass
+
+
+def take_eviction_notice(project: str | None, *, agent: str | None = None) -> dict | None:
+    """Pop the "your lease was voided" note for `agent`, if one is pending.
+
+    The evicted holder believes it still has a loaded level and a live PIE session; nothing else
+    would tell it. Consumed on read, so the call AFTER the notice proceeds normally.
+    """
+    agent = agent or default_agent_id()
+    _acquire_filelock(project)
+    try:
+        state = _load(project)
+        note = state.get("evicted", {}).pop(agent, None)
+        if note is not None:
+            _save(project, state)
+    finally:
+        _release_filelock(project)
+    return note
 
 
 def _grantable(state: dict, mode: str, agent: str) -> bool:
@@ -492,13 +741,17 @@ def acquire(project: str | None, mode: str, *, reason: str = "", agent: str | No
     queue_len = 0
     while True:
         _acquire_filelock(project)
+        evicted = None
         try:
-            state = _evict_stale_waiters(_evict_stale(_load(project)))
+            state, evicted = _refresh(project)
             mine = _holds_already(state, mode, agent)
             if not mine:
                 _enqueue(state, agent, mode, reason)
+                _rebuild_first(state, project)      # a fresh rebuild request may jump the queue
             if _grantable(state, mode, agent) and (mine or _turn_ok(state, mode, agent)):
                 _dequeue(state, agent)
+                # A fresh grant supersedes any "you were evicted" note this agent had pending.
+                state.get("evicted", {}).pop(agent, None)
                 rec = {"agent": agent, "reason": reason, "pid": pid,
                        "acquired_at": _now(), "heartbeat_at": _now(), "ttl": ttl}
                 if mode == "exclusive":
@@ -520,6 +773,7 @@ def acquire(project: str | None, mode: str, *, reason: str = "", agent: str | No
             _save(project, state)
         finally:
             _release_filelock(project)
+            _after_eviction(project, evicted)
         if _now() >= deadline:
             # Give the slot back: a caller that has stopped waiting must not hold up the queue
             # for the _WAITER_TTL it would otherwise take to age out.
@@ -558,10 +812,16 @@ def release(project: str | None, *, agent: str | None = None) -> dict:
         # An agent that releases is done, so it is not waiting for anything either. Drops a stale
         # queue entry left by a killed `acquire --wait` from the same token.
         _dequeue(state, agent)
+        note = state.get("evicted", {}).pop(agent, None)
         _save(project, state)
     finally:
         _release_filelock(project)
-    return {"ok": True, "released": was, "agent": agent}
+    res = {"ok": True, "released": was, "agent": agent}
+    if note:
+        # Nothing was held because the lease was already voided, not because the caller never
+        # had one. Say so instead of a bare `released: false`.
+        res["lease_evicted"] = note
+    return res
 
 
 def heartbeat(project: str | None, *, agent: str | None = None) -> dict:
@@ -578,10 +838,14 @@ def heartbeat(project: str | None, *, agent: str | None = None) -> dict:
             if h.get("agent") == agent:
                 h["heartbeat_at"] = _now()
                 touched += 1
+        note = state.get("evicted", {}).pop(agent, None)
         _save(project, state)
     finally:
         _release_filelock(project)
-    return {"ok": True, "refreshed": touched, "agent": agent}
+    res = {"ok": True, "refreshed": touched, "agent": agent}
+    if note:
+        res["lease_evicted"] = note
+    return res
 
 
 def bump_generation(project: str | None) -> int:
@@ -597,12 +861,14 @@ def bump_generation(project: str | None) -> int:
 
 
 def status(project: str | None) -> dict:
+    evicted = None
     _acquire_filelock(project)
     try:
-        state = _evict_stale_waiters(_evict_stale(_load(project)))
+        state, evicted = _refresh(project)
         _save(project, state)
     finally:
         _release_filelock(project)
+        _after_eviction(project, evicted)
     # `waiters` rides along inside **state; `queue` names them in arrival order so a human
     # reading the output can see who is next without decoding timestamps.
     return {"ok": True, "project": _scope_key(project),
@@ -621,12 +887,14 @@ def wait_while_rebuild(project: str | None, *, wait: float = DEFAULT_WAIT_CAP) -
     waited = False
     while True:
         try:
+            evicted = None
             _acquire_filelock(project)
             try:
-                state = _evict_stale_waiters(_evict_stale(_load(project)))
+                state, evicted = _refresh(project)
                 _save(project, state)
             finally:
                 _release_filelock(project)
+                _after_eviction(project, evicted)
             ex = state.get("exclusive")
             if not ex or not str(ex.get("reason", "")).startswith("rebuild"):
                 return {"ok": True, "waited": waited}
@@ -802,12 +1070,14 @@ def wait_if_blocked(project: str | None, *, agent: str | None = None,
     deadline = _now() + max(0.0, wait)
     while True:
         try:
+            evicted = None
             _acquire_filelock(project)
             try:
-                state = _evict_stale_waiters(_evict_stale(_load(project)))
+                state, evicted = _refresh(project)
                 _save(project, state)
             finally:
                 _release_filelock(project)
+                _after_eviction(project, evicted)
             ex = state.get("exclusive")
             if ex is None or ex.get("agent") == agent:
                 return {"ok": True, "blocked": False}
