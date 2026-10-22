@@ -199,22 +199,37 @@ Build it once (Python 3.11+):
     exit 3
 }
 
-# --- Pin THIS project's editor as the default target -----------------------------------
+# --- Pin THIS project's editor as the target, for this call only ------------------------
 # Several editors can be open at once. Without these, a bare `uap pie start` targets
-# "the first editor that answers" -- which can be the wrong project. Caller env wins.
-if (-not $env:UAP_PROJECT)  { $env:UAP_PROJECT  = '__UAP_PROJECT__' }
-if (-not $env:UAP_UPROJECT) {
-    $uproj = Get-ChildItem -LiteralPath $projectRoot -Filter '*.uproject' -File -ErrorAction SilentlyContinue |
-             Select-Object -First 1
-    if ($uproj) { $env:UAP_UPROJECT = $uproj.FullName }
-}
-if (-not $env:UAP_EDITOR_EXE) {
-    # Best effort: only `game_launch` needs it, and `uap status` reports the real problem
-    # better than failing here would. The project's own resolver wins when it has one.
-    $exe = Resolve-EditorExeViaProject $projectRoot
-    if (-not $exe) { $exe = Resolve-EditorExe $projectRoot }
-    if ($exe) { $env:UAP_EDITOR_EXE = $exe }
-}
+# "the first editor that answers" -- which can be the wrong project.
+#
+# ALWAYS this project, never "only if unset". $env: is process-wide, so a launcher run with
+# `& .\uap.ps1` leaves its values in the calling PowerShell process; with "caller env wins",
+# the NEXT project's launcher in that same session read them as an override and drove the
+# FIRST project's editor. To target another project for one call, pass `--project <Name>`:
+# the CLI prefers it over $env:UAP_PROJECT.
+#
+# Everything set here is put back as it was when the CLI exits, so nothing leaks either way.
+$pinned = @('UAP_PROJECT', 'UAP_UPROJECT', 'UAP_EDITOR_EXE')
+$saved = @{}
+foreach ($name in $pinned) { $saved[$name] = [Environment]::GetEnvironmentVariable($name, 'Process') }
 
-& $py -m unreal_agent_player.cli @UapArgs
-exit $LASTEXITCODE
+$env:UAP_PROJECT = '__UAP_PROJECT__'
+$uproj = Get-ChildItem -LiteralPath $projectRoot -Filter '*.uproject' -File -ErrorAction SilentlyContinue |
+         Select-Object -First 1
+if ($uproj) { $env:UAP_UPROJECT = $uproj.FullName } else { Remove-Item Env:UAP_UPROJECT -ErrorAction SilentlyContinue }
+# Best effort: only `game_launch` needs it, and `uap status` reports the real problem better
+# than failing here would. The project's own resolver wins when it has one. Never inherited:
+# another project's engine (a different fork) is exactly what a leaked value would carry.
+$exe = Resolve-EditorExeViaProject $projectRoot
+if (-not $exe) { $exe = Resolve-EditorExe $projectRoot }
+if ($exe) { $env:UAP_EDITOR_EXE = $exe } else { Remove-Item Env:UAP_EDITOR_EXE -ErrorAction SilentlyContinue }
+
+$uapExit = 1
+try {
+    & $py -m unreal_agent_player.cli @UapArgs
+    $uapExit = $LASTEXITCODE
+} finally {
+    foreach ($name in $pinned) { [Environment]::SetEnvironmentVariable($name, $saved[$name], 'Process') }
+}
+exit $uapExit

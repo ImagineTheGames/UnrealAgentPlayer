@@ -314,12 +314,33 @@ stop -- freeing the machine on a stop that did not happen would hand the other p
 the same failure `lease release` refuses. Every other guarded verb takes a transient hold released
 in a `finally`, so a crash or an exception cannot leave the machine locked. Any pass-through call
 from the holding project refreshes the heartbeat, so an agent that is actually working keeps it.
+A hold past its TTL is evicted only if its project's editor is NOT in PIE: the CLI probes that
+editor (`IsPIEInProgress`) first, and a live session refreshes the hold instead, so a long PIE
+driven through `exec` / `rc` alone no longer ages out under the other project. `pie stop` never
+waits on the machine lock: stopping gives the foreground back.
+
+**Fail closed.** A guarded verb that cannot read or write the machine lock does NOT run. Transient
+Windows sharing violations on the lock files (`O_EXCL` answering EACCES while a release is
+mid-delete; `os.replace` answering WinError 5 while an editor's overlay reads the file) are retried
+in place. This used to be fail-open, and on 2026-10-22 one such error during a wait started School's
+Out's PIE with no machine record while Project Broken Wings was in PIE, after which PBW's next
+`pie start` was granted too. `UAP_MACHINE_LOCK=0` remains the deliberate escape hatch.
+
+**Never wait on the machine while holding the project lease.** A guarded verb from the agent that
+holds its project's exclusive lease asks for the machine once. If another project has it, the verb
+fails fast and the project lease is given back (so teammates are not queued behind a turn the agent
+cannot use), unless that agent's own editor is in PIE: then the lease is kept, because handing a
+live session to a teammate is what `lease release` refuses, and the hint says to `pie stop` and
+re-acquire. Agents without a lease still wait their turn as before.
 
 **Explicit holds:** `uap lease acquire exclusive --reason pie|level|input ... --agent <tok>` takes
 both turns; if the machine is denied it gives the project lease back rather than half-holding.
 `--reason rebuild` does NOT take the machine: a rebuild is CPU-heavy but takes neither the keyboard
 nor a game window, and blocking the other project for a 20-minute rebuild TTL is the worse trade.
-`uap lease release` hands back both.
+`uap lease release` hands back both -- the project's machine hold only for the agent that held the
+project's exclusive lease; any other caller frees only a machine hold it took itself. Releases are
+always scoped to the caller's project, so the same agent token in both projects cannot free the
+other project's session.
 
 **Inspecting and breaking it:** `uap lease status` now reports the machine holder beside the
 project lease (a project lease that reads "free" explains nothing when the blocker is the other
