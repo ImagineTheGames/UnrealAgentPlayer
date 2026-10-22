@@ -164,6 +164,39 @@ def default_agent_id() -> str:
     return f"pid-{os.getpid()}"
 
 
+# --- human labels -----------------------------------------------------------------------------
+# An agent token (`pcgprof`, `rebuild-48876`) says WHO but never WHAT, and it is all the in-editor
+# overlay and `uap lease status` had to show a director looking at a busy editor. A task label is a
+# short free-text string the agent supplies (`--task` / $UAP_TASK) and the lease, the waiter queue,
+# the machine lock and the activity note all carry it, so every one of those views can say what the
+# agent is for. It is display-only: it never takes part in identity, ordering or any grant decision.
+TASK_MAX = 80
+UAP_TASK_ENV = "UAP_TASK"
+_ACTIVITY_TTL = 300.0       # how long an agent's last-verb note stays on the record
+
+
+def sanitize_label(text) -> str:
+    """A label that is safe to store, print and draw: one line, no control chars, <= TASK_MAX.
+
+    The overlay draws it in a fixed-width box and the lease file is read by other tools, so
+    newlines, tabs and other control characters are folded to single spaces and the result is
+    cut at TASK_MAX with a trailing `...`. None / non-strings become "".
+    """
+    if text is None:
+        return ""
+    out = "".join(" " if (ch.isspace() or ord(ch) < 32 or ord(ch) == 127) else ch
+                  for ch in str(text))
+    out = " ".join(out.split())
+    if len(out) > TASK_MAX:
+        out = out[:TASK_MAX - 3].rstrip() + "..."
+    return out
+
+
+def default_task() -> str:
+    """The task label from $UAP_TASK (sanitised), or ""."""
+    return sanitize_label(os.environ.get(UAP_TASK_ENV))
+
+
 def _pid_alive(pid: int) -> bool:
     if not pid:
         return False
@@ -288,7 +321,7 @@ def _release_filelock(project: str | None) -> None:
 
 def _blank() -> dict:
     return {"generation": 0, "exclusive": None, "shared": [], "waiters": [], "evicted": {},
-            "last_eviction": None}
+            "last_eviction": None, "activity": {}}
 
 
 _LOAD_RETRIES = 5
@@ -331,6 +364,7 @@ def _load(project: str | None) -> dict:
                     state.setdefault("waiters", [])
                     state.setdefault("evicted", {})
                     state.setdefault("last_eviction", None)
+                    state.setdefault("activity", {})
                     return state
                 detail = f"top level is {type(state).__name__}, not an object"
         if attempt < _LOAD_RETRIES - 1:
@@ -642,6 +676,17 @@ def _holds_already(state: dict, mode: str, agent: str) -> bool:
     return any(h.get("agent") == agent for h in state.get("shared", []))
 
 
+def _own_record(state: dict, mode: str, agent: str) -> dict | None:
+    """`agent`'s existing hold in `mode`, if any (so a re-acquire can keep its labels)."""
+    if mode == "exclusive":
+        ex = state.get("exclusive")
+        return ex if ex and ex.get("agent") == agent else None
+    for h in state.get("shared", []):
+        if h.get("agent") == agent:
+            return h
+    return None
+
+
 def _waiter_alive(w: dict) -> bool:
     if _now() - float(w.get("heartbeat_at", 0)) > _WAITER_TTL:
         return False            # stopped polling -> the call it belonged to is over
@@ -654,19 +699,26 @@ def _evict_stale_waiters(state: dict) -> dict:
     return state
 
 
-def _enqueue(state: dict, agent: str, mode: str, reason: str) -> None:
+def _enqueue(state: dict, agent: str, mode: str, reason: str, task: str = "",
+             requested_by: str = "") -> None:
     """Register `agent` as waiting, or refresh it if it already is.
 
     Refreshing deliberately does NOT move it to the back -- arrival order is the whole point.
+    `task` / `requested_by` are display labels only (see sanitize_label).
     """
     q = state.setdefault("waiters", [])
     for w in q:
         if w.get("agent") == agent:
             w["heartbeat_at"] = _now()
             w["mode"] = mode
+            if task:
+                w["task"] = task
+            if requested_by:
+                w["requested_by"] = requested_by
             return
     q.append({"agent": agent, "mode": mode, "reason": reason, "pid": os.getpid(),
-              "since": _now(), "heartbeat_at": _now()})
+              "since": _now(), "heartbeat_at": _now(), "task": task,
+              "requested_by": requested_by})
 
 
 def _dequeue(state: dict, agent: str) -> None:
@@ -713,7 +765,8 @@ def _ttl_for(reason: str, ttl: int | None) -> int:
 
 
 def acquire(project: str | None, mode: str, *, reason: str = "", agent: str | None = None,
-            pid: int | None = None, wait: float = DEFAULT_WAIT_CAP, ttl: int | None = None) -> dict:
+            pid: int | None = None, wait: float = DEFAULT_WAIT_CAP, ttl: int | None = None,
+            task: str | None = None, requested_by: str | None = None) -> dict:
     """Block until a `mode` ('exclusive'|'shared') lease is grantable, then take it.
 
     `pid` is the liveness anchor stored with the lease (default: this process). Pass the pid of a
@@ -725,11 +778,20 @@ def acquire(project: str | None, mode: str, *, reason: str = "", agent: str | No
     that arrives later. The `busy` return carries `queue_position` / `queue_ahead` so a caller
     that gives up can say whether it was next or ninth instead of retrying blind.
 
+    `task` is a short human label for what the agent is doing ("PCG profiling pass"), and
+    `requested_by` names the agent a mechanical token acts for (a `rebuild-<pid>` script lease
+    taken on behalf of `pcgprof`). Both are sanitised, stored on the holder AND waiter records and
+    shown by `uap lease status` and the in-editor overlay; neither affects who is granted what.
+    A re-entrant acquire that supplies no label keeps the one already on the record, so the
+    rebuild -> relaunch flip does not wipe it.
+
     Returns {ok, granted, generation, ...} on success, or {ok:False, busy:True, holder} if the
     wait cap elapses. Re-entrant per agent (re-acquiring refreshes, never deadlocks on self).
     """
     if mode not in ("exclusive", "shared"):
         raise ValueError(f"mode must be exclusive|shared, got {mode!r}")
+    task = sanitize_label(task)
+    requested_by = sanitize_label(requested_by)
     agent = agent or default_agent_id()
     pid = os.getpid() if pid is None else int(pid)
     ttl = _ttl_for(reason, ttl)
@@ -746,14 +808,17 @@ def acquire(project: str | None, mode: str, *, reason: str = "", agent: str | No
             state, evicted = _refresh(project)
             mine = _holds_already(state, mode, agent)
             if not mine:
-                _enqueue(state, agent, mode, reason)
+                _enqueue(state, agent, mode, reason, task, requested_by)
                 _rebuild_first(state, project)      # a fresh rebuild request may jump the queue
             if _grantable(state, mode, agent) and (mine or _turn_ok(state, mode, agent)):
                 _dequeue(state, agent)
                 # A fresh grant supersedes any "you were evicted" note this agent had pending.
                 state.get("evicted", {}).pop(agent, None)
+                prev = _own_record(state, mode, agent) or {}
                 rec = {"agent": agent, "reason": reason, "pid": pid,
-                       "acquired_at": _now(), "heartbeat_at": _now(), "ttl": ttl}
+                       "acquired_at": _now(), "heartbeat_at": _now(), "ttl": ttl,
+                       "task": task or prev.get("task", ""),
+                       "requested_by": requested_by or prev.get("requested_by", "")}
                 if mode == "exclusive":
                     state["exclusive"] = rec
                     state["shared"] = [h for h in state["shared"] if h.get("agent") != agent]
@@ -762,7 +827,9 @@ def acquire(project: str | None, mode: str, *, reason: str = "", agent: str | No
                                        + [rec])
                 _save(project, state)
                 return {"ok": True, "granted": True, "agent": agent, "mode": mode,
-                        "reason": reason, "generation": state.get("generation", 0),
+                        "reason": reason, "task": rec["task"],
+                        "requested_by": rec["requested_by"],
+                        "generation": state.get("generation", 0),
                         "queued_seconds": round(_now() - started, 1),
                         "queue_length": len(state.get("waiters", []))}
             holder = state.get("exclusive") or (state.get("shared") or [None])[0]
@@ -824,8 +891,12 @@ def release(project: str | None, *, agent: str | None = None) -> dict:
     return res
 
 
-def heartbeat(project: str | None, *, agent: str | None = None) -> dict:
+def heartbeat(project: str | None, *, agent: str | None = None,
+              task: str | None = None) -> dict:
+    """Refresh `agent`'s holds. A non-empty `task` also replaces the label on them, so an agent
+    that moves on to new work shows the new work without re-acquiring."""
     agent = agent or default_agent_id()
+    task = sanitize_label(task)
     _acquire_filelock(project)
     try:
         state = _load(project)
@@ -833,10 +904,14 @@ def heartbeat(project: str | None, *, agent: str | None = None) -> dict:
         ex = state.get("exclusive")
         if ex and ex.get("agent") == agent:
             ex["heartbeat_at"] = _now()
+            if task:
+                ex["task"] = task
             touched += 1
         for h in state.get("shared", []):
             if h.get("agent") == agent:
                 h["heartbeat_at"] = _now()
+                if task:
+                    h["task"] = task
                 touched += 1
         note = state.get("evicted", {}).pop(agent, None)
         _save(project, state)
@@ -846,6 +921,49 @@ def heartbeat(project: str | None, *, agent: str | None = None) -> dict:
     if note:
         res["lease_evicted"] = note
     return res
+
+
+def note_activity(project: str | None, *, agent: str, verb: str = "",
+                  task: str | None = None) -> None:
+    """Record that `agent` just issued `verb`, so a view of the editor can name who is using it
+    even when that agent holds no lease (most `exec` / `rc` / `status` traffic never takes one).
+
+    One small entry per agent token in the project's state file, replaced on every call and
+    dropped after _ACTIVITY_TTL. Display-only; nothing consults it to decide anything. Callers
+    treat a failure as non-fatal.
+    """
+    task = sanitize_label(task)
+    _acquire_filelock(project)
+    try:
+        state = _load(project)
+        now = _now()
+        act = {a: n for a, n in (state.get("activity") or {}).items()
+               if isinstance(n, dict) and now - float(n.get("at", 0)) < _ACTIVITY_TTL}
+        prev = act.get(agent) or {}
+        act[agent] = {"verb": sanitize_label(verb), "at": now,
+                      "task": task or prev.get("task", "")}
+        state["activity"] = act
+        _save(project, state)
+    finally:
+        _release_filelock(project)
+
+
+def _queue_detail(waiters: list[dict]) -> list[dict]:
+    """The queue in arrival order with each waiter's labels, for humans reading status."""
+    return [{"agent": str(w.get("agent")), "task": w.get("task", ""),
+             "reason": w.get("reason", ""), "requested_by": w.get("requested_by", "")}
+            for w in waiters]
+
+
+def _with_labels(rec: dict | None) -> dict | None:
+    """A holder / waiter record guaranteed to carry `task` and `requested_by` keys (records
+    written before labels existed lack them) so consumers never have to probe for the key."""
+    if not isinstance(rec, dict):
+        return rec
+    out = dict(rec)
+    out.setdefault("task", "")
+    out.setdefault("requested_by", "")
+    return out
 
 
 def bump_generation(project: str | None) -> int:
@@ -871,8 +989,13 @@ def status(project: str | None) -> dict:
         _after_eviction(project, evicted)
     # `waiters` rides along inside **state; `queue` names them in arrival order so a human
     # reading the output can see who is next without decoding timestamps.
+    state = dict(state)
+    state["exclusive"] = _with_labels(state.get("exclusive"))
+    state["shared"] = [_with_labels(h) for h in state.get("shared", [])]
+    state["waiters"] = [_with_labels(w) for w in state.get("waiters", [])]
     return {"ok": True, "project": _scope_key(project),
-            "queue": [str(w.get("agent")) for w in state.get("waiters", [])], **state}
+            "queue": [str(w.get("agent")) for w in state.get("waiters", [])],
+            "queue_detail": _queue_detail(state["waiters"]), **state}
 
 
 def wait_while_rebuild(project: str | None, *, wait: float = DEFAULT_WAIT_CAP) -> dict:
@@ -943,14 +1066,14 @@ def _machine_busy(holder: dict | None, agent: str, wait: float, *, position: int
     return {"ok": False, "granted": False, "busy": True, "acquired": False,
             "agent": agent, "scope": "machine",
             "blocked_by": holder.get("agent"), "project": holder.get("project"),
-            "reason": holder.get("reason"), "holder": holder,
+            "reason": holder.get("reason"), "task": holder.get("task", ""), "holder": holder,
             "waited_seconds": round(max(0.0, wait), 1),
             "queue_position": position, "queue_ahead": ahead or [], "queue_length": queue_len}
 
 
 def acquire_machine(project: str | None, *, reason: str = "", agent: str | None = None,
                     pid: int | None = None, wait: float = DEFAULT_WAIT_CAP,
-                    ttl: int | None = None) -> dict:
+                    ttl: int | None = None, task: str | None = None) -> dict:
     """Block until this machine's foreground lock is ours, then take it.
 
     Grant rule -- the lock arbitrates BETWEEN projects, never within one:
@@ -972,6 +1095,7 @@ def acquire_machine(project: str | None, *, reason: str = "", agent: str | None 
     entirely -- it is not a request, and queueing it would deadlock the holding project.
     """
     agent = agent or default_agent_id()
+    task = sanitize_label(task)
     pid = os.getpid() if pid is None else int(pid)
     ttl = int(ttl) if ttl else MACHINE_TTL
     mine = _safe_project(project)
@@ -991,11 +1115,12 @@ def acquire_machine(project: str | None, *, reason: str = "", agent: str | None 
                 _save(MACHINE_SENTINEL, state)
                 return {"ok": True, "granted": True, "acquired": False, "agent": agent,
                         "scope": "machine", "project": mine, "holder": holder}
-            _enqueue(state, agent, "exclusive", reason)
+            _enqueue(state, agent, "exclusive", reason, task)
             if holder is None and _turn_ok(state, "exclusive", agent):
                 _dequeue(state, agent)
                 rec = {"agent": agent, "project": mine, "reason": reason, "pid": pid,
-                       "acquired_at": _now(), "heartbeat_at": _now(), "ttl": ttl}
+                       "acquired_at": _now(), "heartbeat_at": _now(), "ttl": ttl,
+                       "task": task}
                 state["exclusive"] = rec
                 _save(MACHINE_SENTINEL, state)
                 return {"ok": True, "granted": True, "acquired": True, "agent": agent,
@@ -1053,11 +1178,12 @@ def machine_status() -> dict:
     _acquire_filelock(MACHINE_SENTINEL)
     try:
         holder = _machine_holder()
-        queue = [str(w.get("agent")) for w in _load(MACHINE_SENTINEL).get("waiters", [])]
+        waiters = [_with_labels(w) for w in _load(MACHINE_SENTINEL).get("waiters", [])]
     finally:
         _release_filelock(MACHINE_SENTINEL)
-    return {"ok": True, "scope": "machine", "enabled": machine_lock_enabled(), "holder": holder,
-            "queue": queue}
+    return {"ok": True, "scope": "machine", "enabled": machine_lock_enabled(),
+            "holder": _with_labels(holder), "queue": [str(w.get("agent")) for w in waiters],
+            "queue_detail": _queue_detail(waiters)}
 
 
 def wait_if_blocked(project: str | None, *, agent: str | None = None,

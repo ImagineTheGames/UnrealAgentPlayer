@@ -95,15 +95,36 @@ namespace
     // CLI already writes (~/.uap-reports/.leases/*.json, ~/.uap-reports/.active). Reading them
     // is how the overlay can name the agent, the lease holder and the open report WITHOUT any
     // change to the CLI, which is shared across projects and is not ours to change.
+    //
+    // An agent token (`pcgprof`, `rebuild-48876`) says WHO but not WHAT, so every record also
+    // carries the agent's free-text `task` label (`--task` / $UAP_TASK on the CLI) and, for a
+    // mechanical token such as a Restart-Editor.ps1 `rebuild-<pid>`, `requested_by`: the agent it
+    // acts for. All of it is display-only and may be absent (older CLI, agent set no label).
+    struct FWaiterInfo
+    {
+        FString Agent;
+        FString Task;
+        FString RequestedBy;
+    };
+
     struct FCoordSnapshot
     {
         FString LeaseAgent;
         FString LeaseReason;
+        FString LeaseTask;
+        FString LeaseRequestedBy;
+        double  LeaseAcquiredUnix = 0.0;
         bool    bLeaseStale = false;   // held past its TTL with no heartbeat -- holder is gone
-        FString Waiters;
+        TArray<FWaiterInfo> Waiters;   // arrival order: [0] is next in line
         FString CliVerb;        // machine-lock reason, e.g. "input:hold" -- the CLI-side verb
         FString CliAgent;
+        FString CliTask;
         int64   CliSinceUnix = 0;
+        // Agents that issued an editor verb recently WITHOUT holding a lease (most exec / rc
+        // traffic): token -> task label, plus which of them spoke last.
+        TMap<FString, FString> ActivityTasks;
+        FString ActivityAgent;
+        double  ActivityAtUnix = 0.0;
         FString ReportName;
     };
 
@@ -169,6 +190,9 @@ namespace
             {
                 (*Excl)->TryGetStringField(TEXT("agent"), Next.LeaseAgent);
                 (*Excl)->TryGetStringField(TEXT("reason"), Next.LeaseReason);
+                (*Excl)->TryGetStringField(TEXT("task"), Next.LeaseTask);
+                (*Excl)->TryGetStringField(TEXT("requested_by"), Next.LeaseRequestedBy);
+                (*Excl)->TryGetNumberField(TEXT("acquired_at"), Next.LeaseAcquiredUnix);
 
                 // A LEASE OUTLIVES THE AGENT THAT TOOK IT. It is a file on disk, so it
                 // survives an editor restart and every refresh of this overlay, and a holder
@@ -188,17 +212,44 @@ namespace
             const TArray<TSharedPtr<FJsonValue>>* Waiters = nullptr;
             if (Lease->TryGetArrayField(TEXT("waiters"), Waiters) && Waiters)
             {
-                TArray<FString> Names;
                 for (const TSharedPtr<FJsonValue>& W : *Waiters)
                 {
                     const TSharedPtr<FJsonObject>* WO = nullptr;
-                    FString Name;
-                    if (W.IsValid() && W->TryGetObject(WO) && WO && (*WO)->TryGetStringField(TEXT("agent"), Name))
+                    FWaiterInfo Info;
+                    if (W.IsValid() && W->TryGetObject(WO) && WO && (*WO)->TryGetStringField(TEXT("agent"), Info.Agent))
                     {
-                        Names.Add(Name);
+                        (*WO)->TryGetStringField(TEXT("task"), Info.Task);
+                        (*WO)->TryGetStringField(TEXT("requested_by"), Info.RequestedBy);
+                        Next.Waiters.Add(Info);
                     }
                 }
-                Next.Waiters = FString::Join(Names, TEXT(", "));
+            }
+
+            // Agents seen driving the editor recently, lease or no lease.
+            const TSharedPtr<FJsonObject>* Activity = nullptr;
+            if (Lease->TryGetObjectField(TEXT("activity"), Activity) && Activity && Activity->IsValid())
+            {
+                const double NowUnix = (double)FDateTime::UtcNow().ToUnixTimestamp();
+                for (const TPair<FString, TSharedPtr<FJsonValue>>& Pair : (*Activity)->Values)
+                {
+                    const TSharedPtr<FJsonObject>* Entry = nullptr;
+                    if (!Pair.Value.IsValid() || !Pair.Value->TryGetObject(Entry) || !Entry)
+                    {
+                        continue;
+                    }
+                    FString Task;
+                    double At = 0.0;
+                    (*Entry)->TryGetStringField(TEXT("task"), Task);
+                    (*Entry)->TryGetNumberField(TEXT("at"), At);
+                    Next.ActivityTasks.Add(Pair.Key, Task);
+                    // Only a RECENT call makes an agent "the one driving"; the task map above is
+                    // kept regardless so a known agent's label can still be looked up.
+                    if (At > Next.ActivityAtUnix && (NowUnix - At) <= 60.0)
+                    {
+                        Next.ActivityAtUnix = At;
+                        Next.ActivityAgent = Pair.Key;
+                    }
+                }
             }
         }
 
@@ -217,6 +268,7 @@ namespace
                 {
                     (*Excl)->TryGetStringField(TEXT("reason"), Next.CliVerb);
                     (*Excl)->TryGetStringField(TEXT("agent"), Next.CliAgent);
+                    (*Excl)->TryGetStringField(TEXT("task"), Next.CliTask);
                     double Since = 0.0;
                     (*Excl)->TryGetNumberField(TEXT("acquired_at"), Since);
                     Next.CliSinceUnix = (int64)Since;
@@ -245,6 +297,49 @@ namespace
     FString Trim(const FString& In, int32 Max)
     {
         return In.Len() <= Max ? In : (In.Left(Max - 1) + TEXT("~"));
+    }
+
+    /** "45s", "4m12s", "1h05m" -- how long a lease has been held. */
+    FString FormatAge(double Seconds)
+    {
+        const int64 S = (int64)FMath::Max(0.0, Seconds);
+        if (S < 60)
+        {
+            return FString::Printf(TEXT("%llds"), S);
+        }
+        if (S < 3600)
+        {
+            return FString::Printf(TEXT("%lldm%02llds"), S / 60, S % 60);
+        }
+        return FString::Printf(TEXT("%lldh%02lldm"), S / 3600, (S % 3600) / 60);
+    }
+
+    /** `rebuild-48876 by pcgprof` for a mechanical token with a known owner, else the token. */
+    FString AgentLabel(const FString& Agent, const FString& RequestedBy)
+    {
+        return RequestedBy.IsEmpty() ? Agent : FString::Printf(TEXT("%s by %s"), *Agent, *RequestedBy);
+    }
+
+    /** The task label we know for `Agent`, from the freshest source that has one. */
+    FString TaskFor(const FString& Agent)
+    {
+        if (Agent.IsEmpty())
+        {
+            return FString();
+        }
+        if (Agent == GCoord.CliAgent && !GCoord.CliTask.IsEmpty())
+        {
+            return GCoord.CliTask;
+        }
+        if (Agent == GCoord.LeaseAgent && !GCoord.LeaseTask.IsEmpty())
+        {
+            return GCoord.LeaseTask;
+        }
+        if (const FString* T = GCoord.ActivityTasks.Find(Agent))
+        {
+            return *T;
+        }
+        return FString();
     }
 
     void BuildLines(TArray<FLine>& Out)
@@ -284,11 +379,22 @@ namespace
             Out.Add({ TEXT("idle  no verb yet this session"), CIdle });
         }
 
-        // 3. Who is driving.
-        const FString Who = !GCoord.CliAgent.IsEmpty() ? GCoord.CliAgent : GCoord.LeaseAgent;
+        // 3. Who is driving, and what for. The token alone ("pcgprof") told the person watching
+        //    the screen nothing about the work, which is the complaint this answers: the task
+        //    label is what they actually read. A driver with no label gets a grey nudge to set one
+        //    rather than a silent gap.
+        FString Who = !GCoord.CliAgent.IsEmpty() ? GCoord.CliAgent : GCoord.LeaseAgent;
+        if (Who.IsEmpty())
+        {
+            Who = GCoord.ActivityAgent;     // no lease, no in-flight verb: whoever called last
+        }
         if (!Who.IsEmpty())
         {
             Out.Add({ FString::Printf(TEXT("agent  %s"), *Trim(Who, 34)), CInfo });
+            const FString Task = TaskFor(Who);
+            Out.Add(Task.IsEmpty()
+                        ? FLine{ TEXT("task   (none set: --task / UAP_TASK)"), CIdle }
+                        : FLine{ FString::Printf(TEXT("task   %s"), *Trim(Task, 40)), CInfo });
         }
 
         // 4. Keys still down. A `uap input hold` OUTLIVES ITS CALL by design; two of them
@@ -323,14 +429,48 @@ namespace
             // A stale one is still worth NAMING when the overlay is up for another reason --
             // it is exactly what you need to see to know the lease is safe to break -- but it
             // is not on its own a reason to put the overlay on screen. See ShouldShowOverlay.
-            Out.Add({ FString::Printf(TEXT("lease  %s (%s)%s"),
-                                      *Trim(GCoord.LeaseAgent, 26), *GCoord.LeaseReason,
-                                      GCoord.bLeaseStale ? TEXT(" EXPIRED") : TEXT("")),
-                      GCoord.bLeaseStale ? CAlarm : CInfo });
+            const double NowUnix = (double)FDateTime::UtcNow().ToUnixTimestamp();
+            const FString Age = GCoord.LeaseAcquiredUnix > 0.0
+                ? (TEXT("  ") + FormatAge(NowUnix - GCoord.LeaseAcquiredUnix)) : FString();
+            const FString Expired = GCoord.bLeaseStale ? TEXT(" EXPIRED") : TEXT("");
+            if (GCoord.LeaseAgent == Who && GCoord.LeaseRequestedBy.IsEmpty())
+            {
+                // Holder is the agent already named above: do not repeat the token.
+                Out.Add({ FString::Printf(TEXT("lease  %s%s%s"), *Trim(GCoord.LeaseReason, 26),
+                                          *Age, *Expired),
+                          GCoord.bLeaseStale ? CAlarm : CInfo });
+            }
+            else
+            {
+                Out.Add({ FString::Printf(TEXT("lease  %s (%s)%s%s"),
+                                          *Trim(AgentLabel(GCoord.LeaseAgent, GCoord.LeaseRequestedBy), 26),
+                                          *GCoord.LeaseReason, *Age, *Expired),
+                          GCoord.bLeaseStale ? CAlarm : CInfo });
+                // The holder is somebody other than the driver named above (e.g. the lease is a
+                // PIE hold and a different agent is calling in): say what the holder is for.
+                if (!GCoord.LeaseTask.IsEmpty())
+                {
+                    Out.Add({ FString::Printf(TEXT("  for  %s"), *Trim(GCoord.LeaseTask, 38)), CInfo });
+                }
+            }
         }
-        if (!GCoord.Waiters.IsEmpty())
+        // Who is next. The first two waiters, each with their task, one per line so a long label
+        // is trimmed on its own line instead of pushing the whole box off a small window. This
+        // is the line that explains, on screen, why nothing is moving: drawn in the alarm colour.
+        for (int32 i = 0; i < GCoord.Waiters.Num() && i < 2; ++i)
         {
-            Out.Add({ FString::Printf(TEXT("WAITING  %s"), *Trim(GCoord.Waiters, 34)), CAlarm });
+            const FWaiterInfo& W = GCoord.Waiters[i];
+            FString Text = Trim(AgentLabel(W.Agent, W.RequestedBy), 24);
+            if (!W.Task.IsEmpty())
+            {
+                Text += TEXT(": ") + W.Task;
+            }
+            if (i == 1 && GCoord.Waiters.Num() > 2)
+            {
+                Text = Trim(Text, 42) + FString::Printf(TEXT(" +%d"), GCoord.Waiters.Num() - 2);
+            }
+            Out.Add({ FString::Printf(TEXT("%s%s"), i == 0 ? TEXT("next:  ") : TEXT("       "),
+                                      *Trim(Text, 46)), CAlarm });
         }
 
         // 7. The open report slot -- one per machine, so knowing whose it is matters.

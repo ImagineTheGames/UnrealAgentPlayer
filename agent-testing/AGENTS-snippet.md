@@ -29,6 +29,9 @@ and renders an HTML report.
   response) unless you pass `--keep-pie`, so an agent that always finishes its report never leaves
   a session live -- but check the field rather than assuming, and if `pie_stop_error` comes back
   the editor is still in PIE.
+- **SET `--task "<what you are doing>"` (or `$env:UAP_TASK`) next to your `--agent` token.** The
+  overlay on the editor and `uap lease status` show it for the lease holder and for everyone
+  queued behind it; a bare token tells the person watching nothing. Display only.
 - **THE REPORT SLOT IS ONE PER MACHINE, so pass `--agent <your-token>` on every report call.**
   Two agents verifying at once used to collide QUIETLY: the second `report start` took the slot
   with no check and no record, so the first agent's later notes and asserts went into the second

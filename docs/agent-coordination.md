@@ -70,6 +70,95 @@ design:
   `--agent <token>` on every related call, then `release` (or let the TTL reclaim it). `$UAP_AGENT_ID`
   overrides the default token.
 
+### Who is it, and what for? (`--task` / `$UAP_TASK`)
+
+An agent token (`pcgprof`, `rebuild-48876`) tells a human watching the editor nothing about the
+work. **Set a task label every time you drive the editor**:
+
+```powershell
+$env:UAP_AGENT_ID = "pcgprof"                 # who (same token on every call, see above)
+$env:UAP_TASK     = "PCG profiling, Utah"     # what for -- a few words a director can read
+```
+
+or per call: `uap ... --agent pcgprof --task "PCG profiling, Utah"`. The flag wins over the env
+var. The label is sanitised (one line, control characters folded to spaces) and cut at 80
+characters. It is **display only**: it never affects identity, queue order or who is granted
+what.
+
+It is recorded, in the same state files the in-editor overlay already reads:
+
+| Where | Field | Written by |
+|-------|-------|------------|
+| lease holder (`exclusive` / `shared[]`) | `task`, `requested_by` | `lease acquire`; refreshed by any editor verb or `lease heartbeat` that carries a task |
+| each waiter (`waiters[]`) and `queue_detail` | `task`, `requested_by`, `reason` | the blocked `lease acquire` |
+| machine-wide foreground lock (`_machine.json`) holder / waiters | `task` | the verb that took the machine turn |
+| `activity.<agent>` | `task`, `verb`, `at` | every editor-touching verb, so an agent that holds NO lease (plain `exec` / `rc` traffic) still shows up for ~5 minutes |
+
+`uap lease status` therefore prints `task` for the holder, every waiter and the machine-lock
+holder (`""` when none was set). A refusal (`busy`) names the blocker's task too, as
+`blocked_task`.
+
+**Rebuild requests name their owner.** `Restart-Editor.ps1` takes its lease as the mechanical
+token `rebuild-<pid>`. `lease acquire` now also records `requested_by`: `--requested-by <agent>`
+if given, otherwise `$UAP_AGENT_ID` when it differs from the `--agent` token. Because the
+script's child `uap` processes inherit the environment, an agent that runs
+`$env:UAP_AGENT_ID="pcgprof"; $env:UAP_TASK="..."; .\Restart-Editor.ps1` shows up in the queue as
+`rebuild-48876 by pcgprof` with its task, with **no change to the project's script**. The
+rebuild -> relaunch re-acquire keeps both labels. Projects that want the script to be explicit
+(or to work without the env) can pass them through; see "Projects: Restart-Editor.ps1" below.
+
+### The overlay
+
+The uap overlay (`AgentOverlay.cpp`, top-right of the editor/PIE viewport, and in every
+`uap screenshot`) draws, while an agent is driving:
+
+```
+UAP  ProjectBrokenWings
+RUN  exec print(1)  0.4s
+agent  pcgprof
+task   PCG profiling, Utah
+lease  pie  4m12s
+next:  rebuild-48876 by pcgprof: PCG prof~
+       hangar: Hangar lights +2
+fps  60.0
+```
+
+`agent` / `task` name the current driver (the machine-lock or lease holder, else whoever called
+last within 60 s); a driver with no label gets a grey `task (none set: --task / UAP_TASK)` nudge.
+`lease` shows the reason and how long it has been held (`EXPIRED` in red once past its TTL; when
+the holder is not the driver named above its token and its own `for <task>` line are shown).
+`next:` names the first two waiters with their tasks, plus `+N` for the rest, one per line and
+trimmed so a small window stays readable. Existing lines (project, verb, held keys, fps, report)
+are unchanged.
+
+> The label travels in the lease files, which the shared CLI writes, so the CLI half is live for
+> every project the moment its venv is updated. Drawing it needs the **plugin** half: the overlay
+> is C++ (`Plugin/Source/UnrealAgentPlayerRuntime/Private/AgentOverlay.cpp`), vendored into each
+> project's `Plugins/UnrealAgentPlayer`, so a project sees the new lines only after that file is
+> updated there and the editor is rebuilt (`Restart-Editor.ps1`). Until then the old overlay keeps
+> working and just shows tokens.
+
+### Projects: Restart-Editor.ps1
+
+Optional, because the environment already flows through. To make the owner explicit, give the
+script `-Agent` / `-Task` parameters defaulting to the env and pass them on both `lease acquire`
+calls:
+
+```powershell
+param(
+    # ...existing params...
+    [string]$Agent = $env:UAP_AGENT_ID,
+    [string]$Task  = $env:UAP_TASK
+)
+# ...
+$ownerArgs = @()
+if ($Agent) { $ownerArgs += @('--requested-by', $Agent) }
+if ($Task)  { $ownerArgs += @('--task', $Task) }
+$leaseOut = & powershell -NoProfile -ExecutionPolicy Bypass -File $uapLauncher lease acquire exclusive `
+    --reason rebuild --agent "rebuild-$PID" --pid $PID --wait 900 @ownerArgs
+# ...and the same `@ownerArgs` on the `--reason relaunch` acquire.
+```
+
 Eviction therefore has three independent reclaimers: **stale heartbeat (TTL)** for any hold,
 **dead PID** for PID-anchored holds, and, for `pie`/`level` holds only, **dead editor** (below).
 Any one frees an abandoned lease.
