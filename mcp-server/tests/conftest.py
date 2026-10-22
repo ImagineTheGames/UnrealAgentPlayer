@@ -66,6 +66,9 @@ def _no_live_editor_probe(monkeypatch):
     `coordination._editor_probe` (or fake `_enumerate_editors`).
     """
     monkeypatch.setattr(_coordination, "_editor_probe", lambda project: None)
+    # Same for the machine lock's live-PIE probe, which the CLI wires to a real RC call: with no
+    # editor in a test it must not run (tests of it install `cli._machine_pie_probe` themselves).
+    monkeypatch.setattr(_coordination, "_machine_pie_probe", None)
     # ...and for child processes, which inherit the environment but not the monkeypatch above
     # (the lease-contention tests spawn real workers that take `pie` leases).
     monkeypatch.setenv("UAP_EDITOR_LIVENESS", "0")

@@ -48,6 +48,10 @@ POLL_SECONDS = 2.0
 DEFAULT_WAIT_CAP = 900          # 15 min -- covers a full rebuild
 _FILELOCK_TIMEOUT = 10.0
 _FILELOCK_STALE = 30.0
+# Windows sharing violations on the lock/state files are transient (another process has the file
+# open for a few milliseconds). Ride them out for up to ~2s before calling it an error.
+_SHARING_RETRIES = 100
+_SHARING_RETRY_SLEEP = 0.02
 # TTL is "how long after the holder's LAST uap call before the lease is reclaimed" -- every
 # editor op by the holder heartbeats it (see cli.main), so an actively-working agent keeps its
 # hold indefinitely without manual heartbeating.
@@ -279,6 +283,18 @@ def _acquire_filelock(project: str | None) -> None:
                 os.close(fd)
             _LOCK_OWNER[str(lp)] = token
             return
+        except PermissionError:
+            # Windows answers O_EXCL with EACCES, not EEXIST, while the previous holder's lockfile
+            # is still being deleted (or a scanner has it open). That is "held, for a moment", and
+            # it used to escape as a raw PermissionError: measured 2026-10-22 at about one critical
+            # section in 200 with eight contending processes. The CLI then treated the machine lock
+            # as unavailable and ran `pie start` without it -- two projects in PIE at once.
+            if _now() > deadline:
+                raise LeaseUnavailable(
+                    f"could not create the coordination lock {lp} within "
+                    f"{_FILELOCK_TIMEOUT:.0f}s (access denied every time). Refusing to make a "
+                    f"lease decision without it.") from None
+            time.sleep(0.01)
         except FileExistsError:
             try:
                 if _now() - lp.stat().st_mtime > _FILELOCK_STALE:
@@ -308,15 +324,21 @@ def _release_filelock(project: str | None) -> None:
     mine = _LOCK_OWNER.pop(str(lp), None)
     if mine is None:
         return
-    try:
-        if lp.read_text(encoding="utf-8").strip() != mine:
-            return                       # somebody broke ours and took it; leave theirs alone
-    except OSError:
-        return
-    try:
-        lp.unlink()
-    except OSError:
-        pass
+    for attempt in range(_SHARING_RETRIES):
+        try:
+            if lp.read_text(encoding="utf-8").strip() != mine:
+                return                   # somebody broke ours and took it; leave theirs alone
+            lp.unlink()
+            return
+        except FileNotFoundError:
+            return
+        except PermissionError:
+            # Another process has the file open for a moment (Windows sharing violation). Giving
+            # up here left OUR lock on disk until it went stale 30s later, and every caller in
+            # between timed out with LeaseUnavailable.
+            time.sleep(_SHARING_RETRY_SLEEP)
+        except OSError:
+            return
 
 
 def _blank() -> dict:
@@ -387,7 +409,18 @@ def _save(project: str | None, state: dict) -> None:
     tmp = p.with_name(f"{p.name}.{os.getpid()}.{uuid.uuid4().hex[:8]}.tmp")
     try:
         tmp.write_text(json.dumps(state, indent=2), encoding="utf-8")
-        os.replace(tmp, p)
+        for attempt in range(_SHARING_RETRIES):
+            try:
+                os.replace(tmp, p)
+                break
+            except PermissionError:
+                # WinError 5: a reader has the target open without FILE_SHARE_DELETE. Each editor's
+                # overlay reads these files once a second exactly like that (UE's default
+                # OpenRead), so this is routine, not exceptional. Retry briefly; only a reader
+                # that never lets go surfaces as an error.
+                if attempt == _SHARING_RETRIES - 1:
+                    raise
+                time.sleep(_SHARING_RETRY_SLEEP)
     finally:
         try:
             tmp.unlink()
@@ -883,12 +916,25 @@ def release(project: str | None, *, agent: str | None = None) -> dict:
         _save(project, state)
     finally:
         _release_filelock(project)
-    res = {"ok": True, "released": was, "agent": agent}
+    # `was_exclusive` tells the caller whether this agent owned the project's editor turn, which
+    # is what entitles it to hand back the project's machine hold as well (cli `lease release`).
+    res = {"ok": True, "released": was, "was_exclusive": bool(ex and ex.get("agent") == agent),
+           "agent": agent}
     if note:
         # Nothing was held because the lease was already voided, not because the caller never
         # had one. Say so instead of a bare `released: false`.
         res["lease_evicted"] = note
     return res
+
+
+def holds_exclusive(project: str | None, *, agent: str) -> bool:
+    """Does `agent` hold `project`'s exclusive lease right now? (Read-only.)"""
+    _acquire_filelock(project)
+    try:
+        ex = _evict_stale(_load(project)).get("exclusive")
+    finally:
+        _release_filelock(project)
+    return bool(ex) and ex.get("agent") == agent
 
 
 def heartbeat(project: str | None, *, agent: str | None = None,
@@ -1054,8 +1100,57 @@ def machine_lock_enabled() -> bool:
     return not (raw is not None and raw.strip().lower() in _MACHINE_LOCK_OFF)
 
 
-def _machine_holder() -> dict | None:
-    state = _evict_stale(_load(MACHINE_SENTINEL))
+# "Is this project's editor in PIE right now?" -> True / False / None (cannot tell). The CLI installs
+# an RC-backed probe; with none installed (or None returned) a stale hold ages out on its TTL
+# exactly as before.
+#
+# Why it exists: a sticky `pie start` hold is refreshed only by the holder's FOREGROUND verbs. An
+# agent driving a long PIE session through exec / rc alone never touches it, so after MACHINE_TTL
+# it aged out while the session was still running and the other project was granted the machine.
+# The PIE session is the thing being held, so the session itself is what keeps the hold alive.
+_machine_pie_probe: Callable[[str], bool | None] | None = None
+
+
+def _hold_key(h: dict) -> tuple:
+    return (h.get("agent"), h.get("project"), h.get("acquired_at"))
+
+
+def _live_pie_holds() -> set:
+    """Keys of stale machine holds whose project's editor is still in PIE. Call WITHOUT the lock.
+
+    The probe is a network round trip to an editor, so it must never run inside the filelock
+    (every other agent's coordination call would queue behind it). It reads the state unlocked,
+    which is safe: `_save` is atomic, and the locked pass that follows only acts on a hold whose
+    identity still matches the one probed.
+    """
+    probe = _machine_pie_probe
+    if probe is None:
+        return set()
+    try:
+        ex = _load(MACHINE_SENTINEL).get("exclusive")
+    except Exception:
+        return set()
+    if not ex or _holder_alive(ex):
+        return set()
+    try:
+        live = probe(str(ex.get("target") or ex.get("project") or ""))
+    except Exception:
+        return set()
+    return {_hold_key(ex)} if live is True else set()
+
+
+def _settle_machine(state: dict, live: set) -> dict:
+    """Refresh a stale hold the probe found still in PIE, then evict what is really dead."""
+    ex = state.get("exclusive")
+    if ex and _hold_key(ex) in live and not _holder_alive(ex):
+        ex["heartbeat_at"] = _now()
+        ex["pid"] = 0                # the session, not the process that started it, is the anchor
+        ex["kept_by_live_pie"] = True
+    return _evict_stale_waiters(_evict_stale(state))
+
+
+def _machine_holder(live: set | frozenset = frozenset()) -> dict | None:
+    state = _settle_machine(_load(MACHINE_SENTINEL), set(live))
     _save(MACHINE_SENTINEL, state)
     return state.get("exclusive")
 
@@ -1093,6 +1188,13 @@ def acquire_machine(project: str | None, *, reason: str = "", agent: str | None 
     that had waited longest could be overtaken indefinitely. A blocked caller queues; only the
     head may take the lock. The pass-through case (this project already holds it) skips the queue
     entirely -- it is not a request, and queueing it would deadlock the holding project.
+
+    NEVER RAISES for a coordination failure. A poll that cannot read or write the lock is a poll
+    that was not granted: it is retried, and if the failures outlast the wait the caller gets
+    `busy` with `coordination_unsafe: True`. It used to raise, and the CLI ran the verb on any
+    exception, so one transient Windows sharing violation in the middle of a wait turned "another
+    project is in PIE" into "go ahead": School's Out started PIE under Project Broken Wings'
+    live session (2026-10-22).
     """
     agent = agent or default_agent_id()
     task = sanitize_label(task)
@@ -1104,54 +1206,99 @@ def acquire_machine(project: str | None, *, reason: str = "", agent: str | None 
     position = 0
     ahead: list[str] = []
     queue_len = 0
+    errors = 0
+    last_error = ""
     while True:
-        _acquire_filelock(MACHINE_SENTINEL)
         try:
-            state = _evict_stale_waiters(_evict_stale(_load(MACHINE_SENTINEL)))
-            holder = state.get("exclusive")
-            if holder is not None and holder.get("project") == mine:
-                holder["heartbeat_at"] = _now()
-                _dequeue(state, agent)
-                _save(MACHINE_SENTINEL, state)
-                return {"ok": True, "granted": True, "acquired": False, "agent": agent,
-                        "scope": "machine", "project": mine, "holder": holder}
-            _enqueue(state, agent, "exclusive", reason, task)
-            if holder is None and _turn_ok(state, "exclusive", agent):
-                _dequeue(state, agent)
-                rec = {"agent": agent, "project": mine, "reason": reason, "pid": pid,
-                       "acquired_at": _now(), "heartbeat_at": _now(), "ttl": ttl,
-                       "task": task}
-                state["exclusive"] = rec
-                _save(MACHINE_SENTINEL, state)
-                return {"ok": True, "granted": True, "acquired": True, "agent": agent,
-                        "scope": "machine", "project": mine, "reason": reason, "holder": rec}
-            position = _queue_position(state, agent)
-            ahead = _queue_ahead(state, agent)
-            queue_len = len(state.get("waiters", []))
-            _save(MACHINE_SENTINEL, state)
-        finally:
-            _release_filelock(MACHINE_SENTINEL)
+            granted, holder, position, ahead, queue_len = _machine_poll(
+                project, mine, agent=agent, reason=reason, pid=pid, ttl=ttl, task=task)
+            if granted is not None:
+                return granted
+            last_error = ""
+        except (OSError, CoordinationError) as exc:
+            errors += 1
+            last_error = f"{type(exc).__name__}: {exc}"
+            if errors <= _MACHINE_QUICK_RETRIES:
+                time.sleep(_SHARING_RETRY_SLEEP)
+                continue                 # a sharing violation clears in milliseconds
         if _now() >= deadline:
-            _acquire_filelock(MACHINE_SENTINEL)
             try:
-                state = _load(MACHINE_SENTINEL)
-                _dequeue(state, agent)
-                _save(MACHINE_SENTINEL, state)
-            finally:
-                _release_filelock(MACHINE_SENTINEL)
-            return _machine_busy(holder, agent, wait, position=position, ahead=ahead,
+                _acquire_filelock(MACHINE_SENTINEL)
+                try:
+                    state = _load(MACHINE_SENTINEL)
+                    _dequeue(state, agent)
+                    _save(MACHINE_SENTINEL, state)
+                finally:
+                    _release_filelock(MACHINE_SENTINEL)
+            except (OSError, CoordinationError):
+                pass                     # the waiter entry ages out on its own (_WAITER_TTL)
+            busy = _machine_busy(holder, agent, wait, position=position, ahead=ahead,
                                  queue_len=queue_len)
+            if last_error:
+                busy["coordination_unsafe"] = True
+                busy["error"] = last_error
+            return busy
         time.sleep(POLL_SECONDS)
 
 
+# How many back-to-back retries a poll gets for a coordination error before it counts as a missed
+# turn. Lets `wait=0` callers ride out a sharing violation instead of reporting busy for it.
+_MACHINE_QUICK_RETRIES = 5
+
+
+def _machine_poll(project, mine: str, *, agent: str, reason: str, pid: int, ttl: int,
+                  task: str) -> tuple:
+    """One locked look at the machine lock: (grant-or-None, holder, position, ahead, queue_len)."""
+    live = _live_pie_holds()
+    _acquire_filelock(MACHINE_SENTINEL)
+    try:
+        state = _settle_machine(_load(MACHINE_SENTINEL), live)
+        holder = state.get("exclusive")
+        if holder is not None and holder.get("project") == mine:
+            holder["heartbeat_at"] = _now()
+            _dequeue(state, agent)
+            _save(MACHINE_SENTINEL, state)
+            return ({"ok": True, "granted": True, "acquired": False, "agent": agent,
+                     "scope": "machine", "project": mine, "holder": holder},
+                    holder, 0, [], 0)
+        _enqueue(state, agent, "exclusive", reason, task)
+        if holder is None and _turn_ok(state, "exclusive", agent):
+            _dequeue(state, agent)
+            # `target` keeps the caller's own spelling of the project, which is what the live-PIE
+            # probe needs to address that project's editor.
+            rec = {"agent": agent, "project": mine, "target": str(project or ""),
+                   "reason": reason, "pid": pid, "acquired_at": _now(), "heartbeat_at": _now(),
+                   "ttl": ttl, "task": task}
+            state["exclusive"] = rec
+            _save(MACHINE_SENTINEL, state)
+            return ({"ok": True, "granted": True, "acquired": True, "agent": agent,
+                     "scope": "machine", "project": mine, "reason": reason, "holder": rec},
+                    rec, 0, [], 0)
+        position = _queue_position(state, agent)
+        ahead = _queue_ahead(state, agent)
+        queue_len = len(state.get("waiters", []))
+        _save(MACHINE_SENTINEL, state)
+        return None, holder, position, ahead, queue_len
+    finally:
+        _release_filelock(MACHINE_SENTINEL)
+
+
 def release_machine(*, agent: str | None = None, project: str | None = None,
-                    force: bool = False) -> dict:
+                    force: bool = False, project_wide: bool = True) -> dict:
     """Free the machine lock if it is ours.
 
-    Matches on the holder's `agent` OR its `project`: `uap pie stop` legitimately frees the hold a
-    DIFFERENT agent on the same project took with `pie start`, because the thing being held (that
-    project's PIE session) is genuinely over. `force=True` breaks a hold belonging to anyone --
-    the break-glass for a session that died without releasing and has not yet aged out.
+    With `project`, only a hold of THAT project can be freed, and then:
+      * `project_wide=True` (default) frees it whichever agent took it. `uap pie stop` legitimately
+        frees the hold a DIFFERENT agent on the same project took with `pie start`, because the
+        thing being held (that project's PIE session) is genuinely over;
+      * `project_wide=False` frees it only when `agent` is the one that took it.
+    Without `project`, only `agent`'s own hold is freed.
+
+    It used to match agent OR project, so an agent token that happened to exist in BOTH projects
+    (agents reuse short names) let one project's `pie stop` free the other project's live session.
+
+    `force=True` breaks a hold belonging to anyone -- the break-glass for a session that died
+    without releasing and has not yet aged out.
     """
     agent = agent or default_agent_id()
     mine = _safe_project(project) if project is not None else None
@@ -1161,12 +1308,19 @@ def release_machine(*, agent: str | None = None, project: str | None = None,
     try:
         state = _load(MACHINE_SENTINEL)
         holder = state.get("exclusive")
-        if holder and (force or holder.get("agent") == agent
-                       or (mine is not None and holder.get("project") == mine)):
-            state["exclusive"] = None
-            released = True
-            _dequeue(state, agent)
-            _save(MACHINE_SENTINEL, state)
+        if holder:
+            same_agent = holder.get("agent") == agent
+            if force:
+                ok = True
+            elif mine is None:
+                ok = same_agent
+            else:
+                ok = holder.get("project") == mine and (project_wide or same_agent)
+            if ok:
+                state["exclusive"] = None
+                released = True
+                _dequeue(state, agent)
+                _save(MACHINE_SENTINEL, state)
     finally:
         _release_filelock(MACHINE_SENTINEL)
     return {"ok": True, "released": released, "scope": "machine", "agent": agent,
@@ -1174,10 +1328,12 @@ def release_machine(*, agent: str | None = None, project: str | None = None,
 
 
 def machine_status() -> dict:
-    """Who owns this machine's foreground right now (stale holders evicted first)."""
+    """Who owns this machine's foreground right now (stale holders evicted first, unless their
+    project's editor is still in PIE -- see `_machine_pie_probe`)."""
+    live = _live_pie_holds()
     _acquire_filelock(MACHINE_SENTINEL)
     try:
-        holder = _machine_holder()
+        holder = _machine_holder(live)
         waiters = [_with_labels(w) for w in _load(MACHINE_SENTINEL).get("waiters", [])]
     finally:
         _release_filelock(MACHINE_SENTINEL)

@@ -266,6 +266,11 @@ def _report_finish(args) -> int:
             pie_stop_error = None if pie_stopped else res.get("error")
         except Exception:
             pass  # editor gone / RC unreachable -- nothing to stop, still render the report
+        if pie_stopped:
+            # A confirmed stop ends the session the machine-wide hold was for, exactly as
+            # `uap pie stop` does; otherwise the other project waits out the hold's TTL.
+            _release_machine_quiet(agent=getattr(args, "agent", None) or _coord.default_agent_id(),
+                                   project=proj or _env_project())
         try:
             if pie_stopped:
                 s.add_note("PIE auto-stopped on report finish (teardown confirmed).")
@@ -2487,8 +2492,14 @@ def _lease_inner(args) -> int:
             res["pie_live"] = live
             res["checked_with"] = how
             # Releasing the editor also gives the machine back: the agent has just proved PIE is
-            # down, which is the whole reason the other project was waiting.
-            res["machine"] = _coord.release_machine(agent=res["agent"], project=proj)
+            # down, which is the whole reason the other project was waiting. Project-wide only
+            # for the agent that actually held the project's exclusive turn (whose session a
+            # teammate's `pie start` hold belongs to); anyone else frees only its OWN hold. It was
+            # project-wide for every caller, so a bystander's `lease release` -- with the editor
+            # too busy to answer the PIE check -- freed the holder's machine turn mid-session.
+            res["machine"] = _coord.release_machine(
+                agent=res["agent"], project=proj,
+                project_wide=bool(res.get("was_exclusive") or res.get("lease_evicted")))
     elif cmd == "heartbeat":
         res = _coord.heartbeat(proj, agent=args.agent, task=_task_label(args))
     else:  # status
@@ -3105,6 +3116,69 @@ def _release_machine_quiet(**kw) -> None:
         pass
 
 
+def _machine_denied(args, cmd: str, project: str, agent: str, machine: dict,
+                    holds_lease: bool) -> dict:
+    """The refusal body for a guarded verb that did not get the machine, and the project-lease
+    hand-back for a caller that held one (see `_run_under_machine_lock`)."""
+    if machine.get("coordination_unsafe") and not machine.get("blocked_by"):
+        return {"ok": False, "busy": True, "coordination_unsafe": True, "scope": "machine",
+                "cmd": cmd, "agent": agent, "error": machine.get("error", ""),
+                "hint": "the machine-wide lock could not be read or written, so this foreground "
+                        "verb did NOT run (running it unlocked is how two projects ended up in "
+                        "PIE at once). Retry; if it persists, `uap lease machine-status`. "
+                        "$UAP_MACHINE_LOCK=0 disables the lock deliberately."}
+    body = {"ok": False, "busy": True, "blocked_by": machine.get("blocked_by"),
+            "blocked_task": machine.get("task", ""),
+            "project": machine.get("project"), "reason": machine.get("reason"),
+            "scope": "machine", "cmd": cmd, "agent": agent,
+            "hint": "another PROJECT on this machine holds the foreground (PIE / input / "
+                    "screenshots); this is the machine-wide lock, not your project lease. "
+                    "Wait for it, or if that session is gone: "
+                    "`uap lease machine-status`, then "
+                    "`uap lease machine-release --force`. $UAP_MACHINE_LOCK=0 disables it."}
+    if machine.get("coordination_unsafe"):
+        body["coordination_unsafe"] = True
+        body["error"] = machine.get("error", "")
+    if not holds_lease:
+        return body
+    # Same rule as `lease acquire --reason pie`: a project lease held while the machine is denied
+    # blocks this project's other agents for a turn this agent did not get. Give it back -- unless
+    # its own editor is mid-PIE, because handing a live session to a teammate is the failure
+    # `lease release` refuses. Either way, do not wait.
+    live, how = _pie_state_for_lease(project)
+    body["pie_live"] = live
+    body["checked_with"] = how
+    if live:
+        body["project_lease_released"] = False
+        body["hint"] = ("another PROJECT holds the machine and your project's editor is in PIE "
+                        "WITHOUT the machine turn. Your project lease was kept (it protects that "
+                        "live session) but this call did not wait. Run `uap pie stop` (never "
+                        "blocked by the machine lock), then `uap lease acquire exclusive --reason "
+                        "pie`, which waits for both turns.")
+        return body
+    try:
+        _coord.release(project, agent=agent)
+        body["project_lease_released"] = True
+    except Exception as exc:
+        body["project_lease_released"] = False
+        body["release_error"] = f"{type(exc).__name__}: {exc}"
+    body["hint"] = ("another PROJECT holds the machine. Your project lease was given back so your "
+                    "own team is not queued behind a turn you could not use. Re-take both with "
+                    "`uap lease acquire exclusive --reason pie --agent <token>`, which waits for "
+                    "the machine as well.")
+    return body
+
+
+def _machine_pie_probe(project: str) -> bool | None:
+    """Is `project`'s editor in PIE? The live-session check behind the machine lock's TTL: a stale
+    hold whose editor is still playing is refreshed instead of evicted (coordination.py)."""
+    live, _how = _pie_state_for_lease(project or None)
+    return live
+
+
+_coord._machine_pie_probe = _machine_pie_probe
+
+
 def _run_under_machine_lock(args, cmd: str | None, project: str) -> int:
     """Take the machine-wide foreground turn (if this verb needs it), run the verb, hand it back.
 
@@ -3117,33 +3191,42 @@ def _run_under_machine_lock(args, cmd: str | None, project: str) -> int:
     A call whose project already holds the lock passes straight through and releases nothing.
     """
     sticky = cmd == "pie" and getattr(args, "pie_cmd", "") == "start"
+    # `pie stop` hands the foreground BACK. Queueing it behind the other project's hold only keeps
+    # both sessions alive longer (and, with a hold lost to a bug, left an agent unable to stop the
+    # PIE it should never have been running).
+    stopping = cmd == "pie" and getattr(args, "pie_cmd", "") == "stop"
     machine = None
-    if cmd in _MACHINE_GUARDED and _coord.machine_lock_enabled():
+    if cmd in _MACHINE_GUARDED and not stopping and _coord.machine_lock_enabled():
         agent = getattr(args, "agent", None) or _coord.default_agent_id()
+        # An agent that holds its project's exclusive lease must not sit in the machine queue:
+        # every teammate is queued behind that lease for as long as it waits (2026-10-22, four
+        # School's Out agents behind `sprayhub`, itself queued on a `click`). It asks once.
+        try:
+            holds_lease = _coord.holds_exclusive(project, agent=agent)
+        except Exception:
+            holds_lease = False
         try:
             machine = _coord.acquire_machine(
                 project, reason=_machine_reason(args, cmd), agent=agent,
-                pid=0 if sticky else None, wait=_lease_wait_cap(),
+                pid=0 if sticky else None, wait=0 if holds_lease else _lease_wait_cap(),
                 ttl=_coord.MACHINE_TTL if sticky else _coord.MACHINE_TRANSIENT_TTL,
                 task=_task_label(args))
-        except Exception:
-            machine = None          # fail-open: a coordination bug must not brick uap
-        if machine is not None and machine.get("busy"):
-            _emit({"ok": False, "busy": True, "blocked_by": machine.get("blocked_by"),
-                   "blocked_task": machine.get("task", ""),
-                   "project": machine.get("project"), "reason": machine.get("reason"),
-                   "scope": "machine", "cmd": cmd, "agent": agent,
-                   "hint": "another PROJECT on this machine holds the foreground (PIE / input / "
-                           "screenshots); this is the machine-wide lock, not your project lease. "
-                           "Wait for it, or if that session is gone: "
-                           "`uap lease machine-status`, then "
-                           "`uap lease machine-release --force`. $UAP_MACHINE_LOCK=0 disables it."})
+        except Exception as exc:
+            # FAIL CLOSED. This used to be fail-open ("a coordination bug must not brick uap"),
+            # and one transient sharing violation while School's Out waited for Project Broken
+            # Wings' PIE ran School's Out's `pie start` with no lock at all: two projects in PIE.
+            # The deliberate escape hatch is $UAP_MACHINE_LOCK=0.
+            machine = {"busy": True, "coordination_unsafe": True,
+                       "error": f"{type(exc).__name__}: {exc}"}
+        if machine.get("busy"):
+            _emit(_machine_denied(args, cmd, project, agent, machine, holds_lease))
             return 1
     try:
         rc = args.func(args)
     finally:
         if machine is not None and machine.get("acquired") and not sticky:
-            _release_machine_quiet(agent=machine.get("agent"))
+            _release_machine_quiet(agent=machine.get("agent"), project=project,
+                                   project_wide=False)
     # A CONFIRMED `pie stop` is what ends the sticky hold: the session the other project was
     # waiting on is genuinely over. Only on success -- a stop that failed left PIE running.
     if rc == 0 and cmd == "pie" and getattr(args, "pie_cmd", "") == "stop":
