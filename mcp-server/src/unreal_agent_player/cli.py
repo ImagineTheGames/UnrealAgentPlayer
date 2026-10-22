@@ -2141,7 +2141,11 @@ PLAY-IN-EDITOR
 MULTI-AGENT COORDINATION (several agents sharing one editor; see docs/agent-coordination.md)
   Rebuild ONLY via Restart-Editor.ps1 -- it self-locks; never bounce the editor by hand.
   Editor-touching verbs auto-wait through another agent's rebuild (block then resume, not fail).
-  uap lease status                          who holds the editor + why
+  uap lease status                          who holds the editor + why (and their --task)
+  --task "<what you are doing>" / $UAP_TASK   human label shown beside your --agent token in the
+                                            lease, the wait queue and the editor's uap overlay.
+                                            SET IT: a bare token like `pcgprof` tells the person
+                                            watching the screen nothing about what you are for.
   uap lease acquire exclusive --reason pie --agent <tok> [--wait 900]   # hold PIE/level across calls
   uap lease release --agent <tok>           # ...then release (pass the SAME token every call).
                                             REFUSES while PIE is still in progress -- stop PIE
@@ -2329,8 +2333,9 @@ every time on top of that. Two things to know:
   Neither changes what any verb PROVES: `pie stop` still does not return until teardown is
   confirmed, and `exec` still refuses to run against a process that does not match --project.
 
-FLAGS: --project <name>, --instance <sel> and --agent <token> are accepted by EVERY verb
-(ignored by the ones that don't touch the editor), so you can pass the same set on every call.
+FLAGS: --project <name>, --instance <sel>, --agent <token> and --task <text> are accepted by
+EVERY verb (ignored by the ones that don't touch the editor), so you can pass the same set on
+every call. --task / $UAP_TASK is a short label of what you are doing; the overlay shows it.
   --project picks the PROJECT; --instance picks WHICH PROCESS of it. Every verb targets that
   project's EDITOR by default. A `-game` standalone client (launch_2p_standalone.ps1) answers
   the same discovery under the same project name, so it used to be selectable by accident --
@@ -2397,6 +2402,26 @@ def _pie_state_for_lease(project: str | None) -> tuple[bool | None, str]:
     return None, "unreachable"
 
 
+def _task_label(args) -> str:
+    """The human task label for this call: --task, else $UAP_TASK, sanitised ("" if neither)."""
+    return _coord.sanitize_label(getattr(args, "task_label", None)) or _coord.default_task()
+
+
+def _requested_by(args, agent: str) -> str:
+    """Who a mechanical lease token is really acting for.
+
+    `--requested-by` wins. Otherwise $UAP_AGENT_ID, when it names somebody OTHER than `agent`:
+    `Restart-Editor.ps1` takes its lease as `rebuild-<pid>`, so without this a director looking
+    at the queue sees a bare pid and no owner. The agent that ran the script has its own token in
+    the environment, which the script's child `uap` processes inherit.
+    """
+    explicit = _coord.sanitize_label(getattr(args, "requested_by", None))
+    if explicit:
+        return explicit
+    env = _coord.sanitize_label(os.environ.get("UAP_AGENT_ID"))
+    return env if env and env != agent else ""
+
+
 def _lease(args) -> int:
     """Multi-agent coordination lease for a shared editor. See docs/agent-coordination.md."""
     try:
@@ -2416,8 +2441,11 @@ def _lease_inner(args) -> int:
     proj = getattr(args, "project", "") or _env_project()
     cmd = args.lease_cmd
     if cmd == "acquire":
+        task = _task_label(args)
         res = _coord.acquire(proj, args.mode, reason=args.reason, agent=args.agent,
-                             pid=args.pid, wait=args.wait, ttl=args.ttl)
+                             pid=args.pid, wait=args.wait, ttl=args.ttl, task=task,
+                             requested_by=_requested_by(
+                                 args, args.agent or _coord.default_agent_id()))
         # A declared foreground hold (pie / level / input ...) is a claim on the whole
         # workstation, not just this project's editor, so take the machine turn as well. If the
         # OTHER project has it, give the project lease straight back rather than sitting on a
@@ -2425,7 +2453,7 @@ def _lease_inner(args) -> int:
         if res.get("granted") and _is_foreground_reason(args.reason) \
                 and _coord.machine_lock_enabled():
             mach = _coord.acquire_machine(proj, reason=args.reason, agent=res["agent"],
-                                          pid=args.pid, wait=args.wait, ttl=args.ttl)
+                                          pid=args.pid, wait=args.wait, ttl=args.ttl, task=task)
             if mach.get("busy"):
                 _coord.release(proj, agent=res["agent"])
                 res = dict(mach)
@@ -2462,7 +2490,7 @@ def _lease_inner(args) -> int:
             # down, which is the whole reason the other project was waiting.
             res["machine"] = _coord.release_machine(agent=res["agent"], project=proj)
     elif cmd == "heartbeat":
-        res = _coord.heartbeat(proj, agent=args.agent)
+        res = _coord.heartbeat(proj, agent=args.agent, task=_task_label(args))
     else:  # status
         res = _coord.status(proj)
         # Contention is only legible with both scopes side by side: "my project lease is free"
@@ -2505,6 +2533,12 @@ def build_parser() -> argparse.ArgumentParser:
                            "the exclusive lease an editor op waits for it; passing your own "
                            "token is what stops your own lease from blocking you. Accepted "
                            "(and ignored) on verbs that do not touch the editor.")
+    # dest is task_label, not task: `report start` already has a positional called `task`.
+    proj.add_argument("--task", dest="task_label", default=None, metavar="TEXT",
+                      help="short human label for what you are doing (default $UAP_TASK; the "
+                           "flag wins). Shown next to your --agent token by `uap lease status` "
+                           "and in the editor's uap overlay, for you as lease holder AND while "
+                           "you wait. Display only; truncated to 80 chars.")
     proj.add_argument("--project", default=_env_project(),
                       help="editor to target (default $UAP_PROJECT); RC port resolved per "
                            "project. Ignored by verbs that do not touch the editor.")
@@ -2804,6 +2838,10 @@ def build_parser() -> argparse.ArgumentParser:
     la.add_argument("--wait", type=float, default=_coord.DEFAULT_WAIT_CAP,
                     help="max seconds to block before returning busy (default 900)")
     la.add_argument("--ttl", type=int, default=None)
+    la.add_argument("--requested-by", dest="requested_by", default=None, metavar="AGENT",
+                    help="the agent this token acts for, when --agent is a mechanical token such "
+                         "as rebuild-<pid> (default: $UAP_AGENT_ID when it differs from --agent). "
+                         "Shown next to the token in `uap lease status` and the overlay.")
     la.set_defaults(func=_lease)
     lzr = lzs.add_parser("release", parents=[proj])
     lzr.add_argument("--force", action="store_true",
@@ -2917,6 +2955,8 @@ def _batch(args) -> int:
             argv = [*argv, "--project", args.project]
         if "--agent" not in argv and args.agent:
             argv = [*argv, "--agent", args.agent]
+        if "--task" not in argv and getattr(args, "task_label", None):
+            argv = [*argv, "--task", args.task_label]
         step: dict = {"step": i + 1, "argv": argv}
         buf = io.StringIO()
         try:
@@ -2985,7 +3025,17 @@ def _run_parsed(args) -> int:
     # Coordination: if another agent is rebuilding this editor (it's down), wait it out instead of
     # hard-failing, then proceed against the relaunched editor. Fail-open; only editor-touching
     # verbs are guarded (lease/report verbs manage or don't need the editor).
+    # Say who is using the editor before anything can block, so a call stuck behind a lease or a
+    # rebuild still appears (with its task) in `uap lease status` and the overlay. Display only.
+    task = _task_label(args)
     if cmd in _REBUILD_GUARDED:
+        who = getattr(args, "agent", None) or os.environ.get("UAP_AGENT_ID")
+        if who or task:
+            try:
+                _coord.note_activity(project, agent=who or _coord.default_agent_id(),
+                                     verb=_machine_reason(args, cmd), task=task)
+            except Exception:
+                pass
         try:
             _coord.wait_while_rebuild(project)
         except Exception:
@@ -3003,6 +3053,7 @@ def _run_parsed(args) -> int:
         if not res.get("ok", True) and res.get("blocked"):
             holder = res.get("holder") or {}
             _emit({"ok": False, "busy": True, "blocked_by": holder.get("agent"),
+                    "blocked_task": holder.get("task", ""),
                     "reason": holder.get("reason"), "cmd": cmd, "agent": agent,
                     "hint": "another agent holds the exclusive editor lease; wait, or pass "
                             "--agent/$UAP_AGENT_ID if that lease is yours "
@@ -3029,7 +3080,7 @@ def _run_parsed(args) -> int:
         # Using the editor IS liveness: refresh our own lease so an actively-working holder never
         # has it reclaimed mid-hold, and an abandoned one still ages out on TTL.
         try:
-            _coord.heartbeat(project, agent=agent)
+            _coord.heartbeat(project, agent=agent, task=task)
         except Exception:
             pass
 
@@ -3073,11 +3124,13 @@ def _run_under_machine_lock(args, cmd: str | None, project: str) -> int:
             machine = _coord.acquire_machine(
                 project, reason=_machine_reason(args, cmd), agent=agent,
                 pid=0 if sticky else None, wait=_lease_wait_cap(),
-                ttl=_coord.MACHINE_TTL if sticky else _coord.MACHINE_TRANSIENT_TTL)
+                ttl=_coord.MACHINE_TTL if sticky else _coord.MACHINE_TRANSIENT_TTL,
+                task=_task_label(args))
         except Exception:
             machine = None          # fail-open: a coordination bug must not brick uap
         if machine is not None and machine.get("busy"):
             _emit({"ok": False, "busy": True, "blocked_by": machine.get("blocked_by"),
+                   "blocked_task": machine.get("task", ""),
                    "project": machine.get("project"), "reason": machine.get("reason"),
                    "scope": "machine", "cmd": cmd, "agent": agent,
                    "hint": "another PROJECT on this machine holds the foreground (PIE / input / "

@@ -474,8 +474,15 @@ Verbs used in this flow:
 - `uap log cursor` / `uap log since <c> [--grep RE]` / `uap log tail [--grep RE]` --
   editor log through the plugin (same editor targeting as every other verb, captured into the report).
 - `uap helpers [--grep RE] [--names]` -- list the project's test helpers with their arg schemas.
-- `--agent <token>` and `--project <name>` are accepted on EVERY verb (ignored where irrelevant),
-  so you can pass the same flags on every call without special-casing.
+- `--agent <token>`, `--task "<what you are doing>"` and `--project <name>` are accepted on EVERY
+  verb (ignored where irrelevant), so you can pass the same flags on every call without
+  special-casing.
+- **SET A TASK LABEL: `--task "<few words>"` or `$env:UAP_TASK` (flag wins).** The person watching
+  the editor sees your `--agent` token in the top-right uap overlay and in `uap lease status`, and
+  a token like `pcgprof` does not say what you are doing or why the editor is busy. The label is
+  shown for you as lease holder AND while you wait in the queue (`next:` line), and is display
+  only. Set it once per shell next to `UAP_AGENT_ID`. Rebuilds started with `Restart-Editor.ps1`
+  pick up both from the environment and appear as `rebuild-<pid> by <your token>`.
 
 ## Step 1 -- Translate the question into a verifiable assertion
 
