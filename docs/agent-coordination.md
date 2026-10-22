@@ -70,8 +70,9 @@ design:
   `--agent <token>` on every related call, then `release` (or let the TTL reclaim it). `$UAP_AGENT_ID`
   overrides the default token.
 
-Eviction therefore has two independent reclaimers: **stale heartbeat (TTL)** for any hold, and
-**dead PID** for PID-anchored holds. Either one frees an abandoned lease.
+Eviction therefore has three independent reclaimers: **stale heartbeat (TTL)** for any hold,
+**dead PID** for PID-anchored holds, and, for `pie`/`level` holds only, **dead editor** (below).
+Any one frees an abandoned lease.
 
 ## What's enforced automatically vs explicit (v1)
 
@@ -128,6 +129,55 @@ TTL is "time since the holder's last `uap` call": every editor op by the holder 
 lease, so an actively-working agent never needs manual heartbeating, while an abandoned hold ages
 out (pie/level 10 min, rebuild 20 min, reads 2 min) and PID-death evicts sooner where anchored.
 `uap lease status` names the holder; `uap lease release --agent <tok>` breaks an abandoned one.
+
+## A dead editor voids its pie/level lease
+
+A `pie` or `level` exclusive lease protects a LIVE editor session -- the loaded level, the running
+PIE world. If the editor process is gone, that session cannot exist and the lease protects nothing.
+Yet it used to keep blocking everyone for its full TTL, and the holder's own `uap` calls (which wait
+for the editor to come back) refreshed the heartbeat so it never aged out on its own. On
+2026-10-22 the PBW editor died (out of memory) while agent `respawnfix` held `pie`; the queued
+`Restart-Editor.ps1` (a `rebuild-...` waiter), the one thing that could bring the editor back, could
+not relaunch it until the TTL ran out.
+
+**The rule:** a `pie` / `level` exclusive lease is void when no EDITOR process for that project is
+running AND the project is not mid-rebuild. On every load / acquire / status / wait the holder is
+evicted on the spot, by the same pass that does the TTL and PID-death eviction
+(`coordination._evict_dead_editor`). Nothing else changes: `rebuild` / `relaunch` leases (the
+editor being down is their job), shared reads, and any other reason are never touched, and a `pie`
+lease on a running editor is never evicted by this.
+
+**What counts as "the editor is running"** (`coordination.editor_running`): an `UnrealEditor.exe`
+whose command line names `<project>.uproject`, matched case-insensitively on the .uproject name,
+which is also the lease's project key. So School's Out's editor never counts as PBW's, and vice
+versa. A standalone `-game` client of the same project does NOT count: it has no level or PIE
+session for a lease to protect. Detection is dependency-free (a Toolhelp process snapshot plus the
+command-line read `window_capture` already uses -- no PowerShell, no WMI) and cached for a few
+seconds (5s when up, 1s when down), so status polling stays fast.
+
+**Fail safe.** Only a probe that positively answers "no editor for this project" evicts. These all
+answer "unknown" and never evict (the TTL still reclaims a genuinely abandoned hold): the process
+list could not be read, an editor's command line was unreadable (elevated / other user -- it might
+be this project's), a non-Windows host, an unknown project (`--project` empty), or
+`UAP_EDITOR_LIVENESS=0` (escape hatch, not a setting). A rebuild or relaunch hold anywhere on the
+project also vetoes the eviction.
+
+**Rebuild goes first while the editor is down.** FIFO is right while the editor is up. With it
+verifiably down, a queued `rebuild*` request moves ahead of queued pie/level (and other) waiters,
+so the editor comes back before anyone tries to use it. Stable within each group; with the editor
+up or unknown the queue is untouched.
+
+**The evicted holder is told.** The eviction is recorded in the lease file:
+- the holder's NEXT guarded `uap` call fails once with
+  `{"ok": false, "lease_evicted": true, "why": "editor_not_running", "error": "lease_evicted:
+  editor_not_running -- ..."}` (exit 1) instead of running against a session that died with the
+  editor; the call after that proceeds normally. `lease heartbeat` / `lease release` by the holder
+  carry the same `lease_evicted` note. Re-acquiring clears it.
+- `uap lease status` shows `last_eviction` (agent, held reason, `why`, `evicted_at`, message).
+
+It also frees the holder's machine-wide foreground lock (see below), which `lease acquire ...
+--reason pie` normally takes alongside the project lease: otherwise the OTHER project would sit
+out that hold's TTL for a session that no longer exists.
 
 ## Two projects, one workstation (the machine-wide foreground lock)
 
@@ -211,6 +261,8 @@ foreground lock queues the same way, for the same reason.
   exclusive waiter anywhere ahead still blocks shared traffic, so a queued rebuild cannot be
   starved by a stream of readers.
 - Holder TTL age-out and `uap lease release --agent <token>` are unchanged.
+- One exception to FIFO: with the project's editor verifiably down, `rebuild*` waiters go ahead of
+  the others (see "A dead editor voids its pie/level lease").
 
 The `busy` response carries `queue_position`, `queue_ahead` and `queue_length`, and `uap lease
 status` / `lease machine-status` name the queue in order -- so an agent that gives up can report

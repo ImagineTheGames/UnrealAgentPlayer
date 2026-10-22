@@ -2147,6 +2147,9 @@ MULTI-AGENT COORDINATION (several agents sharing one editor; see docs/agent-coor
                                             REFUSES while PIE is still in progress -- stop PIE
                                             first (`uap pie stop`), or --force to hand over a
                                             live session on purpose.
+  A pie/level lease is VOID when the project's editor process is gone (and it is not
+  mid-rebuild): it is evicted at once and a queued Restart-Editor goes first. The holder's next
+  call answers `lease_evicted: editor_not_running`; `uap lease status` shows `last_eviction`.
 
 TWO PROJECTS ON ONE MACHINE (a second lock, above the per-project lease)
   A project lease covers that project's editor. It says nothing about the OTHER editor open on
@@ -3005,6 +3008,23 @@ def _run_parsed(args) -> int:
                             "--agent/$UAP_AGENT_ID if that lease is yours "
                             "(`uap lease status` to inspect, `uap lease release --agent <token>` "
                             "if it is abandoned)"})
+            return 1
+        # If the editor died under our pie/level lease, the lease was voided (coordination.py,
+        # `_evict_dead_editor`) and the PIE session / loaded level this agent thinks it has died
+        # with the editor. Say so once, clearly, instead of letting the call run against a
+        # session that is gone; the NEXT call proceeds normally.
+        try:
+            note = _coord.take_eviction_notice(project, agent=agent)
+        except Exception:
+            note = None
+        if note:
+            _emit({"ok": False, "lease_evicted": True, "why": note.get("why"),
+                   "error": note.get("message"), "held_reason": note.get("held_reason"),
+                   "evicted_at": note.get("evicted_at"), "cmd": cmd, "agent": agent,
+                   "hint": "your lease is gone and so is the session it protected. Wait for the "
+                           "editor (Restart-Editor.ps1 if it needs relaunching), then re-acquire "
+                           "with `uap lease acquire exclusive --reason pie --agent <token>` and "
+                           "re-run this command. `uap lease status` shows last_eviction."})
             return 1
         # Using the editor IS liveness: refresh our own lease so an actively-working holder never
         # has it reclaimed mid-hold, and an abandoned one still ages out on TTL.
