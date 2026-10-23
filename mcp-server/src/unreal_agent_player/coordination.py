@@ -30,6 +30,10 @@ Two scopes, because two different resources are contended:
    Same-project calls pass straight THROUGH this lock -- intra-project turn-taking is the project
    lease's job. A single-project workstation therefore never waits on it at all.
 
+   Running standalone / packaged game clients hold it for their project on their own, found by a
+   process scan and tracked by pid, because nothing that starts them goes through a guarded verb
+   (see `game_clients` and `_settle_machine`).
+
 Each state file is read-modify-written under an O_EXCL lockfile so concurrent agents update it
 atomically. Pure stdlib, so it is live for every agent via the shared venv -- no editor rebuild,
 no plugin change.
@@ -429,6 +433,12 @@ def _save(project: str | None, state: dict) -> None:
 
 
 def _holder_alive(h: dict) -> bool:
+    # A hold that tracks game-client processes (`pids`) lives exactly as long as they do: TTL does
+    # not age it out under a running client, and it frees the moment the last one exits, so a
+    # crashed or closed client never leaves the machine locked.
+    pids = h.get("pids")
+    if pids:
+        return any(_pid_alive(int(p)) for p in pids)
     if _now() - float(h.get("heartbeat_at", 0)) > float(h.get("ttl", _DEFAULT_TTL)):
         return False  # heartbeat stale -> dead, regardless of pid
     pid = int(h.get("pid", 0))
@@ -469,20 +479,16 @@ _EDITOR_CACHE: dict[str, tuple[float, bool]] = {}
 _EVICTION_NOTICE_TTL = 3600.0        # how long an evicted holder can still be told why
 
 
-def _enumerate_editors() -> list[dict]:
-    """Every `UnrealEditor.exe` process: [{pid, exe, cmdline}] (`cmdline` None if unreadable).
+def _enumerate_processes() -> list[tuple[int, str]]:
+    """Every process on the box as (pid, exe file name), from one Toolhelp snapshot.
 
-    Windows only and dependency-free: a Toolhelp snapshot for the process list and the command
-    line read that window_capture already does. Far cheaper than a WMI/CIM query (no PowerShell
-    spawn), which matters because lease status gets polled. Raises on any failure; the caller
-    turns that into "unknown".
+    Windows only and dependency-free (no PowerShell, no WMI), because lease and machine-lock
+    status get polled. Raises on any failure; callers turn that into "unknown".
     """
     if os.name != "nt":
-        raise OSError("editor process enumeration is only implemented on Windows")
+        raise OSError("process enumeration is only implemented on Windows")
     import ctypes
     from ctypes import wintypes
-
-    from unreal_agent_player import window_capture as wc
 
     class PROCESSENTRY32W(ctypes.Structure):
         _fields_ = [("dwSize", wintypes.DWORD), ("cntUsage", wintypes.DWORD),
@@ -501,21 +507,31 @@ def _enumerate_editors() -> list[dict]:
     snap = k32.CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0)
     if not snap or snap == ctypes.c_void_p(-1).value:
         raise OSError("CreateToolhelp32Snapshot failed")
-    pids: list[int] = []
+    out: list[tuple[int, str]] = []
     try:
         entry = PROCESSENTRY32W()
         entry.dwSize = ctypes.sizeof(PROCESSENTRY32W)
         ok = k32.Process32FirstW(snap, ctypes.byref(entry))
         while ok:
-            if entry.szExeFile.lower() == "unrealeditor.exe":
-                pids.append(int(entry.th32ProcessID))
+            out.append((int(entry.th32ProcessID), str(entry.szExeFile)))
             ok = k32.Process32NextW(snap, ctypes.byref(entry))
     finally:
         k32.CloseHandle(snap)
+    return out
+
+
+def _enumerate_editors() -> list[dict]:
+    """Every `UnrealEditor.exe` process: [{pid, exe, cmdline}] (`cmdline` None if unreadable).
+
+    Raises on any failure; the caller turns that into "unknown".
+    """
+    from unreal_agent_player import window_capture as wc
+
     out = []
-    for pid in pids:
-        exe, cmdline = wc._process_info(pid)
-        out.append({"pid": pid, "exe": exe, "cmdline": cmdline})
+    for pid, name in _enumerate_processes():
+        if name.lower() == "unrealeditor.exe":
+            exe, cmdline = wc._process_info(pid)
+            out.append({"pid": pid, "exe": exe, "cmdline": cmdline})
     return out
 
 
@@ -567,6 +583,103 @@ def editor_running(project: str | None) -> bool | None:
 # The seam the eviction logic goes through. Tests (and the suite-wide conftest, which must not let
 # the developer's real running editors decide what a test asserts) replace this one name.
 _editor_probe: Callable[[str | None], bool | None] = editor_running
+
+
+# --- standalone / packaged game clients -------------------------------------------------------
+# A game client is a game window: it takes the GPU, the foreground and (for a test) the keyboard
+# exactly as PIE does. But nothing that starts one goes through a guarded uap verb -- School's
+# Out's `launch_2p_standalone.ps1` runs `Start-Process UnrealEditor.exe <proj> -game`, the MCP
+# server's `game_launch` spawns the same thing, a teammate double-clicks a packaged build -- so
+# while they ran, the machine lock read "free" to the other project. On 2026-10-22 two School's
+# Out clients were up for a two-client test while Project Broken Wings was granted the machine
+# and started PIE.
+#
+# So the machine lock LOOKS: every live client is, by itself, a machine hold for its project
+# (adopted under the agent name GAME_CLIENTS_AGENT, pids tracked, freed when the last one exits).
+# Detection is the same dependency-free process snapshot `editor_running` uses. Fail safe: a
+# snapshot that fails answers None ("cannot tell"), which changes nothing -- the lock behaves as
+# it did before clients were visible to it.
+GAME_CLIENTS_AGENT = "game-clients"
+GAME_CLIENTS_REASON = "game-clients"
+# A `-game` process that has no window takes no foreground: a dedicated server or a headless run.
+_WINDOWLESS_FLAGS = ("-server", "-nullrhi")
+_GAME_CLIENT_PROBE_OFF = {"0", "false", "no", "off"}
+_GAME_CLIENT_CACHE_SECONDS = 1.0
+_GAME_CLIENT_CACHE: list = []          # [(at, result)] -- one entry, cleared by tests
+
+
+def _known_projects() -> set[str]:
+    """Project keys this machine has coordinated (one lease file each). A packaged build's exe
+    name is matched only against these, so an unrelated `Foo-Win64-Shipping.exe` is never taken
+    for a project."""
+    out = set()
+    for f in _leases_dir().glob("*.json"):
+        stem = f.stem
+        if stem and not stem.startswith("_") and "." not in stem:
+            out.add(stem)
+    return out
+
+
+def game_clients() -> dict[str, list[int]] | None:
+    """Live game-client processes by project key: {"schoolsout": [21716, 59372]}.
+
+    Counts `UnrealEditor*.exe <project>.uproject -game` (what launch_2p_standalone.ps1 and MCP
+    `game_launch` start) and a packaged `<Project>[-<Platform>-<Config>].exe` under a `Binaries`
+    folder, for a project this machine knows. Never the editor itself, and never a windowless
+    `-server` / `-nullrhi` process. None when the process list cannot be read, the host is not
+    Windows, or `$UAP_GAME_CLIENT_PROBE=0`.
+    """
+    raw = os.environ.get("UAP_GAME_CLIENT_PROBE")
+    if raw is not None and raw.strip().lower() in _GAME_CLIENT_PROBE_OFF:
+        return None
+    if _GAME_CLIENT_CACHE and _now() - _GAME_CLIENT_CACHE[0][0] < _GAME_CLIENT_CACHE_SECONDS:
+        return _GAME_CLIENT_CACHE[0][1]
+    try:
+        from unreal_agent_player import window_capture as wc
+
+        known = _known_projects()
+        found: dict[str, list[int]] = {}
+        for pid, name in _enumerate_processes():
+            lname = name.lower()
+            stem = os.path.splitext(lname)[0]
+            editor_binary = stem.startswith("unrealeditor")
+            if not editor_binary and wc._PACKAGED_SUFFIX_RE.sub("", stem) not in known:
+                continue
+            exe, cmdline = wc._process_info(pid)
+            if editor_binary:
+                if not cmdline:
+                    continue
+                info = wc.parse_cmdline(cmdline)
+                if not info.get("game_client") or not info.get("project"):
+                    continue
+                key = _safe_project(info["project"])
+            else:
+                if not exe or "\\binaries\\" not in exe.replace("/", "\\").lower():
+                    continue
+                key = wc._PACKAGED_SUFFIX_RE.sub("", stem)
+            if cmdline and any(wc._has_flag(cmdline, f) for f in _WINDOWLESS_FLAGS):
+                continue
+            found.setdefault(key, []).append(int(pid))
+    except Exception:
+        return None
+    result = {k: sorted(v) for k, v in found.items()}
+    _GAME_CLIENT_CACHE[:] = [(_now(), result)]
+    return result
+
+
+# The seam the machine lock goes through (tests and the suite-wide conftest replace it).
+_game_client_probe: Callable[[], dict[str, list[int]] | None] = game_clients
+
+
+def _live_game_clients() -> dict[str, list[int]] | None:
+    """The probe, never raising. Call WITHOUT the filelock (it enumerates processes)."""
+    try:
+        res = _game_client_probe()
+    except Exception:
+        return None
+    if res is None:
+        return None
+    return {_safe_project(k): sorted(int(p) for p in v) for k, v in res.items() if v}
 
 
 def _is_rebuild_reason(reason) -> bool:
@@ -1139,18 +1252,59 @@ def _live_pie_holds() -> set:
     return {_hold_key(ex)} if live is True else set()
 
 
-def _settle_machine(state: dict, live: set) -> dict:
-    """Refresh a stale hold the probe found still in PIE, then evict what is really dead."""
+def _adopted_record(project: str, pids: list[int]) -> dict:
+    """The machine hold that running game clients ARE, when nobody holds the lock for them."""
+    pids = sorted(int(p) for p in pids)
+    return {"agent": GAME_CLIENTS_AGENT, "project": project, "target": project,
+            "reason": GAME_CLIENTS_REASON, "pid": 0, "pids": pids, "adopted": True,
+            "acquired_at": _now(), "heartbeat_at": _now(), "ttl": MACHINE_TTL,
+            "task": f"standalone game client(s) of {project} running (pids "
+                    f"{', '.join(str(p) for p in pids)})"}
+
+
+def _settle_machine(state: dict, live: set,
+                    clients: dict[str, list[int]] | None = None) -> dict:
+    """Bring the machine record up to date with what is actually running, then evict the dead.
+
+    * a stale hold the PIE probe found still in PIE is refreshed (`live`);
+    * a hold whose project has live game clients is kept alive by them, and names them;
+    * a hold that exists only because of game clients goes when they do;
+    * a FREE lock with game clients running is taken by them, for their project.
+    `clients` None means "cannot tell": nothing is adopted or dropped on its account.
+    """
     ex = state.get("exclusive")
     if ex and _hold_key(ex) in live and not _holder_alive(ex):
         ex["heartbeat_at"] = _now()
         ex["pid"] = 0                # the session, not the process that started it, is the anchor
         ex["kept_by_live_pie"] = True
-    return _evict_stale_waiters(_evict_stale(state))
+    if ex and clients is not None:
+        running = clients.get(ex.get("project"))
+        if running:
+            ex["clients"] = running
+            if ex.get("adopted"):
+                ex["pids"] = running
+                ex["task"] = _adopted_record(str(ex.get("project")), running)["task"]
+            elif int(ex.get("pid", 0) or 0) == 0 and not ex.get("pids"):
+                # A sticky hold (a `2p` lease, a PIE session) whose project's clients are up:
+                # the clients are the session, so they keep it, however its agent drives them.
+                ex["heartbeat_at"] = _now()
+                ex["kept_by_game_clients"] = True
+        elif ex.get("adopted"):
+            state["exclusive"] = None
+        else:
+            ex.pop("clients", None)
+    state = _evict_stale_waiters(_evict_stale(state))
+    if state.get("exclusive") is None and clients:
+        # Deterministic when two projects' clients are both up (itself a conflict, reported by
+        # machine_status): the first by name holds the machine, the other is listed.
+        proj = min(clients)
+        state["exclusive"] = _adopted_record(proj, clients[proj])
+    return state
 
 
-def _machine_holder(live: set | frozenset = frozenset()) -> dict | None:
-    state = _settle_machine(_load(MACHINE_SENTINEL), set(live))
+def _machine_holder(live: set | frozenset = frozenset(),
+                    clients: dict[str, list[int]] | None = None) -> dict | None:
+    state = _settle_machine(_load(MACHINE_SENTINEL), set(live), clients)
     _save(MACHINE_SENTINEL, state)
     return state.get("exclusive")
 
@@ -1250,10 +1404,26 @@ def _machine_poll(project, mine: str, *, agent: str, reason: str, pid: int, ttl:
                   task: str) -> tuple:
     """One locked look at the machine lock: (grant-or-None, holder, position, ahead, queue_len)."""
     live = _live_pie_holds()
+    clients = _live_game_clients()
     _acquire_filelock(MACHINE_SENTINEL)
     try:
-        state = _settle_machine(_load(MACHINE_SENTINEL), live)
+        state = _settle_machine(_load(MACHINE_SENTINEL), live, clients)
         holder = state.get("exclusive")
+        if holder is not None and holder.get("project") == mine and holder.get("adopted") \
+                and pid == 0:
+            # A sticky hold (`pie start`, `lease acquire --reason 2p`) in the project whose
+            # clients already hold the machine: the agent takes the hold over, so its own session
+            # does not lose the machine the moment the clients exit.
+            _dequeue(state, agent)
+            rec = {"agent": agent, "project": mine, "target": str(project or ""),
+                   "reason": reason, "pid": 0, "acquired_at": _now(), "heartbeat_at": _now(),
+                   "ttl": ttl, "task": task, "clients": list(holder.get("pids") or [])}
+            state["exclusive"] = rec
+            _save(MACHINE_SENTINEL, state)
+            return ({"ok": True, "granted": True, "acquired": True, "agent": agent,
+                     "scope": "machine", "project": mine, "reason": reason, "holder": rec,
+                     "took_over_from": GAME_CLIENTS_AGENT},
+                    rec, 0, [], 0)
         if holder is not None and holder.get("project") == mine:
             holder["heartbeat_at"] = _now()
             _dequeue(state, agent)
@@ -1331,15 +1501,59 @@ def machine_status() -> dict:
     """Who owns this machine's foreground right now (stale holders evicted first, unless their
     project's editor is still in PIE -- see `_machine_pie_probe`)."""
     live = _live_pie_holds()
+    clients = _live_game_clients()
     _acquire_filelock(MACHINE_SENTINEL)
     try:
-        holder = _machine_holder(live)
+        holder = _machine_holder(live, clients)
         waiters = [_with_labels(w) for w in _load(MACHINE_SENTINEL).get("waiters", [])]
     finally:
         _release_filelock(MACHINE_SENTINEL)
+    # Game clients of a project that does NOT hold the machine were started outside uap while
+    # another project had it (a launcher script, a double-click). uap cannot undo the launch, so
+    # it names them: this is the state "two projects running games at once" looks like.
+    hp = (holder or {}).get("project")
+    conflicts = {k: v for k, v in (clients or {}).items() if k != hp}
     return {"ok": True, "scope": "machine", "enabled": machine_lock_enabled(),
             "holder": _with_labels(holder), "queue": [str(w.get("agent")) for w in waiters],
-            "queue_detail": _queue_detail(waiters)}
+            "queue_detail": _queue_detail(waiters), "game_clients": clients,
+            "conflicts": conflicts}
+
+
+def heartbeat_machine(project: str | None, *, agent: str | None = None) -> bool:
+    """Refresh `agent`'s own machine hold for `project` (the `lease heartbeat` half that keeps a
+    long `2p` / PIE hold alive while it is driven through verbs that never touch the lock)."""
+    agent = agent or default_agent_id()
+    mine = _safe_project(project)
+    _acquire_filelock(MACHINE_SENTINEL)
+    try:
+        state = _load(MACHINE_SENTINEL)
+        ex = state.get("exclusive")
+        if not ex or ex.get("agent") != agent or ex.get("project") != mine:
+            return False
+        ex["heartbeat_at"] = _now()
+        _save(MACHINE_SENTINEL, state)
+        return True
+    finally:
+        _release_filelock(MACHINE_SENTINEL)
+
+
+def track_machine_pids(project: str | None, *, agent: str, pids: list[int]) -> bool:
+    """Tie `agent`'s machine hold to these client processes: it now lives exactly as long as any
+    of them does (see `_holder_alive`). Only a hold `agent` itself took for `project` -- never a
+    teammate's PIE hold it merely passed through, which must not vanish with the clients."""
+    mine = _safe_project(project)
+    _acquire_filelock(MACHINE_SENTINEL)
+    try:
+        state = _load(MACHINE_SENTINEL)
+        ex = state.get("exclusive")
+        if not ex or ex.get("agent") != agent or ex.get("project") != mine:
+            return False
+        ex["pids"] = sorted({int(p) for p in (ex.get("pids") or [])} | {int(p) for p in pids})
+        ex["pid"] = 0
+        _save(MACHINE_SENTINEL, state)
+        return True
+    finally:
+        _release_filelock(MACHINE_SENTINEL)
 
 
 def wait_if_blocked(project: str | None, *, agent: str | None = None,

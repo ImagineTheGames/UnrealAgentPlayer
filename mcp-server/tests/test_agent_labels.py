@@ -189,8 +189,10 @@ def test_requested_by_flag_wins_and_same_agent_is_not_its_own_requester(monkeypa
     assert main(["lease", "acquire", "exclusive", "--agent", "pcgprof", "--project", "demo",
                  "--wait", "0"]) == 0
     assert _status(capsys)["exclusive"]["requested_by"] == ""
-    assert main(["lease", "acquire", "exclusive", "--agent", "rebuild-9", "--requested-by", "bob",
-                 "--project", "demo2", "--wait", "0"]) == 0
+    # `--reason rebuild`, as Restart-Editor.ps1 takes it: an exclusive lease for any other reason
+    # now also takes the machine-wide lock, which project `demo` already holds.
+    assert main(["lease", "acquire", "exclusive", "--reason", "rebuild", "--agent", "rebuild-9",
+                 "--requested-by", "bob", "--project", "demo2", "--wait", "0"]) == 0
     capsys.readouterr()
     assert main(["lease", "status", "--project", "demo2"]) == 0
     assert json.loads(capsys.readouterr().out)["exclusive"]["requested_by"] == "bob"

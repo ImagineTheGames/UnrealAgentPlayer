@@ -7,8 +7,10 @@ from typing import Any
 
 import httpx
 
+from unreal_agent_player import coordination as _coord
 from unreal_agent_player.errors import ErrorCode, error_response, ok_response
 from unreal_agent_player.instances import InstanceRegistry
+from unreal_agent_player.tools import machine as _machine
 
 _PROCS: dict[str, subprocess.Popen] = {}
 _RUNTIME_OBJ = "/Script/UnrealAgentPlayerRuntime.Default__UAPAgentRuntimeSubsystem"
@@ -59,17 +61,34 @@ async def game_launch(
     target: str = "standalone", map: str | None = None,
     extra_args: list[str] | None = None, no_vr: bool = True,
 ) -> dict[str, Any]:
+    # A game client is a game window: it needs the machine-wide lock exactly as PIE does, and holds
+    # it for as long as the process lives (the hold tracks its pid and frees itself on exit).
+    grant, refusal = _machine.take_sticky("game:launch")
+    if refusal is not None:
+        return refusal
     port = registry.next_free_port()
-    proc = _spawn(port, map, extra_args, no_vr)
+    try:
+        proc = _spawn(port, map, extra_args, no_vr)
+    except Exception:
+        _machine.give_back(grant)
+        raise
+    pid = getattr(proc, "pid", None)
+    if grant is not None and grant.get("acquired") and pid:
+        try:
+            _coord.track_machine_pids(_machine.machine_project(), agent=grant.get("agent"),
+                                      pids=[int(pid)])
+        except Exception:
+            pass                         # the process scan still sees the client
     if not await _wait_rc_ready(port):
         try:
             proc.kill()
         except Exception:
             pass
+        _machine.give_back(grant)
         return error_response(ErrorCode.GAME_LAUNCH_FAILED, f"Instance on port {port} did not answer RemoteControl in time.")
-    iid = registry.register(port=port, pid=getattr(proc, "pid", None))
+    iid = registry.register(port=port, pid=pid)
     _track_proc(iid, proc)
-    return ok_response({"instance_id": iid, "port": port, "pid": getattr(proc, "pid", None)})
+    return ok_response({"instance_id": iid, "port": port, "pid": pid})
 
 
 async def game_attach(

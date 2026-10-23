@@ -5,6 +5,7 @@ import time
 from typing import Any
 
 from unreal_agent_player.errors import AgentError, ErrorCode
+from unreal_agent_player.tools import machine as _machine
 from unreal_agent_player.transport import SUBSYSTEM_OBJECT_PATH, RemoteControlClient
 
 
@@ -55,6 +56,11 @@ async def pie_start(
         raise AgentError(
             ErrorCode.SCHEMA_VALIDATION, f"Unknown PIE mode: {mode}", recoverable=False
         )
+    # PIE (and PlayInNewWindow, a game window of its own) needs the machine-wide lock, held for the
+    # session, exactly like the CLI's `pie start`. Refused, not queued: see tools/machine.py.
+    grant, refusal = _machine.take_sticky("pie:start")
+    if refusal is not None:
+        return refusal
     lines = ["import unreal"]
     if map_path:
         lines.append(f"unreal.EditorLoadingAndSavingUtils.load_map('{map_path}')")
@@ -72,7 +78,11 @@ async def pie_start(
         # UE 5.7: editor_play() does not exist; editor_request_begin_play() starts PIE.
         lines.append("_les.editor_request_begin_play()")
     t0 = time.monotonic()
-    py_exec.exec_python("\n".join(lines))
+    try:
+        py_exec.exec_python("\n".join(lines))
+    except Exception:
+        _machine.give_back(grant)
+        raise
     if not wait:
         # Opt-in fire-and-forget. RequestPlaySession only QUEUES the session and the editor tick
         # creates the play world later, so the phase below is not "the world exists" -- which is
@@ -131,6 +141,8 @@ async def pie_stop(*, rc: RemoteControlClient, py_exec: Any,
         await asyncio.sleep(_PIE_STOP_POLL_SECONDS)
         phase = await _get_phase(rc)
     stopped = phase == "NotPlaying"
+    if stopped:
+        _machine.release_project()      # the session the machine was held for is over
     out: dict[str, Any] = {"ok": stopped, "stopped": stopped, "phase": phase}
     if not stopped:
         out["error"] = (f"PIE still in phase {phase!r} {timeout}s after the stop request -- the "

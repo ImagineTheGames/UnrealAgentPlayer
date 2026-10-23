@@ -264,9 +264,9 @@ up or unknown the queue is untouched.
   carry the same `lease_evicted` note. Re-acquiring clears it.
 - `uap lease status` shows `last_eviction` (agent, held reason, `why`, `evicted_at`, message).
 
-It also frees the holder's machine-wide foreground lock (see below), which `lease acquire ...
---reason pie` normally takes alongside the project lease: otherwise the OTHER project would sit
-out that hold's TTL for a session that no longer exists.
+It also frees the holder's machine-wide foreground lock (see below), which every exclusive
+`lease acquire` except `rebuild*` takes alongside the project lease: otherwise the OTHER project
+would sit out that hold's TTL for a session that no longer exists.
 
 ## Two projects, one workstation (the machine-wide foreground lock)
 
@@ -296,12 +296,29 @@ callers WAIT, exactly as they do for an exclusive project lease, and on the cap 
 `{"ok": false, "busy": true, "blocked_by": "<agent>", "project": "SchoolsOut", "scope": "machine"}`
 with exit 1.
 
+Also taken, because each is one of those verbs by another name:
+- `uap rc StartPIE` / `StartPIEMode` (sticky, like `pie start`), `uap rc StopPIE` / `StopPIEEx`
+  (never waits, like `pie stop`; frees the hold once `IsPIEInProgress` confirms PIE is down), and
+  the `rc` input / foreground functions (`InjectKey`, `InjectAxis`, `InjectGamepad`,
+  `InjectMouseButton`, `InjectMouseMove`, `SetMousePosition`, `ClickMouse`, `HoldKey`, `HoldAxis`,
+  `InjectXRButton`, `InjectXRControllerPose`, `NavigateUI`, `SelectTab`, `FocusEditorWindow`,
+  `CaptureViewportWithUI`, `DumpViewportUI`; transient, like `input`).
+- `uap exec` / `exec-file` whose Python requests a play session (`editor_request_begin_play`,
+  `editor_play_simulate`, `request_play_session`, the plugin's `start_pie` / `start_pie_mode`):
+  sticky, like `pie start`. Python that only stops PIE (`editor_request_end_play`, `stop_pie`) is
+  treated like `pie stop`.
+- `uap batch` steps: each goes through the same guard path as the verb typed alone.
+- The MCP server's `pie_start` (every mode, `PlayInNewWindow` included) and `game_launch`: sticky,
+  refused rather than queued (an MCP call must not block for 15 minutes), fail closed. `pie_stop`
+  frees the hold on a confirmed stop. `game_launch` ties its hold to the client's pid.
+
 **What does not:** `status`, `log`, `sample`, `helpers` -- read-only, and they are the verbs you
-reach for *while* diagnosing a locked machine. Nor `rc` / `exec` / `exec-file`: those can do
-anything, but they are the generic transport for ordinary project-scoped work, and gating every
+reach for *while* diagnosing a locked machine. Nor ordinary `rc` / `exec` / `exec-file`: those can
+do anything, but they are the generic transport for ordinary project-scoped work, and gating every
 one of them on the other project's PIE session would serialize the two projects almost completely
 -- a far bigger behaviour change than the clash being fixed. They stay governed by the project
-lease.
+lease. `exec` Python that starts PIE through an API the pattern above does not know is not
+caught; a `-game` process it launches is still caught by the client scan below.
 
 **Same-project calls pass straight through.** The lock arbitrates BETWEEN projects only; within a
 project, turn-taking already has an owner (the exclusive lease) and a second gate there would
@@ -333,14 +350,59 @@ cannot use), unless that agent's own editor is in PIE: then the lease is kept, b
 live session to a teammate is what `lease release` refuses, and the hint says to `pie stop` and
 re-acquire. Agents without a lease still wait their turn as before.
 
-**Explicit holds:** `uap lease acquire exclusive --reason pie|level|input ... --agent <tok>` takes
-both turns; if the machine is denied it gives the project lease back rather than half-holding.
-`--reason rebuild` does NOT take the machine: a rebuild is CPU-heavy but takes neither the keyboard
-nor a game window, and blocking the other project for a 20-minute rebuild TTL is the worse trade.
+**Explicit holds:** `uap lease acquire exclusive --reason <anything> ... --agent <tok>` takes both
+turns; if the machine is denied it gives the project lease back rather than half-holding. Every
+exclusive reason takes it (`pie`, `level:<path>`, `2p`, `soak`, an empty reason) except
+`rebuild*` and `relaunch*`. Shared leases never do.
+
+This used to be an allow-list (`pie`, `level`, `input`, `screenshot`, `click`, `nav`). On
+2026-10-22 School's Out held its project lease with `--reason 2p` for a two-client test, which was
+not on the list, so it took no machine turn; eleven minutes later Project Broken Wings was granted
+the machine and started PIE while both School's Out clients were still up. An allow-list fails
+open on every reason nobody thought of, so it is now the other way round.
+
+`--reason rebuild` (and `relaunch`, its second half) does NOT take the machine: a rebuild is
+CPU-heavy but takes neither the keyboard nor a game window, and blocking the other project for a
+20-minute rebuild TTL is the worse trade. `uap lease heartbeat --agent <tok>` refreshes the
+agent's machine hold along with its lease, for a session driven through verbs that never touch the
+machine lock (`screenshot --window`, `exec --instance`).
 `uap lease release` hands back both -- the project's machine hold only for the agent that held the
 project's exclusive lease; any other caller frees only a machine hold it took itself. Releases are
 always scoped to the caller's project, so the same agent token in both projects cannot free the
 other project's session.
+
+**Running game clients hold it too.** A standalone or packaged game client is a game window: it
+takes the GPU, the foreground and, for a test, the keyboard, exactly as PIE does. But nothing that
+starts one goes through a guarded uap verb (`launch_2p_standalone.ps1` runs
+`Start-Process UnrealEditor.exe <proj>.uproject -game`; a packaged build is double-clicked), so the
+machine lock used to read "free" while they ran. Now every look at the machine lock (each `acquire`
+poll, `lease status`, `lease machine-status`) also scans the process list:
+
+- A client is `UnrealEditor*.exe <project>.uproject -game`, or a packaged
+  `<Project>[-<Platform>-<Config>].exe` under a `Binaries` folder for a project that has a lease
+  file on this machine. Never the editor itself, and never a windowless `-server` / `-nullrhi`
+  process.
+- With the lock free and a project's clients running, the clients hold it for that project, as
+  agent `game-clients` with their pids (`"adopted": true`). The other project waits for them like
+  any other holder; its `busy` answer names the project and the pids. Same-project calls pass
+  through as usual.
+- The hold lives exactly as long as the clients: it is not aged out by TTL while any of them is
+  alive, and it is gone the moment the last one exits (crash, close or kill). No stale lock.
+- A sticky request from the clients' own project (`pie start`, `lease acquire ... --reason 2p`)
+  takes the hold over, so the agent's session does not lose the machine when the clients exit. An
+  agent's sticky hold is also kept alive (heartbeat refreshed) while its project's clients run.
+- Clients of a project that does NOT hold the machine were started outside uap under the other
+  project's turn. uap cannot undo a launch, so `lease machine-status` / `lease status` list them
+  under `conflicts`, and the moment the holder lets go the clients' project holds the machine.
+- `machine-release --force` cannot break a clients' hold (the next look re-adopts it): close the
+  clients.
+- Fail safe: if the process list cannot be read the scan answers "cannot tell" and changes
+  nothing. `UAP_GAME_CLIENT_PROBE=0` turns the scan off (an escape hatch, like
+  `UAP_MACHINE_LOCK=0`). It costs about 25 ms uncached and is cached for 1 s.
+
+For a two-client test, take the turn BEFORE launching: `uap lease acquire exclusive --reason 2p
+--agent <tok> --wait 900`, then run the launcher. If the other project is playing, the acquire
+waits and then refuses, and the clients are never started.
 
 **Inspecting and breaking it:** `uap lease status` now reports the machine holder beside the
 project lease (a project lease that reads "free" explains nothing when the blocker is the other

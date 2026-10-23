@@ -2168,9 +2168,15 @@ TWO PROJECTS ON ONE MACHINE (a second lock, above the per-project lease)
   the busy answer names the project holding it. Automatic -- nothing to remember.
   Calls from your own project pass straight through, so working alone never waits.
   `pie start` holds the machine until `pie stop`; everything else holds it for one call.
+  `lease acquire exclusive` takes it too, for ANY reason except rebuild*/relaunch* (a `2p`
+  two-client test included), and keeps it until `lease release`.
+  Running standalone/packaged game clients (launch_2p_standalone.ps1, a packaged build) hold it
+  for their project on their own, until the last one exits.
+  `rc` StartPIE*/StopPIE*/input functions and `exec` Python that starts PIE are gated like
+  `pie start` / `pie stop` / `input`.
   uap lease machine-status                  which project owns the foreground right now
   uap lease machine-release [--force]       hand it back / break a hold left by a dead session
-  Read-only verbs (status, log, sample, helpers) and rc/exec never take it.
+  Read-only verbs (status, log, sample, helpers) and ordinary rc/exec never take it.
   $UAP_MACHINE_LOCK=0 disables it entirely (escape hatch, not a setting).
 
 DRIVE + OBSERVE
@@ -2377,15 +2383,29 @@ _LEASE_GUARDED = _REBUILD_GUARDED - {"status"}
 # you diagnose), and `rc` / `exec` / `exec-file`. Those last three CAN do anything, but they are
 # the generic transport for ordinary project-scoped work; gating every one of them on the other
 # project's PIE session would make two projects serialize almost completely, which is a far bigger
-# behaviour change than the clash being fixed. They remain governed by the per-project lease.
+# behaviour change than the clash being fixed. They remain governed by the per-project lease --
+# except for the `rc` functions and `exec` Python that ARE one of these verbs by another name
+# (start / stop PIE, inject input); see `_machine_guard`.
 _MACHINE_GUARDED = {"pie", "input", "screenshot", "click", "tab", "nav", "read-ui"}
 
-# `uap lease acquire --reason <r>` for one of these is a declaration that the agent is about to
-# hold the foreground across several calls, so it takes the machine lock too. `rebuild` is absent
-# on purpose: a rebuild is CPU-heavy but it neither takes the keyboard nor runs a game window, and
-# blocking the other project for a 20-minute rebuild TTL would be a worse trade than the
-# contention it avoids.
-_FOREGROUND_REASONS = ("pie", "level", "input", "screenshot", "click", "nav")
+# `uap rc <func>` reaches the same plugin verbs the guarded verbs use, so the functions that start
+# PIE, stop it, or inject input / need the foreground are gated exactly like `pie start`,
+# `pie stop` and `input`. Read-only functions (GetPIEPhase, IsInPIE, GetLogsSince ...) are not.
+_RC_PIE_START = {"StartPIE", "StartPIEMode"}
+_RC_PIE_STOP = {"StopPIE", "StopPIEEx"}
+_RC_FOREGROUND = {"InjectKey", "InjectAxis", "InjectGamepad", "InjectMouseButton",
+                  "InjectMouseMove", "SetMousePosition", "ClickMouse", "HoldKey", "HoldAxis",
+                  "InjectXRButton", "InjectXRControllerPose", "NavigateUI", "SelectTab",
+                  "FocusEditorWindow", "CaptureViewportWithUI", "DumpViewportUI"}
+
+# `uap exec` / `exec-file` stay ungated (they are the generic transport), EXCEPT for Python that
+# requests a play session: that is a `pie start` by another name and holds the machine the same
+# way. Matched on the editor APIs that start (or stop) PIE, including the plugin's own.
+_EXEC_PIE_START_RE = re.compile(
+    r"\b(editor_request_begin_play|editor_play_simulate|editor_request_play_session|"
+    r"request_play_session|start_pie(_mode)?|StartPIE(Mode)?|RequestPlaySession)\b")
+_EXEC_PIE_STOP_RE = re.compile(
+    r"\b(editor_request_end_play|stop_pie(_ex)?|StopPIE(Ex)?|RequestEndPlayMap)\b")
 
 
 def _pie_state_for_lease(project: str | None) -> tuple[bool | None, str]:
@@ -2455,7 +2475,7 @@ def _lease_inner(args) -> int:
         # workstation, not just this project's editor, so take the machine turn as well. If the
         # OTHER project has it, give the project lease straight back rather than sitting on a
         # half-held claim that blocks this project's other agents for nothing.
-        if res.get("granted") and _is_foreground_reason(args.reason) \
+        if res.get("granted") and _lease_takes_machine(args.mode, args.reason) \
                 and _coord.machine_lock_enabled():
             mach = _coord.acquire_machine(proj, reason=args.reason, agent=res["agent"],
                                           pid=args.pid, wait=args.wait, ttl=args.ttl, task=task)
@@ -2502,6 +2522,14 @@ def _lease_inner(args) -> int:
                 project_wide=bool(res.get("was_exclusive") or res.get("lease_evicted")))
     elif cmd == "heartbeat":
         res = _coord.heartbeat(proj, agent=args.agent, task=_task_label(args))
+        # ...and the machine hold that went with the lease. A `2p` session is driven through
+        # `screenshot --window` and `exec --instance`, which never touch the machine lock, so
+        # without this the hold aged out under a live two-client test.
+        try:
+            res["machine_refreshed"] = _coord.heartbeat_machine(
+                proj, agent=args.agent or _coord.default_agent_id())
+        except _coord.CoordinationError:
+            res["machine_refreshed"] = False
     else:  # status
         res = _coord.status(proj)
         # Contention is only legible with both scopes side by side: "my project lease is free"
@@ -2511,9 +2539,20 @@ def _lease_inner(args) -> int:
     return 0 if res.get("ok", True) else 1
 
 
-def _is_foreground_reason(reason: str) -> bool:
-    """Does `--reason` declare a hold on the keyboard / foreground window / a PIE session?"""
-    return (reason or "").strip().lower().split(":")[0] in _FOREGROUND_REASONS
+def _lease_takes_machine(mode: str, reason: str) -> bool:
+    """Does this `lease acquire` also take the machine-wide lock?
+
+    Every EXCLUSIVE lease does, whatever its reason, except `rebuild*` / `relaunch*`. It used to be
+    a fixed list (pie / level / input / screenshot / click / nav), so School's Out's `--reason 2p`
+    -- a two-client game test, the most foreground-hungry thing either project does -- took only
+    its project lease, and Project Broken Wings was granted the machine and started PIE under it
+    (2026-10-22). An allow-list fails open on every reason nobody thought of; this fails closed.
+
+    A rebuild stays exempt: it is CPU-heavy but takes neither the keyboard nor a game window, and
+    blocking the other project for a 20-minute rebuild TTL is the worse trade. Shared leases are
+    concurrent reads and never take it.
+    """
+    return mode == "exclusive" and not _coord._is_rebuild_reason(reason)
 
 
 def _env_project() -> str:
@@ -2836,7 +2875,9 @@ def build_parser() -> argparse.ArgumentParser:
                         help="block until an exclusive|shared lease is free, then take it")
     la.add_argument("mode", choices=["exclusive", "shared"])
     la.add_argument("--reason", default="",
-                    help="rebuild|pie|level|... (rebuild* makes other agents' ops auto-wait)")
+                    help="rebuild|pie|level|2p|... (rebuild* makes other agents' ops auto-wait; "
+                         "every exclusive reason except rebuild*/relaunch* also takes the "
+                         "machine-wide lock)")
     # --agent comes from the shared `proj` parent (also honours $UAP_AGENT_ID). It is REQUIRED for
     # a hold spanning multiple calls -- this harness has no reliable auto-id -- and it is the same
     # token your later editor ops must carry, or your own lease will block you.
@@ -3136,6 +3177,15 @@ def _machine_denied(args, cmd: str, project: str, agent: str, machine: dict,
                     "Wait for it, or if that session is gone: "
                     "`uap lease machine-status`, then "
                     "`uap lease machine-release --force`. $UAP_MACHINE_LOCK=0 disables it."}
+    holder = machine.get("holder") or {}
+    if holder.get("adopted") or holder.get("agent") == _coord.GAME_CLIENTS_AGENT:
+        pids = ", ".join(str(p) for p in holder.get("pids") or [])
+        body["pids"] = holder.get("pids") or []
+        body["hint"] = (f"standalone game client(s) of project {holder.get('project')!r} are "
+                        f"running (pids {pids}). A game window takes the machine just as PIE "
+                        "does, so they hold the machine-wide lock until the last one exits; it "
+                        "frees itself then. Ask that project's agents to close them. "
+                        "`uap lease machine-status` shows them.")
     if machine.get("coordination_unsafe"):
         body["coordination_unsafe"] = True
         body["error"] = machine.get("error", "")
@@ -3179,24 +3229,62 @@ def _machine_pie_probe(project: str) -> bool | None:
 _coord._machine_pie_probe = _machine_pie_probe
 
 
+def _exec_code_of(args, cmd: str) -> str:
+    """The Python an `exec` / `exec-file` call will run ("" if it cannot be read here)."""
+    if cmd == "exec":
+        return str(getattr(args, "code", "") or "")
+    try:
+        with open(args.path, encoding="utf-8") as f:
+            return f.read()
+    except (OSError, UnicodeDecodeError, AttributeError):
+        return ""
+
+
+def _machine_guard(args, cmd: str | None) -> str | None:
+    """How this call relates to the machine lock: None (not at all), "transient" (needs the
+    foreground for this call), "sticky" (starts a game session that outlives the call) or "stop"
+    (ends one: never waits, frees the hold once the stop is confirmed)."""
+    if cmd == "pie":
+        sub = getattr(args, "pie_cmd", "")
+        return {"start": "sticky", "stop": "stop"}.get(sub, "transient")
+    if cmd in _MACHINE_GUARDED:
+        return "transient"
+    if cmd == "rc":
+        func = getattr(args, "rc_func", "")
+        if func in _RC_PIE_START:
+            return "sticky"
+        if func in _RC_PIE_STOP:
+            return "stop"
+        return "transient" if func in _RC_FOREGROUND else None
+    if cmd in ("exec", "exec-file"):
+        code = _exec_code_of(args, cmd)
+        if _EXEC_PIE_START_RE.search(code):
+            return "sticky"
+        if _EXEC_PIE_STOP_RE.search(code):
+            return "stop"
+    return None
+
+
 def _run_under_machine_lock(args, cmd: str | None, project: str) -> int:
     """Take the machine-wide foreground turn (if this verb needs it), run the verb, hand it back.
 
     Two hold shapes, because two lifetimes:
-      * `pie start` takes a STICKY hold (pid 0, so it outlives this short-lived process) -- what it
-        is holding is the PIE SESSION, which lives on after the command returns. `pie stop` frees
-        it; otherwise the TTL does, the same way an abandoned project lease is reclaimed.
-      * every other guarded verb takes a TRANSIENT hold, released in `finally` -- it only needs the
-        foreground for the duration of the call.
+      * a session start (`pie start`, `rc StartPIE*`, `exec` that requests a play session) takes a
+        STICKY hold (pid 0, so it outlives this short-lived process) -- what it is holding is the
+        PIE SESSION, which lives on after the command returns. A confirmed stop frees it;
+        otherwise the TTL does, the same way an abandoned project lease is reclaimed.
+      * every other guarded call takes a TRANSIENT hold, released in `finally` -- it only needs
+        the foreground for the duration of the call.
     A call whose project already holds the lock passes straight through and releases nothing.
     """
-    sticky = cmd == "pie" and getattr(args, "pie_cmd", "") == "start"
-    # `pie stop` hands the foreground BACK. Queueing it behind the other project's hold only keeps
+    shape = _machine_guard(args, cmd)
+    sticky = shape == "sticky"
+    # A stop hands the foreground BACK. Queueing it behind the other project's hold only keeps
     # both sessions alive longer (and, with a hold lost to a bug, left an agent unable to stop the
     # PIE it should never have been running).
-    stopping = cmd == "pie" and getattr(args, "pie_cmd", "") == "stop"
+    stopping = shape == "stop"
     machine = None
-    if cmd in _MACHINE_GUARDED and not stopping and _coord.machine_lock_enabled():
+    if shape in ("transient", "sticky") and _coord.machine_lock_enabled():
         agent = getattr(args, "agent", None) or _coord.default_agent_id()
         # An agent that holds its project's exclusive lease must not sit in the machine queue:
         # every teammate is queued behind that lease for as long as it waits (2026-10-22, four
@@ -3227,12 +3315,39 @@ def _run_under_machine_lock(args, cmd: str | None, project: str) -> int:
         if machine is not None and machine.get("acquired") and not sticky:
             _release_machine_quiet(agent=machine.get("agent"), project=project,
                                    project_wide=False)
-    # A CONFIRMED `pie stop` is what ends the sticky hold: the session the other project was
-    # waiting on is genuinely over. Only on success -- a stop that failed left PIE running.
-    if rc == 0 and cmd == "pie" and getattr(args, "pie_cmd", "") == "stop":
-        _release_machine_quiet(agent=getattr(args, "agent", None) or _coord.default_agent_id(),
-                               project=project)
+    # A CONFIRMED stop is what ends the sticky hold: the session the other project was waiting on
+    # is genuinely over. Only on success -- a stop that failed left PIE running. `pie stop`
+    # confirms the teardown itself; a raw `rc StopPIE*` / `exec` stop only asks for one, so ask
+    # the editor before handing the machine over.
+    if rc == 0 and stopping:
+        if cmd == "pie" or _pie_down_confirmed(project, _RAW_STOP_CONFIRM_SECONDS):
+            _release_machine_quiet(
+                agent=getattr(args, "agent", None) or _coord.default_agent_id(), project=project)
+    # A raw start (`rc StartPIE*`, `exec`) that this call took a sticky hold for, but which left
+    # no session -- it failed, or the exec only MENTIONED a start API -- gives the hold straight
+    # back instead of blocking the other project until the TTL. IsPIEInProgress counts a queued
+    # start, so a start that is merely still coming up keeps it.
+    elif sticky and cmd != "pie" and machine is not None and machine.get("acquired") \
+            and _pie_state_for_lease(project or None)[0] is False:
+        _release_machine_quiet(agent=machine.get("agent"), project=project, project_wide=False)
     return rc
+
+
+# How long a raw stop (`rc StopPIE*`, `exec`) is given to finish tearing down before the machine
+# hold is kept (it then ages out on the TTL, refreshed only while that editor is still in PIE).
+_RAW_STOP_CONFIRM_SECONDS = 5.0
+
+
+def _pie_down_confirmed(project: str | None, seconds: float) -> bool:
+    """True once the editor positively answers "not in PIE" (live or queued) within `seconds`."""
+    deadline = time.monotonic() + max(0.0, seconds)
+    while True:
+        live, _how = _pie_state_for_lease(project or None)
+        if live is False:
+            return True
+        if live is None or time.monotonic() >= deadline:
+            return False
+        time.sleep(0.25)
 
 
 if __name__ == "__main__":
