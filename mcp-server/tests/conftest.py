@@ -73,3 +73,9 @@ def _no_live_editor_probe(monkeypatch):
     # (the lease-contention tests spawn real workers that take `pie` leases).
     monkeypatch.setenv("UAP_EDITOR_LIVENESS", "0")
     _coordination._EDITOR_CACHE.clear()
+    # ...and for the machine lock's game-client scan, which would otherwise see the developer's
+    # REAL standalone clients (a two-client test in another project) and refuse a test's
+    # `pie start`. "Cannot tell" (None) changes nothing; tests of it install their own probe.
+    monkeypatch.setattr(_coordination, "_game_client_probe", lambda: None)
+    monkeypatch.setenv("UAP_GAME_CLIENT_PROBE", "0")
+    _coordination._GAME_CLIENT_CACHE.clear()

@@ -30,6 +30,7 @@ class ErrorCode(str, Enum):
     INSTANCE_NOT_FOUND = "INSTANCE_NOT_FOUND"
     GAME_LAUNCH_FAILED = "GAME_LAUNCH_FAILED"
     REPORT_NO_SESSION = "REPORT_NO_SESSION"
+    MACHINE_BUSY = "MACHINE_BUSY"
 
     @classmethod
     def domain_of(cls, code: ErrorCode) -> str:
