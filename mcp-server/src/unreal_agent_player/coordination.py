@@ -347,7 +347,8 @@ def _release_filelock(project: str | None) -> None:
 
 def _blank() -> dict:
     return {"generation": 0, "exclusive": None, "shared": [], "waiters": [], "evicted": {},
-            "last_eviction": None, "activity": {}}
+            "last_eviction": None, "activity": {}, "pie_session": None, "pending_reap": None,
+            "last_reap": None, "unowned_pie": None, "inflight": {}}
 
 
 _LOAD_RETRIES = 5
@@ -391,6 +392,11 @@ def _load(project: str | None) -> dict:
                     state.setdefault("evicted", {})
                     state.setdefault("last_eviction", None)
                     state.setdefault("activity", {})
+                    state.setdefault("pie_session", None)
+                    state.setdefault("pending_reap", None)
+                    state.setdefault("last_reap", None)
+                    state.setdefault("unowned_pie", None)
+                    state.setdefault("inflight", {})
                     return state
                 detail = f"top level is {type(state).__name__}, not an object"
         if attempt < _LOAD_RETRIES - 1:
@@ -760,7 +766,11 @@ def _refresh(project: str | None) -> tuple[dict, dict | None]:
     Returns (state, eviction record or None); the caller saves, and after releasing the lock hands
     the record to `_after_eviction`.
     """
-    state = _evict_stale(_load(project))
+    state = _load(project)
+    aged_out = _ttl_expired_exclusive(state, project)
+    state = _evict_stale(state)
+    if aged_out is not None and state.get("exclusive") is None:
+        _note_pending_reap(state, aged_out)
     evicted = _evict_dead_editor(state, project)
     _evict_stale_waiters(state)
     _rebuild_first(state, project)
@@ -948,6 +958,9 @@ def acquire(project: str | None, mode: str, *, reason: str = "", agent: str | No
     ahead: list[str] = []
     queue_len = 0
     while True:
+        # A holder that aged out may have left its PIE running: stop that BEFORE the editor is
+        # handed to the next agent, not after it has started driving a session that is not its own.
+        reap_stale_pie(project)
         _acquire_filelock(project)
         evicted = None
         try:
@@ -956,7 +969,8 @@ def acquire(project: str | None, mode: str, *, reason: str = "", agent: str | No
             if not mine:
                 _enqueue(state, agent, mode, reason, task, requested_by)
                 _rebuild_first(state, project)      # a fresh rebuild request may jump the queue
-            if _grantable(state, mode, agent) and (mine or _turn_ok(state, mode, agent)):
+            if _grantable(state, mode, agent) and (mine or _turn_ok(state, mode, agent)) \
+                    and (mine or _reaper_holder(state) is None):
                 _dequeue(state, agent)
                 # A fresh grant supersedes any "you were evicted" note this agent had pending.
                 state.get("evicted", {}).pop(agent, None)
@@ -978,7 +992,8 @@ def acquire(project: str | None, mode: str, *, reason: str = "", agent: str | No
                         "generation": state.get("generation", 0),
                         "queued_seconds": round(_now() - started, 1),
                         "queue_length": len(state.get("waiters", []))}
-            holder = state.get("exclusive") or (state.get("shared") or [None])[0]
+            holder = (state.get("exclusive") or (state.get("shared") or [None])[0]
+                      or _reaper_holder(state))
             position = _queue_position(state, agent)
             ahead = _queue_ahead(state, agent)
             queue_len = len(state.get("waiters", []))
@@ -1138,6 +1153,7 @@ def bump_generation(project: str | None) -> int:
 
 
 def status(project: str | None) -> dict:
+    reap_stale_pie(project)          # `lease status` is a reaper run too (opportunistic)
     evicted = None
     _acquire_filelock(project)
     try:
@@ -1187,6 +1203,464 @@ def wait_while_rebuild(project: str | None, *, wait: float = DEFAULT_WAIT_CAP) -
             return {"ok": False, "timed_out": True, "holder": holder}
         waited = True
         time.sleep(POLL_SECONDS)
+
+
+# ----------------------------------------------------------------------------------------------
+# Stale PIE reaper
+#
+# A lease ageing out freed the LEASE and nothing else. 2026-10-23: agent `gpufoliage` was in PBW
+# PIE when it hit its turn limit and stopped without handing off. Its `pie` lease aged out on the
+# 600s TTL, but PIE kept running in the PBW editor for about 1.5 hours, holding the machine-wide
+# lock (a live PIE session keeps a stale machine hold alive, see `_live_pie_holds`), stealing focus
+# from the other project and burning the GPU, until a human noticed.
+#
+# So a session uap started is stopped once nobody is driving it:
+#   * `lease_ttl`: a non-rebuild exclusive lease aged out on its TTL (the holder made no uap call
+#     for that long) and the editor is still in PIE;
+#   * `orphan`: nobody holds the lease, PIE is still running, and no uap call has touched this
+#     project's editor for the idle window (an agent that ran `pie start` without a lease).
+# Rules:
+#   * NEVER a human's PIE. Only a session uap itself started (`pie_session`, written by
+#     `note_pie_started`) is ever stopped, and the running session must be provably THAT one: its
+#     start time (now - GetPIEElapsedSeconds) has to fall inside the window the uap start was
+#     made in. A session uap cannot identify is reported (`unowned_pie`) and left alone.
+#   * Any uap call that reads lease state may run it (it is opportunistic); two racing callers are
+#     serialized by a claim taken under the filelock, so exactly one of them stops PIE.
+#   * The probes are network round trips to the editor, so they never run inside the filelock.
+#   * Never while a rebuild holds the project, a live holder owns the lease, or another uap call
+#     is mid-flight against this editor (`inflight`).
+#   * $UAP_PIE_REAPER=0 turns it off.
+# The CLI installs the two seams below (an RC-backed probe and its confirmed `pie stop`). With
+# either missing (the MCP server, the test suite by default) the reaper does nothing.
+# ----------------------------------------------------------------------------------------------
+EVICT_STALE_PIE = "stale_pie_reaped"
+REAP_FAILED = "stale_pie_reap_failed"
+REAPER_AGENT = "uap-reaper"
+_PIE_REAPER_OFF = {"0", "false", "no", "off"}
+_REAP_CHECK_INTERVAL = 15.0       # at most one probe per project per this many seconds
+_REAP_CLAIM_TTL = 120.0           # a claim older than this belonged to a reaper that died
+_SESSION_SLACK = 5.0              # clock/RC slack before the uap start request
+_SESSION_CONFIRMED_SLACK = 30.0   # play world confirmed live -> PostPIEStarted, at most this later
+_SESSION_UNCONFIRMED_WINDOW = 300.0   # a start nobody watched come up (`--no-wait`, rc, exec)
+_PENDING_REAP_MAX_AGE = 3600.0    # an eviction whose editor never answered stops being chased
+_INFLIGHT_MAX_AGE = 7200.0        # a call record this old belongs to a process that was killed
+
+# "Is PIE running in this project's editor, and since when?" ->
+#   {"in_progress": True/False/None, "started_at": unix seconds or None}
+_pie_session_probe: Callable[[str], dict | None] | None = None
+# Stop PIE in this project's editor and confirm it: -> {"stopped": bool, ...}
+_pie_stopper: Callable[[str], dict] | None = None
+
+
+def pie_reaper_enabled() -> bool:
+    """False disables the stale-PIE reaper entirely ($UAP_PIE_REAPER=0)."""
+    raw = os.environ.get("UAP_PIE_REAPER")
+    return not (raw is not None and raw.strip().lower() in _PIE_REAPER_OFF)
+
+
+def reap_idle_seconds() -> float:
+    """How long a uap-started PIE with NO lease holder may go without a uap call before it is
+    reaped. Same as the pie lease TTL by default; $UAP_PIE_REAP_IDLE overrides."""
+    raw = os.environ.get("UAP_PIE_REAP_IDLE")
+    try:
+        return max(0.0, float(raw)) if raw and raw.strip() else float(_TTL_BY_REASON["pie"])
+    except ValueError:
+        return float(_TTL_BY_REASON["pie"])
+
+
+def _ttl_expired_exclusive(state: dict, project: str | None) -> dict | None:
+    """The exclusive holder about to be evicted for INACTIVITY (heartbeat past its TTL), if any.
+
+    Not a rebuild/relaunch (the editor being down is its job), not a pid-tracked client hold, and
+    project scopes only. Call before `_evict_stale`.
+    """
+    ex = state.get("exclusive")
+    if not ex or isinstance(project, _MachineScope) or ex.get("pids"):
+        return None
+    if _is_rebuild_reason(ex.get("reason")):
+        return None
+    if _now() - float(ex.get("heartbeat_at", 0)) <= float(ex.get("ttl", _DEFAULT_TTL)):
+        return None
+    return ex
+
+
+def _note_pending_reap(state: dict, ex: dict) -> None:
+    """Remember that `ex` aged out, so whichever caller runs the reaper next checks its PIE.
+
+    Recorded in the state rather than acted on here because the eviction happens inside the
+    filelock, where the editor must not be probed, and the caller that evicts is not always one
+    that can run the reaper.
+    """
+    state["pending_reap"] = {"agent": ex.get("agent"), "held_reason": ex.get("reason"),
+                             "task": ex.get("task", ""), "heartbeat_at": ex.get("heartbeat_at"),
+                             "ttl": ex.get("ttl"), "evicted_at": _now(), "attempted_at": 0.0}
+
+
+def _other_inflight(state: dict) -> list[str]:
+    """Pids of OTHER uap processes currently running a verb against this editor. Prunes dead ones."""
+    now = _now()
+    me = str(os.getpid())
+    live: dict = {}
+    others: list[str] = []
+    for pid, rec in (state.get("inflight") or {}).items():
+        try:
+            at = float((rec or {}).get("at", 0))
+            alive = now - at < _INFLIGHT_MAX_AGE and _pid_alive(int(pid))
+        except (TypeError, ValueError):
+            alive = False
+        if alive:
+            live[pid] = rec
+            if pid != me:
+                others.append(pid)
+    state["inflight"] = live
+    return others
+
+
+def _reap_claim_fresh(state: dict) -> dict | None:
+    claim = state.get("reaping")
+    if claim and _now() - float(claim.get("at", 0)) < _REAP_CLAIM_TTL:
+        return claim
+    return None
+
+
+def _reaper_holder(state: dict) -> dict | None:
+    """A pseudo-holder while a reap is in progress, so nobody is granted an editor mid-stop."""
+    claim = _reap_claim_fresh(state)
+    if not claim or claim.get("pid") == os.getpid():
+        return None
+    return {"agent": REAPER_AGENT, "reason": "stale_pie_reap", "task": "stopping a stale PIE",
+            "acquired_at": claim.get("at"), "heartbeat_at": claim.get("at"),
+            "ttl": _REAP_CLAIM_TTL, "requested_by": ""}
+
+
+def _reap_cause(state: dict, project: str | None) -> str | None:
+    """Why this project's PIE should be checked right now ("lease_ttl" / "orphan"), or None.
+
+    Cheap and local (no probe): call with the filelock held. May drop a `pending_reap` that a new
+    holder has made moot.
+    """
+    if not pie_reaper_enabled() or _pie_session_probe is None or _pie_stopper is None:
+        return None
+    if isinstance(project, _MachineScope) or _scope_key(project) == "_default":
+        return None
+    if _mid_rebuild(state) or _reap_claim_fresh(state):
+        return None
+    now = _now()
+    pending = state.get("pending_reap")
+    if pending and now - float(pending.get("evicted_at", 0)) > _PENDING_REAP_MAX_AGE:
+        state["pending_reap"] = pending = None
+    if state.get("exclusive"):
+        # A live holder owns the editor now; the session it is driving is its business.
+        if pending:
+            state["pending_reap"] = None
+        return None
+    if _other_inflight(state):
+        return None
+    if pending:
+        if now - float(pending.get("attempted_at", 0)) < _REAP_CHECK_INTERVAL:
+            return None
+        return "lease_ttl"
+    sess = state.get("pie_session")
+    if not sess:
+        return None
+    if now - float(state.get("reap_checked_at", 0) or 0) < _REAP_CHECK_INTERVAL:
+        return None
+    last = max(float(state.get("last_uap_at", 0) or 0), float(sess.get("requested_at", 0) or 0),
+               float(sess.get("confirmed_at", 0) or 0))
+    return "orphan" if now - last > reap_idle_seconds() else None
+
+
+def _session_is_ours(sess: dict | None, started_at) -> bool:
+    """Is the PIE session that started at `started_at` the one uap started (`sess`)?"""
+    if not sess or started_at is None:
+        return False
+    req = float(sess.get("requested_at", 0) or 0)
+    if not req:
+        return False
+    conf = sess.get("confirmed_at")
+    hi = (float(conf) + _SESSION_CONFIRMED_SLACK) if conf else (req + _SESSION_UNCONFIRMED_WINDOW)
+    return req - _SESSION_SLACK <= float(started_at) <= hi
+
+
+def _reap_log(project: str | None, rec: dict) -> None:
+    """Append one line per reaper decision to `<leases>/reaper.log`. Best effort."""
+    try:
+        with open(_leases_dir() / "reaper.log", "a", encoding="utf-8") as f:
+            f.write(json.dumps({"project": _scope_key(project), **rec}) + "\n")
+    except OSError:
+        pass
+
+
+def reap_stale_pie(project: str | None) -> dict | None:
+    """Stop a PIE session uap started that nobody is driving any more. None when nothing to do.
+
+    Safe to call from anywhere that is NOT holding a filelock; it is cheap when there is nothing
+    to do (one locked read). Never raises. See the section comment above for the rules.
+    """
+    if not pie_reaper_enabled() or _pie_session_probe is None or _pie_stopper is None:
+        return None
+    try:
+        return _reap(project)
+    except Exception as exc:
+        return {"reaped": False, "error": f"{type(exc).__name__}: {exc}"}
+
+
+def _reap(project: str | None) -> dict | None:
+    token = uuid.uuid4().hex[:12]
+    evicted = None
+    _acquire_filelock(project)
+    try:
+        state, evicted = _refresh(project)
+        cause = _reap_cause(state, project)
+        if cause:
+            state["reaping"] = {"token": token, "pid": os.getpid(), "at": _now(), "cause": cause}
+            if cause == "lease_ttl":
+                state["pending_reap"]["attempted_at"] = _now()
+            else:
+                state["reap_checked_at"] = _now()
+        sess = dict(state.get("pie_session") or {}) or None
+        pending = dict(state.get("pending_reap") or {}) or None
+        idle_since = float(state.get("last_uap_at", 0) or 0)
+        _save(project, state)
+    finally:
+        _release_filelock(project)
+        _after_eviction(project, evicted)
+    if not cause:
+        return None
+
+    target = str((sess or {}).get("target") or project or "")
+    outcome: dict = {"cause": cause}
+    try:
+        info = _pie_session_probe(target) or {}
+    except Exception as exc:
+        info = {"in_progress": None, "error": f"{type(exc).__name__}: {exc}"}
+    live = info.get("in_progress")
+    started_at = info.get("started_at")
+    outcome.update({"in_progress": live, "session_started_at": started_at})
+    stop: dict | None = None             # None: no stop was attempted
+    owned = live is True and _session_is_ours(sess, started_at)
+    if owned:
+        if _claim_still_ours(project, token, sess):
+            try:
+                stop = _pie_stopper(target) or {}
+            except Exception as exc:
+                stop = {"stopped": False, "error": f"{type(exc).__name__}: {exc}"}
+            outcome["stopped"] = bool(stop.get("stopped"))
+        else:
+            # Somebody took the lease or started a new session while we probed: theirs now.
+            live = "superseded"
+
+    rec = _record_reap(project, token, cause, sess, pending, live, started_at, stop, idle_since,
+                       info)
+    if rec and rec.get("why") == EVICT_STALE_PIE:
+        _release_machine_after_reap(project, rec, sess, pending)
+        _reap_log(project, rec)
+    elif rec:
+        _reap_log(project, rec)
+    return rec or {"reaped": False, **outcome}
+
+
+def _claim_still_ours(project: str | None, token: str, sess: dict | None) -> bool:
+    """Last look before stopping: our claim stands and nobody started a new session or took the
+    lease since we probed."""
+    _acquire_filelock(project)
+    try:
+        state = _load(project)
+        claim = state.get("reaping") or {}
+        cur = state.get("pie_session") or {}
+        return (claim.get("token") == token and not state.get("exclusive")
+                and cur.get("requested_at") == (sess or {}).get("requested_at"))
+    finally:
+        _release_filelock(project)
+
+
+def _record_reap(project, token, cause, sess, pending, live, started_at, stop, idle_since,
+                 info) -> dict | None:
+    """Write what the reaper found and did, and release the claim. Returns the record for a reap
+    (or a failed reap / an unowned session), None for "nothing was running"."""
+    now = _now()
+    key = _scope_key(project)
+    rec: dict | None = None
+    _acquire_filelock(project)
+    try:
+        state = _load(project)
+        if (state.get("reaping") or {}).get("token") == token:
+            state.pop("reaping", None)
+        same_session = (state.get("pie_session") or {}).get("requested_at") == \
+            (sess or {}).get("requested_at")
+        if live == "superseded":
+            pass                         # only the claim is released
+        elif live is False:
+            # Nothing is running: whatever uap started is over (stopped by hand, crashed ...).
+            if same_session:
+                state["pie_session"] = None
+            state["pending_reap"] = None
+            state["unowned_pie"] = None
+        elif live is None:
+            # The editor did not answer. If it is verifiably gone, so is any session in it.
+            try:
+                gone = _editor_probe(project) is False
+            except Exception:
+                gone = False
+            if gone:
+                if same_session:
+                    state["pie_session"] = None
+                state["pending_reap"] = None
+        elif stop is not None and stop.get("stopped"):
+            agent = (pending or {}).get("agent") or (sess or {}).get("agent")
+            held = (pending or {}).get("held_reason") or (sess or {}).get("via") or "pie"
+            idle = now - max(idle_since, float((sess or {}).get("requested_at", 0) or 0))
+            if cause == "lease_ttl":
+                why_text = (f"its '{held}' lease aged out after {int(float((pending or {}).get('ttl') or 0))}s "
+                            f"with no uap call")
+            else:
+                why_text = f"no lease was held and no uap call touched the editor for {int(idle)}s"
+            rec = {"why": EVICT_STALE_PIE, "cause": cause, "agent": agent, "held_reason": held,
+                   "pie_started_by": (sess or {}).get("agent"), "project": key,
+                   "evicted_at": now, "reaped_at": now, "reaped_by": default_agent_id(),
+                   "session_started_at": started_at,
+                   "acquired_at": (sess or {}).get("requested_at"),
+                   "message": (f"lease_evicted: {EVICT_STALE_PIE} -- the {key} PIE session uap "
+                               f"started for {agent} was still running after {why_text}, so it "
+                               f"was stopped (confirmed) and the machine-wide lock given back. "
+                               f"Nothing you were doing in that session survives. Re-acquire "
+                               f"(`uap lease acquire exclusive --reason pie --agent <token>`) and "
+                               f"`uap pie start` again.")}
+            state["pie_session"] = None
+            state["pending_reap"] = None
+            state["unowned_pie"] = None
+            state["last_reap"] = rec
+            state["last_eviction"] = rec
+            notes = {a: n for a, n in state.get("evicted", {}).items()
+                     if now - float(n.get("evicted_at", 0)) < _EVICTION_NOTICE_TTL}
+            for who in {agent, (sess or {}).get("agent")}:
+                if who:
+                    notes[str(who)] = rec
+            state["evicted"] = notes
+        elif stop is not None:
+            rec = {"why": REAP_FAILED, "cause": cause, "agent": (sess or {}).get("agent"),
+                   "project": key, "at": now, "error": stop.get("error", "stop not confirmed"),
+                   "message": (f"the stale {key} PIE session could not be stopped "
+                               f"({stop.get('error', 'stop not confirmed')}); it will be retried. "
+                               f"Stop it in the editor by hand if it persists.")}
+            state["last_reap"] = rec
+        else:
+            # PIE is running, but not a session uap can prove it started: a human's (or the MCP
+            # server's, or one an unrecognised API started). Never stopped -- only reported.
+            rec = {"why": "unowned_pie_left_running", "cause": cause, "project": key,
+                   "seen_at": now, "session_started_at": started_at,
+                   "evicted_agent": (pending or {}).get("agent"),
+                   "message": (f"PIE is running in the {key} editor but uap has no record of "
+                               f"starting this session (a human, the MCP server or an "
+                               f"unrecognised API started it, or this editor's plugin cannot "
+                               f"report the session start), so the reaper did NOT stop it.")}
+            if info.get("error"):
+                rec["probe_error"] = info["error"]
+            state["unowned_pie"] = rec
+            state["pending_reap"] = None
+            if same_session and started_at is not None:
+                state["pie_session"] = None      # our record is provably not this session
+        _save(project, state)
+    finally:
+        _release_filelock(project)
+    return rec
+
+
+def _release_machine_after_reap(project, rec: dict, sess: dict | None,
+                                pending: dict | None) -> None:
+    """The reaped session was what held the machine for this project: give it back. Running
+    standalone clients of the project are never killed (uap did not necessarily launch them);
+    they keep the machine on their own (`_settle_machine`) and are named in the record."""
+    try:
+        res = release_machine(agent=str((pending or sess or {}).get("agent") or REAPER_AGENT),
+                              project=project, project_wide=True)
+        rec["machine_released"] = bool(res.get("released"))
+    except Exception as exc:
+        rec["machine_released"] = False
+        rec["machine_error"] = f"{type(exc).__name__}: {exc}"
+    clients = (_live_game_clients() or {}).get(_safe_project(project))
+    if clients:
+        rec["game_clients_left_running"] = clients
+        try:
+            _acquire_filelock(project)
+            try:
+                state = _load(project)
+                if (state.get("last_reap") or {}).get("reaped_at") == rec.get("reaped_at"):
+                    state["last_reap"]["game_clients_left_running"] = clients
+                    _save(project, state)
+            finally:
+                _release_filelock(project)
+        except CoordinationError:
+            pass
+
+
+def note_pie_started(project: str | None, *, agent: str, requested_at: float,
+                     confirmed_at: float | None = None, via: str = "pie start") -> None:
+    """Record that uap started a PIE session in `project` (the reaper only ever stops these).
+
+    `requested_at` is when the start was asked for; `confirmed_at` when the play world was seen
+    live, if it was. Together they bound the session start the reaper matches against.
+    """
+    _acquire_filelock(project)
+    try:
+        state = _load(project)
+        prev = state.get("pie_session") or {}
+        if prev.get("requested_at"):
+            # A second start while the first session is (as far as uap knows) still running is a
+            # no-op in the editor: the session that keeps running is the FIRST one. Keep its
+            # window open, or the running session would no longer match and could never be reaped.
+            requested_at = min(float(requested_at), float(prev["requested_at"]))
+        state["pie_session"] = {"agent": agent, "target": str(project or ""), "via": via,
+                                "requested_at": float(requested_at),
+                                "confirmed_at": float(confirmed_at) if confirmed_at else None,
+                                "pid": os.getpid()}
+        state["unowned_pie"] = None
+        state["last_uap_at"] = _now()
+        _save(project, state)
+    finally:
+        _release_filelock(project)
+
+
+def note_pie_stopped(project: str | None) -> None:
+    """A confirmed stop: nothing uap started is running in `project` any more."""
+    _acquire_filelock(project)
+    try:
+        state = _load(project)
+        if state.get("pie_session") or state.get("pending_reap") or state.get("unowned_pie"):
+            state["pie_session"] = None
+            state["pending_reap"] = None
+            state["unowned_pie"] = None
+            _save(project, state)
+    finally:
+        _release_filelock(project)
+
+
+def begin_call(project: str | None, verb: str = "") -> None:
+    """A uap verb is about to run against this editor: it counts as activity until `end_call`.
+
+    The reaper never stops PIE under a call in flight (a long `sample`, `input hold` or `exec`
+    makes no further uap calls while it runs, yet is plainly driving the session).
+    """
+    _acquire_filelock(project)
+    try:
+        state = _load(project)
+        state.setdefault("inflight", {})[str(os.getpid())] = {"verb": sanitize_label(verb),
+                                                              "at": _now()}
+        state["last_uap_at"] = _now()
+        _save(project, state)
+    finally:
+        _release_filelock(project)
+
+
+def end_call(project: str | None) -> None:
+    _acquire_filelock(project)
+    try:
+        state = _load(project)
+        (state.get("inflight") or {}).pop(str(os.getpid()), None)
+        state["last_uap_at"] = _now()
+        _save(project, state)
+    finally:
+        _release_filelock(project)
 
 
 # ----------------------------------------------------------------------------------------------
@@ -1245,10 +1719,19 @@ def _live_pie_holds() -> set:
         return set()
     if not ex or _holder_alive(ex):
         return set()
+    target = str(ex.get("target") or ex.get("project") or "")
     try:
-        live = probe(str(ex.get("target") or ex.get("project") or ""))
+        live = probe(target)
     except Exception:
         return set()
+    if live is True and target:
+        # A live session keeps the hold -- unless it is a session uap started that nobody is
+        # driving any more. Then it is stopped instead (2026-10-23: one held the machine, and the
+        # other project, for 1.5 hours). This is the path the OTHER project's calls reach, which
+        # matters: the stale project's own agents are, by definition, no longer calling.
+        reaped = reap_stale_pie(target)
+        if reaped and reaped.get("why") == EVICT_STALE_PIE:
+            return set()
     return {_hold_key(ex)} if live is True else set()
 
 
@@ -1566,6 +2049,8 @@ def wait_if_blocked(project: str | None, *, agent: str | None = None,
     deadline = _now() + max(0.0, wait)
     while True:
         try:
+            # The holder we are waiting on may just have aged out with its PIE still running.
+            reap_stale_pie(project)
             evicted = None
             _acquire_filelock(project)
             try:
@@ -1574,7 +2059,7 @@ def wait_if_blocked(project: str | None, *, agent: str | None = None,
             finally:
                 _release_filelock(project)
                 _after_eviction(project, evicted)
-            ex = state.get("exclusive")
+            ex = state.get("exclusive") or _reaper_holder(state)
             if ex is None or ex.get("agent") == agent:
                 return {"ok": True, "blocked": False}
             holder = ex

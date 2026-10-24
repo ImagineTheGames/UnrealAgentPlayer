@@ -161,7 +161,8 @@ $leaseOut = & powershell -NoProfile -ExecutionPolicy Bypass -File $uapLauncher l
 
 Eviction therefore has three independent reclaimers: **stale heartbeat (TTL)** for any hold,
 **dead PID** for PID-anchored holds, and, for `pie`/`level` holds only, **dead editor** (below).
-Any one frees an abandoned lease.
+Any one frees an abandoned lease. A TTL eviction also stops the PIE session the holder left
+running, if uap started it ("An abandoned PIE session is stopped", below).
 
 ## What's enforced automatically vs explicit (v1)
 
@@ -268,6 +269,79 @@ It also frees the holder's machine-wide foreground lock (see below), which every
 `lease acquire` except `rebuild*` takes alongside the project lease: otherwise the OTHER project
 would sit out that hold's TTL for a session that no longer exists.
 
+## An abandoned PIE session is stopped (the stale-PIE reaper)
+
+Ageing a lease out freed the LEASE and nothing else. On 2026-10-23 agent `gpufoliage` was in PBW
+PIE when it hit its turn limit and stopped without handing off. Its `pie` lease aged out on the
+600s TTL, but the session kept running for about 1.5 hours: it held the machine-wide lock (a live
+PIE keeps a stale machine hold alive, see below), stole focus from the other project and burned the
+GPU until the director noticed.
+
+**The rule:** a PIE session that **uap started** is stopped, with the same confirmed stop as `uap pie
+stop`, when nobody is driving it any more:
+
+| Cause (`last_reap.cause`) | When |
+|---------------------------|------|
+| `lease_ttl` | a non-rebuild exclusive lease (`pie`, `level:<path>`, `input`, `2p`, any reason but `rebuild*` / `relaunch*`) aged out on its TTL, i.e. the holder made no uap call for that long, and the editor is still in PIE |
+| `orphan` | nobody holds the project's exclusive lease, PIE is still running, and no uap call has touched this project's editor for the idle window (default 600s, the pie TTL; `UAP_PIE_REAP_IDLE=<seconds>` overrides). This is the agent that ran `pie start` without a lease |
+
+Then the project's machine hold is given back (whoever took it for this project), so the other
+project is no longer locked out by a session that is over.
+
+**Never a human's PIE.** uap records every session it starts (`pie_session` in the lease file):
+`pie start` (also `--no-wait` and a start that timed out, which is still queued), and an `rc
+StartPIE*` / `exec` start that left PIE in progress. A confirmed stop (`pie stop`, a raw stop that
+the editor confirms, `report finish`) clears it. The reaper only ever stops a session it can prove
+is that one: the plugin's `GetPIEElapsedSeconds` gives the running session's start time, which has
+to fall inside the window uap's start was made in (from 5s before the request to 30s after the
+play world was seen live, or 300s after the request when nobody watched it come up). Anything
+else is a session somebody else started (a human pressing Play, the MCP server's `pie_start`, an
+API the CLI does not recognise, or a human who stopped uap's session and started their own): it
+is **reported, never stopped**, as `unowned_pie` in `uap lease status`. An editor whose plugin
+copy cannot date its session (no `GetPIEElapsedSeconds`) is never reaped either.
+
+**Who runs it.** Nothing is a daemon. Any uap call that reads lease state may run it:
+every editor-touching verb (`status`, `rc`, `exec`, `pie`, `input`, `screenshot` ...) runs it
+first, before the call counts as activity itself; `lease status` and `lease acquire` run it (and
+an `acquire` runs it BEFORE granting, so the next agent is never handed an editor still in the
+previous agent's PIE); every poll of a blocked call (`wait_if_blocked`, `acquire`) runs it; and
+every look at the machine lock runs it for the project whose stale hold is being kept alive by a
+live PIE. That last path matters most: the abandoned project's own agents are, by definition, not
+calling any more, so it is the OTHER project's `pie start` that notices.
+
+**Never while anyone is working.** It does not fire while a live holder owns the lease, while a
+`rebuild*` / `relaunch*` hold is on the project, or while another uap call is mid-flight against
+that editor (`inflight`: a long `sample`, `input hold` or `exec` makes no further calls while it
+runs, yet is plainly driving the session). An agent driving its PIE with `exec` / `rc` alone,
+without a lease, keeps it alive simply by calling.
+
+**Two callers at once.** The candidate check and a claim (`reaping`) are taken under the
+project's filelock; the probe and the stop (network round trips) run outside it; the claim is
+re-checked right before the stop. Exactly one caller stops PIE; the others see the claim and do
+nothing. While a claim is live, `acquire` grants nobody and `wait_if_blocked` keeps waiting (the
+holder reads as `uap-reaper`), so nobody starts driving an editor mid-stop. A claim older than
+120s belongs to a reaper that died and is ignored. Probes are rate-limited to one per project per
+15s.
+
+**What it records.**
+- `last_reap` (and `last_eviction`) in the lease file: `why: "stale_pie_reaped"`, `cause`,
+  `agent`, `held_reason`, `pie_started_by`, `reaped_at`, `session_started_at`,
+  `machine_released`, and a `message`. A stop that is not confirmed records
+  `why: "stale_pie_reap_failed"` with the error and is retried.
+- the evicted agent's next guarded call fails once with `lease_evicted: true, why:
+  "stale_pie_reaped"`, exactly like the dead-editor eviction, so it does not carry on against a
+  session that is gone.
+- one JSON line per decision in `~/.uap-reports/.leases/reaper.log`.
+- the in-editor overlay draws `reaped stale PIE of <agent>  <age> ago` for 15 minutes (plugin
+  half: `AgentOverlay.cpp`; a project sees it after its vendored plugin is updated and rebuilt).
+
+**Standalone game clients are never killed.** If the reaped session's project still has `-game`
+clients or a packaged build running, uap did not necessarily launch them: they are named in
+`last_reap.game_clients_left_running` and left alone. They keep holding the machine on their own,
+as `game-clients`, until the last one exits (see below).
+
+**Escape hatch:** `UAP_PIE_REAPER=0` turns the reaper off entirely.
+
 ## Two projects, one workstation (the machine-wide foreground lock)
 
 Everything above is scoped to ONE project's editor. That scoping is correct for what a project's
@@ -333,7 +407,8 @@ in a `finally`, so a crash or an exception cannot leave the machine locked. Any 
 from the holding project refreshes the heartbeat, so an agent that is actually working keeps it.
 A hold past its TTL is evicted only if its project's editor is NOT in PIE: the CLI probes that
 editor (`IsPIEInProgress`) first, and a live session refreshes the hold instead, so a long PIE
-driven through `exec` / `rc` alone no longer ages out under the other project. `pie stop` never
+driven through `exec` / `rc` alone no longer ages out under the other project. The exception is a
+session nobody is driving any more: the stale-PIE reaper stops it and the hold goes with it. `pie stop` never
 waits on the machine lock: stopping gives the foreground back.
 
 **Fail closed.** A guarded verb that cannot read or write the machine lock does NOT run. Transient

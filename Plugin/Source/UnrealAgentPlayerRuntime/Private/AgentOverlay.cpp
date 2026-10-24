@@ -126,6 +126,10 @@ namespace
         FString ActivityAgent;
         double  ActivityAtUnix = 0.0;
         FString ReportName;
+        // The last time the CLI's stale-PIE reaper stopped a session uap started and nobody was
+        // driving any more (`last_reap` in the lease file, why == "stale_pie_reaped").
+        FString ReapedAgent;
+        double  ReapedAtUnix = 0.0;
     };
 
     FCoordSnapshot GCoord;
@@ -249,6 +253,20 @@ namespace
                         Next.ActivityAtUnix = At;
                         Next.ActivityAgent = Pair.Key;
                     }
+                }
+            }
+
+            // A PIE session the CLI stopped because its agent went quiet. Without this line the
+            // session just vanishes from the screen with no explanation.
+            const TSharedPtr<FJsonObject>* Reap = nullptr;
+            if (Lease->TryGetObjectField(TEXT("last_reap"), Reap) && Reap && Reap->IsValid())
+            {
+                FString Why;
+                (*Reap)->TryGetStringField(TEXT("why"), Why);
+                if (Why == TEXT("stale_pie_reaped"))
+                {
+                    (*Reap)->TryGetStringField(TEXT("agent"), Next.ReapedAgent);
+                    (*Reap)->TryGetNumberField(TEXT("reaped_at"), Next.ReapedAtUnix);
                 }
             }
         }
@@ -452,6 +470,18 @@ namespace
                 {
                     Out.Add({ FString::Printf(TEXT("  for  %s"), *Trim(GCoord.LeaseTask, 38)), CInfo });
                 }
+            }
+        }
+        // A stale PIE session the CLI stopped recently (15 min), and whose it was. Display only:
+        // like a stale lease, it is not on its own a reason to put the overlay on screen.
+        if (GCoord.ReapedAtUnix > 0.0)
+        {
+            const double Ago = (double)FDateTime::UtcNow().ToUnixTimestamp() - GCoord.ReapedAtUnix;
+            if (Ago >= 0.0 && Ago <= 900.0)
+            {
+                Out.Add({ FString::Printf(TEXT("reaped stale PIE of %s  %s ago"),
+                                          *Trim(GCoord.ReapedAgent.IsEmpty() ? FString(TEXT("?")) : GCoord.ReapedAgent, 20),
+                                          *FormatAge(Ago)), CAlarm });
             }
         }
         // Who is next. The first two waiters, each with their task, one per line so a long label
