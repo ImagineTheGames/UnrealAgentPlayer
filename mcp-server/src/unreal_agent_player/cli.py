@@ -974,6 +974,8 @@ def _pie_stop(project: str | None, timeout: float) -> dict:
     out["waited_seconds"] = round(time.monotonic() - t0, 2)
     if restops:
         out["restops"] = restops
+    if out["stopped"]:
+        _note_pie_stopped(project)       # nothing uap started is running here any more
     return out
 
 
@@ -1045,8 +1047,12 @@ def _pie(args) -> int:
     body: dict = {"ok": True}
     try:
         if sub == "start":
+            requested_at = _coord._now()
             body.update(_pie_start(getattr(args, "mode", "flat") or "flat", args.project))
             if body.get("ok"):
+                # Recorded BEFORE the wait: a start that times out is still queued, and still ours.
+                _note_pie_started(args.project, getattr(args, "agent", None), requested_at, None,
+                                  "pie start")
                 timeout = getattr(args, "timeout", None)
                 timeout = _pie_start_timeout() if timeout is None else timeout
                 if getattr(args, "no_wait", False):
@@ -1065,6 +1071,9 @@ def _pie(args) -> int:
                     waited = _pie_wait_for_live(args.project, timeout)
                     body["playing"] = waited["playing"]
                     body["waited_seconds"] = waited["waited_seconds"]
+                    if waited["playing"]:
+                        _note_pie_started(args.project, getattr(args, "agent", None),
+                                          requested_at, _coord._now(), "pie start")
                     if not waited["playing"]:
                         # A start we could not confirm IS still queued -- say so here, where it is
                         # true, and never as a cheerful ok.
@@ -3081,6 +3090,10 @@ def _run_parsed(args) -> int:
     # rebuild still appears (with its task) in `uap lease status` and the overlay. Display only.
     task = _task_label(args)
     if cmd in _REBUILD_GUARDED:
+        # First, before this call counts as activity itself: a PIE session uap started that nobody
+        # has driven for the idle window, or whose lease aged out, is stopped here
+        # (coordination.reap_stale_pie). Never a human's PIE; never raises.
+        _coord.reap_stale_pie(project)
         who = getattr(args, "agent", None) or os.environ.get("UAP_AGENT_ID")
         if who or task:
             try:
@@ -3229,6 +3242,55 @@ def _machine_pie_probe(project: str) -> bool | None:
 _coord._machine_pie_probe = _machine_pie_probe
 
 
+def _reaper_pie_probe(project: str) -> dict:
+    """The stale-PIE reaper's view of an editor: is PIE in progress, and since when?
+
+    `started_at` is derived from the plugin's GetPIEElapsedSeconds (stamped at PostPIEStarted), so
+    the reaper can tell the session uap started from one somebody started later. Unknown (None)
+    whenever it cannot be read -- an older plugin, a session still coming up -- and the reaper
+    never stops a session it cannot identify.
+    """
+    live, how = _pie_state_for_lease(project or None)
+    out: dict = {"in_progress": live, "checked_with": how, "started_at": None}
+    if live is not True:
+        return out
+    try:
+        elapsed = float(_rc_call("GetPIEElapsedSeconds", {}, project or None))
+    except Exception:
+        elapsed = 0.0
+    if elapsed > 0.0:
+        out["elapsed"] = elapsed
+        out["started_at"] = _coord._now() - elapsed
+    return out
+
+
+def _reaper_pie_stop(project: str) -> dict:
+    """The reaper stops PIE exactly the way `uap pie stop` does: cancel a queued start, then wait
+    for the confirmed teardown."""
+    return _pie_stop(project or None, _pie_stop_timeout())
+
+
+_coord._pie_session_probe = _reaper_pie_probe
+_coord._pie_stopper = _reaper_pie_stop
+
+
+def _note_pie_started(project: str | None, agent: str | None, requested_at: float,
+                      confirmed_at: float | None, via: str) -> None:
+    """Best effort: the record is what lets the reaper stop this session if it is abandoned."""
+    try:
+        _coord.note_pie_started(project, agent=agent or _coord.default_agent_id(),
+                                requested_at=requested_at, confirmed_at=confirmed_at, via=via)
+    except Exception:
+        pass
+
+
+def _note_pie_stopped(project: str | None) -> None:
+    try:
+        _coord.note_pie_stopped(project)
+    except Exception:
+        pass
+
+
 def _exec_code_of(args, cmd: str) -> str:
     """The Python an `exec` / `exec-file` call will run ("" if it cannot be read here)."""
     if cmd == "exec":
@@ -3309,9 +3371,23 @@ def _run_under_machine_lock(args, cmd: str | None, project: str) -> int:
         if machine.get("busy"):
             _emit(_machine_denied(args, cmd, project, agent, machine, holds_lease))
             return 1
+    # A verb running against the editor is activity for as long as it runs, so the stale-PIE
+    # reaper never stops a session under a long `sample` / `input hold` / `exec`.
+    tracked = cmd in _REBUILD_GUARDED
+    if tracked:
+        try:
+            _coord.begin_call(project, _machine_reason(args, cmd))
+        except Exception:
+            tracked = False
+    requested_at = _coord._now()
     try:
         rc = args.func(args)
     finally:
+        if tracked:
+            try:
+                _coord.end_call(project)
+            except Exception:
+                pass
         if machine is not None and machine.get("acquired") and not sticky:
             _release_machine_quiet(agent=machine.get("agent"), project=project,
                                    project_wide=False)
@@ -3321,15 +3397,25 @@ def _run_under_machine_lock(args, cmd: str | None, project: str) -> int:
     # the editor before handing the machine over.
     if rc == 0 and stopping:
         if cmd == "pie" or _pie_down_confirmed(project, _RAW_STOP_CONFIRM_SECONDS):
+            if cmd != "pie":
+                _note_pie_stopped(project)   # `pie stop` records its own confirmed stop
             _release_machine_quiet(
                 agent=getattr(args, "agent", None) or _coord.default_agent_id(), project=project)
-    # A raw start (`rc StartPIE*`, `exec`) that this call took a sticky hold for, but which left
-    # no session -- it failed, or the exec only MENTIONED a start API -- gives the hold straight
-    # back instead of blocking the other project until the TTL. IsPIEInProgress counts a queued
-    # start, so a start that is merely still coming up keeps it.
-    elif sticky and cmd != "pie" and machine is not None and machine.get("acquired") \
-            and _pie_state_for_lease(project or None)[0] is False:
-        _release_machine_quiet(agent=machine.get("agent"), project=project, project_wide=False)
+    elif sticky and cmd != "pie":
+        acquired = machine is not None and bool(machine.get("acquired"))
+        live = _pie_state_for_lease(project or None)[0] if (rc == 0 or acquired) else None
+        # A raw start (`rc StartPIE*`, `exec`) that left a session behind is recorded as uap's,
+        # like `pie start` records its own, so the reaper can stop it if it is abandoned.
+        if rc == 0 and live is not False:
+            _note_pie_started(project, getattr(args, "agent", None), requested_at, None,
+                              f"{cmd}:{getattr(args, 'rc_func', '') or 'play'}")
+        # One that this call took a sticky hold for, but which left no session -- it failed, or
+        # the exec only MENTIONED a start API -- gives the hold straight back instead of blocking
+        # the other project until the TTL. IsPIEInProgress counts a queued start, so a start that
+        # is merely still coming up keeps it.
+        if acquired and live is False:
+            _release_machine_quiet(agent=machine.get("agent"), project=project,
+                                   project_wide=False)
     return rc
 
 
