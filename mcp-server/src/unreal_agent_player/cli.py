@@ -1312,6 +1312,8 @@ _NEEDS_XR_AIM = ("opt-in aim-pose emulation for the injected XR controllers -- w
 _NEEDS_XR_STATE = "reading back what the injected XR controllers answer (grip AND aim pose)"
 _XR_HANDS = {"left": "Left", "right": "Right"}
 _XR_AXES = {"grip": "Grip_Axis", "trigger": "Trigger_Axis"}
+_XR_CLICKS = {"grip": "Grip_Click", "trigger": "Trigger_Click"}
+_XR_CLICK_THRESHOLD = 0.5
 
 
 def _xr_hands(which: str) -> list[str]:
@@ -1328,7 +1330,19 @@ def _xr(args) -> int:
         ns.input_cmd = "axis"
         ns.key = f"OculusTouch_{_XR_HANDS[args.hand]}_{_XR_AXES[sub]}"
         ns.user = None
-        return _input(ns)
+        rc = _input(ns)
+        if rc != 0 or args.value < _XR_CLICK_THRESHOLD or args.no_click:
+            return rc
+        # A real Touch controller reports the squeeze as BOTH the analog axis and the digital
+        # _Click key (the OpenXR runtime thresholds the value). Games bind either - this project's
+        # "use held object" is Trigger_Click - so holding only the axis would leave every _Click
+        # binding dead and read as a broken feature. Press the click for the same window.
+        click = argparse.Namespace(**vars(args))
+        click.input_cmd = "hold"
+        click.key = f"OculusTouch_{_XR_HANDS[args.hand]}_{_XR_CLICKS[sub]}"
+        click.overlap = True
+        click.user = None
+        return _input(click)
 
     t0 = time.monotonic()
     body: dict = {"ok": True, "action": f"xr {sub}"}
@@ -2332,9 +2346,10 @@ SUSTAINED INPUT (a single injected event CANNOT drive locomotion -- see below)
 
 VR HANDS (the injected Quest controllers -- drive the REAL VR pawn's hands with no headset)
   uap xr pose left|right X Y Z [--pitch P --yaw Y --roll R]   place a hand, TRACKING space (cm)
-  uap xr grip left|right [v] --seconds N   hold OculusTouch_<Hand>_Grip_Axis (an `input axis`
+  uap xr grip left|right [v] --seconds N   hold OculusTouch_<Hand>_Grip_Axis + _Grip_Click (`input axis`
                                        hold: same ledger, same overlap refusal, same --wait)
-  uap xr trigger left|right [v] --seconds N   ...OculusTouch_<Hand>_Trigger_Axis
+  uap xr trigger left|right [v] --seconds N   ...OculusTouch_<Hand>_Trigger_Axis + _Trigger_Click
+                                       (a real Touch sends both; --no-click for the axis alone)
   uap xr aim on|off|status [--loc X Y Z --rot P Y R]   OPT-IN aim-pose emulation. OFF by default,
                                        '<Hand>Aim' answers the GRIP pose, so aim == grip and a
                                        check of "does it point where I point" is meaningless.
@@ -2906,7 +2921,7 @@ def build_parser() -> argparse.ArgumentParser:
                    ).set_defaults(func=_xr)
     for verb in ("grip", "trigger"):
         xg = xrs.add_parser(verb, parents=[proj],
-                            help=f"hold OculusTouch_<Hand>_{_XR_AXES[verb]} at a value for N seconds "
+                            help=f"hold OculusTouch_<Hand>_{_XR_AXES[verb]} (+ _{_XR_CLICKS[verb]} at >= 0.5) for N seconds "
                                  f"(an `input axis` hold under the hood)")
         xg.add_argument("hand", choices=["left", "right"])
         xg.add_argument("value", type=float, nargs="?", default=1.0, help="0.0 .. 1.0 (default 1)")
@@ -2914,6 +2929,9 @@ def build_parser() -> argparse.ArgumentParser:
         xg.add_argument("--wait", action="store_true", help="block until the hold expires")
         xg.add_argument("--overlap", action="store_true",
                         help="allow it alongside a hold already running (e.g. grip held, then trigger)")
+        xg.add_argument("--no-click", dest="no_click", action="store_true",
+                        help=f"do not also hold OculusTouch_<Hand>_{_XR_CLICKS[verb]} (a real controller "
+                             f"sends the _Click with the axis once it passes {_XR_CLICK_THRESHOLD})")
         xg.set_defaults(func=_xr)
 
     # Mouse position inside a CAPTURED viewport. Not a hold -- a position, which is a different

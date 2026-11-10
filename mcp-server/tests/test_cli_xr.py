@@ -33,6 +33,8 @@ def _wire(monkeypatch, answers: dict | None = None):
             return True
         if func == "HoldAxis":
             return json.dumps({"ok": True, "key": params["AxisKeyName"], "pressed": True})
+        if func == "HoldKey":
+            return json.dumps({"ok": True, "key": params["KeyName"], "pressed": True})
         if func == "GetHeldInput":
             return json.dumps({"ok": True, "held": []})
         if func == "SetXRAimEmulation":
@@ -135,3 +137,19 @@ def test_old_plugin_without_aim_verb_is_named_as_skew(monkeypatch, capsys):
 def test_xr_is_lease_and_machine_guarded():
     assert "xr" in cli._LEASE_GUARDED
     assert "xr" in cli._MACHINE_GUARDED
+
+
+def test_grip_also_holds_the_click_like_a_real_controller(monkeypatch, capsys):
+    calls = _wire(monkeypatch)
+    rc, body = _run(["xr", "trigger", "left", "--seconds", "0.3"], capsys)
+    assert rc == 0, body
+    keys = [c[1].get("KeyName") for c in calls if c[0] == "HoldKey"]
+    assert keys == ["OculusTouch_Left_Trigger_Click"]
+    assert body["key"] == "OculusTouch_Left_Trigger_Click"
+
+
+def test_no_click_and_light_squeeze_hold_only_the_axis(monkeypatch, capsys):
+    calls = _wire(monkeypatch)
+    _run(["xr", "grip", "right", "--seconds", "1", "--no-click"], capsys)
+    _run(["xr", "grip", "right", "0.3", "--seconds", "1", "--overlap"], capsys)
+    assert not [c for c in calls if c[0] == "HoldKey"]
