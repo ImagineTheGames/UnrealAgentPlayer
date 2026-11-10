@@ -83,6 +83,28 @@ _DEFAULT_TTL = 600
 # a lease TTL, because a waiter is only ever alive inside one blocking call.
 _WAITER_TTL = 15.0
 
+# --- parked waiters (harness-safe waiting) -----------------------------------------------------
+# An agent harness kills a tool call after 120-600s, but `lease acquire --wait 900` can block for
+# 15 minutes. The kill lost the agent its place (the waiter ages out in _WAITER_TTL and a fresh
+# acquire re-joins at the BACK), so agents fell back to polling `lease status` + sleep, 8-18 times
+# each. `--max-block S` returns within S seconds instead and PARKS the waiter: it keeps its place
+# for `_park_ttl()` seconds with no process behind it. `uap lease wait` (or the same `lease
+# acquire` again) resumes from that place. A parked agent that never comes back drops out when the
+# park expires, and its request is remembered in `lost_waiters` so its next call can say so.
+_PARK_TTL_DEFAULT = 180.0
+_LOST_WAITER_TTL = 3600.0
+# How long `last_eviction` / `last_reap` stay on the record. They are diagnostics for the next few
+# minutes ("why did my lease vanish"), and every `lease status` printed them for days.
+_RECORD_MAX_AGE = 3600.0
+
+
+def _park_ttl() -> float:
+    raw = os.environ.get("UAP_WAITER_PARK_TTL", "")
+    try:
+        return max(_WAITER_TTL, float(raw)) if raw.strip() else _PARK_TTL_DEFAULT
+    except ValueError:
+        return _PARK_TTL_DEFAULT
+
 # --- machine-wide foreground lock -------------------------------------------------------------
 # Its own scope key, so it reuses the whole per-project file/lock/eviction machinery unchanged.
 # `_safe_project` reserves this name, so a project literally called "_machine" cannot collide
@@ -773,6 +795,7 @@ def _refresh(project: str | None) -> tuple[dict, dict | None]:
         _note_pending_reap(state, aged_out)
     evicted = _evict_dead_editor(state, project)
     _evict_stale_waiters(state)
+    _prune_records(state)
     _rebuild_first(state, project)
     return state, evicted
 
@@ -844,6 +867,10 @@ def _own_record(state: dict, mode: str, agent: str) -> dict | None:
 
 
 def _waiter_alive(w: dict) -> bool:
+    # A parked waiter (see _park_ttl) has no process behind it between calls; its park is its
+    # liveness until it expires.
+    if _now() < float(w.get("parked_until", 0) or 0):
+        return True
     if _now() - float(w.get("heartbeat_at", 0)) > _WAITER_TTL:
         return False            # stopped polling -> the call it belonged to is over
     pid = int(w.get("pid", 0) or 0)
@@ -851,8 +878,49 @@ def _waiter_alive(w: dict) -> bool:
 
 
 def _evict_stale_waiters(state: dict) -> dict:
-    state["waiters"] = [w for w in state.get("waiters", []) if _waiter_alive(w)]
+    keep, lost = [], {}
+    for w in state.get("waiters", []):
+        if _waiter_alive(w):
+            keep.append(w)
+        elif w.get("parked_until"):
+            # Remember what a PARKED waiter was asking for, so its next `lease wait` can say it
+            # lost its place (and re-queue it) instead of answering a bare "not queued".
+            lost[str(w.get("agent"))] = {k: w.get(k) for k in
+                                         ("mode", "reason", "task", "requested_by",
+                                          "lease_pid", "lease_ttl", "give_up_at")}
+            lost[str(w.get("agent"))]["lost_at"] = _now()
+    state["waiters"] = keep
+    if lost:
+        state.setdefault("lost_waiters", {}).update(lost)
     return state
+
+
+def _prune_records(state: dict) -> None:
+    """Drop diagnostics that have aged out, so `lease status` stops printing week-old reaps."""
+    now = _now()
+
+    def _age(rec) -> float:
+        if not isinstance(rec, dict):
+            return 0.0
+        at = max(float(rec.get(k) or 0) for k in ("reaped_at", "evicted_at", "at"))
+        return now - at if at else _RECORD_MAX_AGE + 1
+
+    for key in ("last_eviction", "last_reap"):
+        if state.get(key) and _age(state[key]) > _RECORD_MAX_AGE:
+            state[key] = None
+    ev = state.get("evicted") or {}
+    if ev:
+        state["evicted"] = {a: n for a, n in ev.items()
+                            if isinstance(n, dict)
+                            and now - float(n.get("evicted_at", 0)) < _EVICTION_NOTICE_TTL}
+    lw = state.get("lost_waiters")
+    if lw:
+        lw = {a: n for a, n in lw.items()
+              if isinstance(n, dict) and now - float(n.get("lost_at", 0)) < _LOST_WAITER_TTL}
+        if lw:
+            state["lost_waiters"] = lw
+        else:
+            state.pop("lost_waiters", None)
 
 
 def _enqueue(state: dict, agent: str, mode: str, reason: str, task: str = "",
@@ -866,6 +934,9 @@ def _enqueue(state: dict, agent: str, mode: str, reason: str, task: str = "",
     for w in q:
         if w.get("agent") == agent:
             w["heartbeat_at"] = _now()
+            # A parked waiter resumes from a NEW process: anchor liveness to it, or the dead pid
+            # of the call that parked it would evict it the moment its park expired.
+            w["pid"] = os.getpid()
             w["mode"] = mode
             if task:
                 w["task"] = task
@@ -922,7 +993,8 @@ def _ttl_for(reason: str, ttl: int | None) -> int:
 
 def acquire(project: str | None, mode: str, *, reason: str = "", agent: str | None = None,
             pid: int | None = None, wait: float = DEFAULT_WAIT_CAP, ttl: int | None = None,
-            task: str | None = None, requested_by: str | None = None) -> dict:
+            task: str | None = None, requested_by: str | None = None,
+            max_block: float | None = None, resume: bool = False) -> dict:
     """Block until a `mode` ('exclusive'|'shared') lease is grantable, then take it.
 
     `pid` is the liveness anchor stored with the lease (default: this process). Pass the pid of a
@@ -933,6 +1005,14 @@ def acquire(project: str | None, mode: str, *, reason: str = "", agent: str | No
     the lease when it frees, so an agent that has been waiting longest cannot be overtaken by one
     that arrives later. The `busy` return carries `queue_position` / `queue_ahead` so a caller
     that gives up can say whether it was next or ninth instead of retrying blind.
+
+    `max_block` (seconds) makes the call HARNESS-SAFE: it returns within that long even when
+    `wait` is longer, with `still_waiting: true`, and the waiter stays PARKED in the queue (see
+    `_park_ttl`) so `wait_turn` -- or this same call again -- resumes from the same place.
+    `wait` is then the total budget across those calls. None (the default) is the old blocking
+    call, unchanged. `resume` is set by `wait_turn`: the overall budget comes from the parked
+    record, and an agent that is neither queued nor holding (and has no lost place on record)
+    gets `not_queued` instead of a silent re-queue.
 
     `task` is a short human label for what the agent is doing ("PCG profiling pass"), and
     `requested_by` names the agent a mechanical token acts for (a `rebuild-<pid>` script lease
@@ -953,10 +1033,14 @@ def acquire(project: str | None, mode: str, *, reason: str = "", agent: str | No
     ttl = _ttl_for(reason, ttl)
     started = _now()
     deadline = started + max(0.0, wait)
+    parking = max_block is not None
+    block_deadline = min(deadline, started + max(0.0, max_block)) if parking else deadline
     holder = None
     position = 0
     ahead: list[str] = []
     queue_len = 0
+    requeued = False
+    first = True
     while True:
         # A holder that aged out may have left its PIE running: stop that BEFORE the editor is
         # handed to the next agent, not after it has started driving a session that is not its own.
@@ -967,11 +1051,35 @@ def acquire(project: str | None, mode: str, *, reason: str = "", agent: str | No
             state, evicted = _refresh(project)
             mine = _holds_already(state, mode, agent)
             if not mine:
+                queued = _queue_position(state, agent) > 0
+                if first and resume and not queued:
+                    lost = (state.get("lost_waiters") or {}).pop(agent, None)
+                    if lost is None:
+                        _save(project, state)
+                        return {"ok": False, "granted": False, "held": False,
+                                "still_waiting": False, "not_queued": True, "agent": agent,
+                                "error": ("not queued and not holding: nothing to resume. Run "
+                                          "`uap lease acquire <mode> --reason <r> --max-block "
+                                          "110 --agent <tok>` to join the queue.")}
+                    requeued = True     # its park expired: back of the queue, and say so
                 _enqueue(state, agent, mode, reason, task, requested_by)
+                if parking:
+                    for w in state["waiters"]:
+                        if w.get("agent") == agent:
+                            # Parked for this whole call too: a harness that kills the call
+                            # mid-block must not cost the agent its place.
+                            w["parked_until"] = block_deadline + _park_ttl()
+                            w["give_up_at"] = deadline
+                            w["lease_pid"] = pid
+                            w["lease_ttl"] = ttl
+                            if reason:
+                                w["reason"] = reason
                 _rebuild_first(state, project)      # a fresh rebuild request may jump the queue
+            first = False
             if _grantable(state, mode, agent) and (mine or _turn_ok(state, mode, agent)) \
                     and (mine or _reaper_holder(state) is None):
                 _dequeue(state, agent)
+                (state.get("lost_waiters") or {}).pop(agent, None)
                 # A fresh grant supersedes any "you were evicted" note this agent had pending.
                 state.get("evicted", {}).pop(agent, None)
                 prev = _own_record(state, mode, agent) or {}
@@ -986,12 +1094,18 @@ def acquire(project: str | None, mode: str, *, reason: str = "", agent: str | No
                     state["shared"] = ([h for h in state["shared"] if h.get("agent") != agent]
                                        + [rec])
                 _save(project, state)
-                return {"ok": True, "granted": True, "agent": agent, "mode": mode,
-                        "reason": reason, "task": rec["task"],
-                        "requested_by": rec["requested_by"],
-                        "generation": state.get("generation", 0),
-                        "queued_seconds": round(_now() - started, 1),
-                        "queue_length": len(state.get("waiters", []))}
+                res = {"ok": True, "granted": True, "agent": agent, "mode": mode,
+                       "reason": reason, "task": rec["task"],
+                       "requested_by": rec["requested_by"],
+                       "generation": state.get("generation", 0),
+                       "queued_seconds": round(_now() - started, 1),
+                       "queue_length": len(state.get("waiters", []))}
+                if parking:
+                    res["held"] = True
+                    res["still_waiting"] = False
+                    if requeued:
+                        res["requeued"] = True
+                return res
             holder = (state.get("exclusive") or (state.get("shared") or [None])[0]
                       or _reaper_holder(state))
             position = _queue_position(state, agent)
@@ -1002,6 +1116,22 @@ def acquire(project: str | None, mode: str, *, reason: str = "", agent: str | No
         finally:
             _release_filelock(project)
             _after_eviction(project, evicted)
+        if parking and _now() >= block_deadline and _now() < deadline:
+            # Harness-safe return: still queued, place kept (parked_until was set above).
+            res = {"ok": False, "granted": False, "held": False, "still_waiting": True,
+                   "busy": True, "agent": agent, "mode": mode, "holder": holder,
+                   "position": position, "queue_position": position,
+                   "queue_length": queue_len, "queue_ahead": ahead,
+                   "waited_seconds": round(_now() - started, 1),
+                   "parked_seconds": round(_park_ttl()),
+                   "give_up_in_seconds": round(deadline - _now()),
+                   "resume": f"uap lease wait --agent {agent}",
+                   "hint": ("your place in the queue is KEPT for parked_seconds. Resume with "
+                            "`uap lease wait --agent <tok> --seconds 110` (or this same "
+                            "acquire); do not poll `lease status`.")}
+            if requeued:
+                res["requeued"] = True
+            return res
         if _now() >= deadline:
             # Give the slot back: a caller that has stopped waiting must not hold up the queue
             # for the _WAITER_TTL it would otherwise take to age out.
@@ -1012,16 +1142,67 @@ def acquire(project: str | None, mode: str, *, reason: str = "", agent: str | No
                 _save(project, state)
             finally:
                 _release_filelock(project)
-            return {"ok": False, "granted": False, "busy": True, "agent": agent,
-                    "mode": mode, "holder": holder,
-                    "waited_seconds": round(max(0.0, wait), 1),
-                    "queue_position": position, "queue_length": queue_len,
-                    "queue_ahead": ahead,
-                    "hint": ("you left the FIFO queue by timing out; a fresh acquire re-joins at "
-                             "the BACK. queue_position is where you stood when the wait capped: "
-                             "1 means you were next." if position
-                             else "the lease was held but you were not queued behind it")}
-        time.sleep(POLL_SECONDS)
+            res = {"ok": False, "granted": False, "busy": True, "agent": agent,
+                   "mode": mode, "holder": holder,
+                   "waited_seconds": round(max(0.0, wait), 1),
+                   "queue_position": position, "queue_length": queue_len,
+                   "queue_ahead": ahead,
+                   "hint": ("you left the FIFO queue by timing out; a fresh acquire re-joins at "
+                            "the BACK. queue_position is where you stood when the wait capped: "
+                            "1 means you were next." if position
+                            else "the lease was held but you were not queued behind it")}
+            if parking:
+                res.update({"held": False, "still_waiting": False, "position": position,
+                            "waited_seconds": round(_now() - started, 1)})
+            return res
+        if parking:
+            time.sleep(min(POLL_SECONDS, max(0.05, block_deadline - _now())))
+        else:
+            time.sleep(POLL_SECONDS)
+
+
+def wait_turn(project: str | None, *, agent: str | None = None, seconds: float = 110.0,
+              mode: str | None = None, reason: str | None = None,
+              task: str | None = None) -> dict:
+    """Resume a PARKED `acquire --max-block` without re-queuing (`uap lease wait`).
+
+    The request (mode / reason / ttl / pid / overall budget) comes from the parked waiter record,
+    so the caller only names itself. Returns the same shapes as `acquire` with `max_block`:
+    granted (`held: true`), `still_waiting: true` (place kept, call again), or `not_queued`.
+    An agent that already holds the lease gets `held: true` straight back.
+    """
+    agent = agent or default_agent_id()
+    _acquire_filelock(project)
+    evicted = None
+    try:
+        state, evicted = _refresh(project)
+        rec = next((w for w in state.get("waiters", []) if w.get("agent") == agent), None)
+        if rec is None:
+            rec = (state.get("lost_waiters") or {}).get(agent)
+        ex = state.get("exclusive")
+        held_ex = bool(ex) and ex.get("agent") == agent
+        held_sh = any(h.get("agent") == agent for h in state.get("shared", []))
+        _save(project, state)
+    finally:
+        _release_filelock(project)
+        _after_eviction(project, evicted)
+    if (held_ex or held_sh) and rec is None:
+        return {"ok": True, "granted": True, "held": True, "still_waiting": False,
+                "agent": agent, "mode": "exclusive" if held_ex else "shared",
+                "already_held": True}
+    lost = rec is not None and "lost_at" in rec
+    rec = rec or {}
+    give_up = float(rec.get("give_up_at") or 0)
+    budget = max(0.0, give_up - _now()) if give_up else float(seconds)
+    if lost:
+        budget = max(budget, float(seconds))    # it lost its place; give the re-queue a turn
+    lp = rec.get("lease_pid")
+    return acquire(project, mode or rec.get("mode") or "exclusive",
+                   reason=reason if reason is not None else (rec.get("reason") or ""),
+                   agent=agent, pid=0 if lp is None else int(lp), wait=budget,
+                   ttl=rec.get("lease_ttl"), task=task or rec.get("task"),
+                   requested_by=rec.get("requested_by"), max_block=float(seconds),
+                   resume=True)
 
 
 def release(project: str | None, *, agent: str | None = None) -> dict:
@@ -1661,6 +1842,72 @@ def end_call(project: str | None) -> None:
         _save(project, state)
     finally:
         _release_filelock(project)
+
+
+def guard_pass(project: str | None, *, agent: str, verb: str = "", task: str | None = None,
+               note: bool = False, lease_guarded: bool = False, track: bool = False) -> dict:
+    """The per-call guard chain's FAST PATH, in ONE locked read-modify-write.
+
+    Every editor verb used to run reap -> note_activity -> wait_while_rebuild -> wait_if_blocked
+    -> take_eviction_notice -> heartbeat -> begin_call, each its own lock + load + save: 6-8 file
+    round trips per call when nothing was even contended. This settles the common case -- no
+    rebuild, nobody else's exclusive lease, no reap due -- in one pass and does every write those
+    steps would have done (activity note, own-lease heartbeat, in-flight record).
+
+    It never WAITS and never decides anything the chain would decide differently: anything that
+    is not the clear case comes back `clear: False` with `why` (rebuild | blocked | reap), having
+    written nothing but the settled state, and the caller then runs the original chain, which
+    does the waiting. An eviction notice for `agent` is popped and returned (`eviction`) exactly
+    as `take_eviction_notice` would, with no heartbeat or in-flight record after it.
+    """
+    task = sanitize_label(task)
+    evicted = None
+    _acquire_filelock(project)
+    try:
+        state, evicted = _refresh(project)
+        ex = state.get("exclusive")
+        why = None
+        if _reap_cause(state, project):
+            why = "reap"
+        elif ex and str(ex.get("reason", "")).startswith("rebuild"):
+            why = "rebuild"
+        elif lease_guarded:
+            blk = ex or _reaper_holder(state)
+            if blk is not None and blk.get("agent") != agent:
+                why = "blocked"
+        if why:
+            _save(project, state)
+            return {"clear": False, "why": why}
+        now = _now()
+        if note:
+            act = {a: n for a, n in (state.get("activity") or {}).items()
+                   if isinstance(n, dict) and now - float(n.get("at", 0)) < _ACTIVITY_TTL}
+            prev = act.get(agent) or {}
+            act[agent] = {"verb": sanitize_label(verb), "at": now,
+                          "task": task or prev.get("task", "")}
+            state["activity"] = act
+        res: dict = {"clear": True, "tracked": False}
+        if lease_guarded:
+            gone = state.get("evicted", {}).pop(agent, None)
+            if gone is not None:
+                _save(project, state)
+                res["eviction"] = gone
+                return res
+            for h in [ex, *state.get("shared", [])]:
+                if h and h.get("agent") == agent:
+                    h["heartbeat_at"] = now
+                    if task:
+                        h["task"] = task
+        if track:
+            state.setdefault("inflight", {})[str(os.getpid())] = {"verb": sanitize_label(verb),
+                                                                  "at": now}
+            state["last_uap_at"] = now
+            res["tracked"] = True
+        _save(project, state)
+        return res
+    finally:
+        _release_filelock(project)
+        _after_eviction(project, evicted)
 
 
 # ----------------------------------------------------------------------------------------------

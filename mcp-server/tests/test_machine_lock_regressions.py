@@ -439,6 +439,10 @@ def test_launchers_in_one_session_each_target_their_own_project(tmp_path):
     script.write_text(session, encoding="ascii")
     env = {**os.environ, "UAP_HOME": str(home)}
     env.pop("UAP_PROJECT", None)
+    # The fake venv's stub cli must be what runs. An inherited PYTHONPATH (a worktree run with
+    # PYTHONPATH=src, which is how a checkout without its own venv tests itself) put the REAL
+    # package ahead of it, and this failed for a reason that has nothing to do with launchers.
+    env.pop("PYTHONPATH", None)
     res = subprocess.run([ps, "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", str(script)],
                          capture_output=True, text=True, env=env, check=False)
     lines = [ln.strip() for ln in res.stdout.splitlines() if ln.strip()]
