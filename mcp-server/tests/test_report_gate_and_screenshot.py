@@ -80,7 +80,15 @@ def test_help_catalog_has_recipes(capsys):
     from unreal_agent_player.cli import _help
     assert build_parser().parse_args(["help"]).func is _help
     assert build_parser().parse_args(["tools"]).func is _help
+    # `uap help` is now a short index; the full catalog moved to `uap help --all` (and the
+    # mouse section to `uap help mouse`). Both must still be reachable from the index.
     assert _help(None) == 0
+    index = capsys.readouterr().out
+    assert "read-ui" in index
+    assert "report finish" in index
+    assert "docs/agent-testing.md" in index
+    assert "help --all" in index
+    assert _help(build_parser().parse_args(["help", "--all"])) == 0
     out = capsys.readouterr().out
     # The catalog must teach the click chain (read-ui coords -> inject mouse) -- the implicit
     # chain that agents had to reverse-engineer.
@@ -88,6 +96,8 @@ def test_help_catalog_has_recipes(capsys):
     assert "InjectMouseMove" in out
     assert "report finish" in out
     assert "docs/agent-testing.md" in out
+    assert _help(build_parser().parse_args(["help", "mouse"])) == 0
+    assert "InjectMouseMove" in capsys.readouterr().out
 
 
 # --- #3: report finish must not pass without required visual proof ---
