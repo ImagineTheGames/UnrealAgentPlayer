@@ -154,6 +154,18 @@ With no key, this is the escape hatch: it releases every registry entry **and** 
 | `input_xr_pose` | `hand`, `position` (vec3), `orientation` (rotator), `tracked` (bool) | Sets the pose returned by the plugin's fake `IMotionController`. |
 | `input_xr_clear` | `hand` | Stop overriding that hand; real devices win again. |
 
+CLI verbs for the same surface (`uap xr ...`):
+
+| Verb | Plugin call | Notes |
+| --- | --- | --- |
+| `uap xr pose left\|right X Y Z [--pitch --yaw --roll] [--untracked]` | `InjectXRControllerPose` | TRACKING-space pose, cm / degrees. Named struct fields on the wire. |
+| `uap xr clear [left\|right\|both]` | `ClearXRControllerOverride` | Default both. |
+| `uap xr grip\|trigger left\|right [v] --seconds N` | `HoldAxis` on `OculusTouch_<Hand>_Grip_Axis` / `_Trigger_Axis` | An `input axis` hold: same ledger, overlap refusal, `--wait`. |
+| `uap xr aim on\|off\|status [--loc X Y Z --rot P Y R]` | `SetXRAimEmulation` / `GetXRControllerState` | **Opt-in, OFF by default.** With it OFF the `<Hand>Aim` source answers the GRIP pose (aim == grip). ON: `<Hand>Aim` = grip_to_aim * grip, default delta = Quest (pitch -60, loc 7.35 0 -6.73), given for the right hand and mirrored for the left. A zero delta means "use the Quest default". |
+| `uap xr state` | `GetXRControllerState` | Grip pose, the aim pose this controller answers, and whether aim is emulated, per hand. |
+
+`InjectXRButton` now REFUSES a key that names the other hand (`Hand=Right`, `OculusTouch_Left_X_Click`); it used to ignore `Hand` and press whatever the key said.
+
 > **VR pose caveat:** in HMD-less PIE with an active OpenXR runtime, the runtime's own motion controller can win modular-feature precedence, so an injected pose may not move the live component. Button injection is unaffected. See [architecture.md](architecture.md).
 
 ---
@@ -403,7 +415,7 @@ Launch and drive standalone `-game` processes independently from the editor, eac
 
 The C++ functions on `UAPAgentSubsystem`, callable directly over Remote Control:
 
-`GetPluginVersion` · `ExecuteConsoleCommand` · `GetRemoteControlPort` · `FocusEditorWindow` · `GetPIEPhase` · `GetPIEElapsedSeconds` · `StartPIE` · `StartPIEMode` · `StopPIE` · `StopPIEEx` · `IsInPIE` · `IsPIEInProgress` · `GetLogCursor` · `GetLogsSince` · `InjectKey` · `InjectMouseMove` · `InjectMouseButton` · `InjectAxis` · `InjectGamepad` · `InjectXRButton` · `InjectXRControllerPose` · `ClearXRControllerOverride` · `HoldKey` · `HoldAxis` · `ReleaseHeldInput` · `GetHeldInput` · `ListTestHelpers` · `ListTestHelpersJson` · `CallTestHelper` · `StartPropertySample` · `ReadPropertySample` · `StopPropertySample` · `GetStatGroupText` · `DumpViewportUI` · `SelectTab` · `NavigateUI` · `CaptureViewportWithUI`
+`GetPluginVersion` · `ExecuteConsoleCommand` · `GetRemoteControlPort` · `FocusEditorWindow` · `GetPIEPhase` · `GetPIEElapsedSeconds` · `StartPIE` · `StartPIEMode` · `StopPIE` · `StopPIEEx` · `IsInPIE` · `IsPIEInProgress` · `GetLogCursor` · `GetLogsSince` · `InjectKey` · `InjectMouseMove` · `InjectMouseButton` · `InjectAxis` · `InjectGamepad` · `InjectXRButton` · `InjectXRControllerPose` · `ClearXRControllerOverride` · `SetXRAimEmulation` · `GetXRControllerState` · `HoldKey` · `HoldAxis` · `ReleaseHeldInput` · `GetHeldInput` · `ListTestHelpers` · `ListTestHelpersJson` · `CallTestHelper` · `StartPropertySample` · `ReadPropertySample` · `StopPropertySample` · `GetStatGroupText` · `DumpViewportUI` · `SelectTab` · `NavigateUI` · `CaptureViewportWithUI`
 
 The same surface (minus the editor-only PIE and focus verbs) exists on `UAPAgentRuntimeSubsystem` for standalone `-game` processes.
 

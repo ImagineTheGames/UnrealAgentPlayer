@@ -179,6 +179,20 @@ public:
     UFUNCTION(BlueprintCallable, Category="Agent|Input")
     bool ClearXRControllerOverride(EAgentXRHand Hand);
 
+    // Opt-in aim-pose emulation for the injected controllers (OFF by default). With it ON the
+    // "<Hand>Aim" motion source answers GripToAim * grip instead of the grip pose itself, so a
+    // laser / distance grab / "where does the player point" check sees the delta a real runtime
+    // has (Quest: pitch -60, (7.35, 0, -6.73) cm). Location AND rotation zero = the Quest
+    // default. Delta is for the RIGHT hand; the left uses its mirror. See AgentMotionController.h.
+    // {"ok":true,"aim_emulation":bool,"delta_source":"quest_default"|"caller",...}
+    UFUNCTION(BlueprintCallable, Category="Agent|Input")
+    FString SetXRAimEmulation(bool bEnabled, FVector GripToAimLocation, FRotator GripToAimRotation);
+
+    // What the injected controllers answer right now: per hand active/tracked, the grip pose and
+    // the aim pose this controller reports for "<Hand>Aim", plus the emulation state.
+    UFUNCTION(BlueprintCallable, Category="Agent|Input")
+    FString GetXRControllerState();
+
     UFUNCTION(BlueprintCallable, Category="Agent|Helpers")
     TArray<FAgentHelperDescriptor> ListTestHelpers();
 
