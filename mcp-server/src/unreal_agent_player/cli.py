@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import argparse
-import asyncio
 import contextlib
 import io
 import itertools
@@ -15,14 +14,48 @@ import time
 from datetime import datetime as datetime_cls
 from datetime import timezone
 
-from unreal_agent_player import contract as _contract
 from unreal_agent_player import coordination as _coord
 from unreal_agent_player import throttle as _throttle
 from unreal_agent_player.errors import AgentError, ErrorCode
 from unreal_agent_player.reporting import session as sess
-from unreal_agent_player.reporting import viewer as _viewer
-from unreal_agent_player.reporting.render import render
-from unreal_agent_player.transport import PythonRemoteExecClient, RemoteControlClient
+
+
+class _Lazy:
+    """A module (or one attribute of it) imported on FIRST USE instead of at startup.
+
+    httpx + asyncio + the contract/transport/report-rendering modules cost ~190 ms to import, and
+    `help`, `lease`, `report note` and the other local-only verbs never touch any of them. The
+    names stay module globals, so `monkeypatch.setattr(cli, "PythonRemoteExecClient", Fake)`
+    still replaces them outright.
+    """
+
+    __slots__ = ("_attr", "_mod", "_obj")
+
+    def __init__(self, mod: str, attr: str | None = None):
+        self._mod = mod
+        self._attr = attr
+        self._obj = None
+
+    def _get(self):
+        if self._obj is None:
+            import importlib
+            m = importlib.import_module(self._mod)
+            self._obj = getattr(m, self._attr) if self._attr else m
+        return self._obj
+
+    def __getattr__(self, name):
+        return getattr(self._get(), name)
+
+    def __call__(self, *a, **kw):
+        return self._get()(*a, **kw)
+
+
+asyncio = _Lazy("asyncio")
+_contract = _Lazy("unreal_agent_player.contract")
+_viewer = _Lazy("unreal_agent_player.reporting.viewer")
+render = _Lazy("unreal_agent_player.reporting.render", "render")
+PythonRemoteExecClient = _Lazy("unreal_agent_player.transport", "PythonRemoteExecClient")
+RemoteControlClient = _Lazy("unreal_agent_player.transport", "RemoteControlClient")
 
 
 def _load_active() -> sess.ReportSession | None:
@@ -71,8 +104,111 @@ def _require_active(agent: str | None = None):
     return s
 
 
+# Output mode for THIS invocation (or batch step). Brief is opt-in -- `--brief` or
+# $UAP_OUTPUT=brief, with `--full` forcing the old shape back -- because a dozen agents' scripts
+# parse today's keys. Default output is byte-for-byte what it always was.
+_OUT: dict = {"brief": False, "verb": ("", ""), "agent": ""}
+
+
+def _want_brief(args) -> bool:
+    if getattr(args, "full", False):
+        return False
+    if getattr(args, "brief", False):
+        return True
+    return os.environ.get("UAP_OUTPUT", "").strip().lower() == "brief"
+
+
+def _set_output_mode(args) -> None:
+    cmd = getattr(args, "cmd", "") or ""
+    sub = ""
+    for attr in ("lease_cmd", "log_cmd", "pie_cmd", "rcmd", "timing_cmd"):
+        if getattr(args, attr, None):
+            sub = getattr(args, attr)
+            break
+    _OUT["brief"] = _want_brief(args)
+    _OUT["verb"] = (cmd, sub)
+    _OUT["agent"] = getattr(args, "agent", None) or os.environ.get("UAP_AGENT_ID", "") or ""
+
+
+def _holder_brief(h) -> dict | None:
+    if not isinstance(h, dict):
+        return None
+    out = {"agent": h.get("agent"), "reason": h.get("reason", "")}
+    if h.get("task"):
+        out["task"] = h.get("task")
+    if h.get("acquired_at"):
+        try:
+            out["age_s"] = round(time.time() - float(h["acquired_at"]))
+        except (TypeError, ValueError):
+            pass
+    return out
+
+
+# Correctness signals a brief log answer must never drop: they say the sweep did not see the
+# whole window, which is exactly when "count 0" is not "nothing happened".
+_LOG_BRIEF_KEYS = ("ok", "cursor", "count", "dropped", "truncated", "stale_cursor",
+                   "scan_incomplete", "omitted", "head_cursor", "warning", "error")
+
+
+def _briefen(obj):
+    """The compact shape of `obj` for the verb being run (brief mode only)."""
+    if not isinstance(obj, dict):
+        return obj
+    cmd, sub = _OUT["verb"]
+    if cmd == "log" and sub in ("tail", "since") and obj.get("count") == 0:
+        return {k: obj[k] for k in _LOG_BRIEF_KEYS if k in obj}
+    if cmd == "lease" and sub in ("acquire", "wait"):
+        out = {"ok": obj.get("ok"), "held": bool(obj.get("granted") or obj.get("held"))}
+        if obj.get("still_waiting"):
+            out.update({"still_waiting": True,
+                        "position": obj.get("position", obj.get("queue_position")),
+                        "holder": (obj.get("holder") or {}).get("agent")
+                        if isinstance(obj.get("holder"), dict) else obj.get("holder"),
+                        "resume": obj.get("resume")})
+        elif not out["held"]:
+            if "queue_position" in obj or "position" in obj:
+                out["position"] = obj.get("position", obj.get("queue_position"))
+            h = obj.get("holder")
+            if h:
+                out["holder"] = h.get("agent") if isinstance(h, dict) else h
+        for k in ("mode", "requeued", "not_queued", "busy", "coordination_unsafe", "error"):
+            if obj.get(k):
+                out[k] = obj[k]
+        if out["held"] and obj.get("queued_seconds"):
+            out["waited_s"] = obj["queued_seconds"]
+        return out
+    if cmd == "lease" and sub == "release":
+        out = {"ok": obj.get("ok"), "released": obj.get("released")}
+        for k in ("pie_live", "error"):
+            if obj.get(k):
+                out[k] = obj[k]
+        if obj.get("lease_evicted"):
+            out["lease_evicted"] = (obj["lease_evicted"] or {}).get("why", True)
+        return out
+    if cmd == "lease" and sub == "status" and "queue" in obj:
+        agent = _OUT.get("agent") or ""
+        queue = list(obj.get("queue") or [])
+        mh = ((obj.get("machine") or {}).get("holder")) or None
+        out = {"ok": obj.get("ok", True), "holder": _holder_brief(obj.get("exclusive")),
+               "queue": queue,
+               "my_position": (queue.index(agent) + 1) if agent in queue else 0,
+               "machine_holder": (f"{mh.get('agent')}@{mh.get('project')}"
+                                  if isinstance(mh, dict) else None)}
+        if obj.get("shared"):
+            out["shared"] = [h.get("agent") for h in obj["shared"] if isinstance(h, dict)]
+        return out
+    if obj.get("busy") and "blocked_by" in obj:
+        # The guard's "another agent holds the editor" answer: the names are the information,
+        # the 300-byte hint is the same every time.
+        return {k: v for k, v in obj.items() if k not in ("hint", "blocked_task")}
+    return obj
+
+
 def _emit(obj: dict) -> None:
-    print(json.dumps(obj))
+    if _OUT["brief"]:
+        print(json.dumps(_briefen(obj), separators=(",", ":")))
+    else:
+        print(json.dumps(obj))
 
 
 def _err(exc: Exception) -> dict:
@@ -383,12 +519,19 @@ def _rc_port_for(project: str | None) -> int:
     return 30010
 
 
+# Set (only) by _status_probe for the duration of its call: a short RC timeout for a liveness
+# probe. Kept out of _rc_call's signature so every caller and test double stays as it was.
+_RC_PROBE_TIMEOUT: list = [None]
+
+
 def _rc_call(func: str, params: dict, project: str | None = None):
     port = _rc_port_for(project)
+    timeout = _RC_PROBE_TIMEOUT[0]
 
     def _call(p: int):
         async def _go():
-            rc = RemoteControlClient(port=p)
+            rc = RemoteControlClient(port=p) if timeout is None else \
+                RemoteControlClient(port=p, timeout=timeout)
             try:
                 return await rc.call_preset(func, params)
             finally:
@@ -397,7 +540,11 @@ def _rc_call(func: str, params: dict, project: str | None = None):
 
     try:
         return _call(port)
-    except AgentError:
+    except AgentError as exc:
+        # A short-timeout PROBE that timed out reached a live listener whose game thread is
+        # busy: the port is right, and re-resolving it over remote-exec would only add seconds.
+        if timeout is not None and _is_timeout(exc):
+            raise
         # The cached/default port may be stale (editor restarted on a different port).
         # Re-resolve once via exec and retry -- unless an explicit env override pins the port.
         if project and not os.environ.get("UAP_RC_PORT"):
@@ -527,6 +674,30 @@ def _capture(tool: str, args: dict, body: dict, ms: int) -> None:
         pass
 
 
+def _is_timeout(exc: Exception) -> bool:
+    cause = getattr(exc, "__cause__", None)
+    return type(cause).__name__.endswith("Timeout") or "timed out" in str(exc).lower()
+
+
+# The `status` liveness probe. It used the 10s RC default, so a busy editor made `status` take
+# 10-11.5s at p90 before saying anything. A probe answers in milliseconds or not at all: 3s, one
+# quick retry. $UAP_STATUS_TIMEOUT overrides.
+_STATUS_PROBE_TIMEOUT = 3.0
+
+
+def _status_probe(project: str | None):
+    _RC_PROBE_TIMEOUT[0] = _float_env("UAP_STATUS_TIMEOUT", _STATUS_PROBE_TIMEOUT) or None
+    try:
+        try:
+            return _rc_call("GetPluginVersion", {}, project)
+        except AgentError as exc:
+            if not _is_timeout(exc):
+                raise
+        return _rc_call("GetPluginVersion", {}, project)    # one quick retry
+    finally:
+        _RC_PROBE_TIMEOUT[0] = None
+
+
 def _status(args) -> int:
     """Preflight. Also the ONE place the CLI/plugin skew check runs by default, because it is
     the call every documented workflow starts with -- so a project whose plugin copy is behind
@@ -539,16 +710,25 @@ def _status(args) -> int:
     t0 = time.monotonic()
     out = {"ok": True, "rc_reachable": False, "plugin_version": None, "rc_port": _rc_port_for(args.project)}
     try:
-        ver = _rc_call("GetPluginVersion", {}, args.project)
+        ver = _status_probe(args.project)
         out["rc_reachable"] = True
         out["plugin_version"] = ver
     except AgentError as exc:
         out["ok"] = False
         out["error"] = str(exc)
-    if out["rc_reachable"]:
+    # Brief mode skips the contract fetch unless asked (--contract); the default shape keeps it.
+    brief = _OUT["brief"]
+    if out["rc_reachable"] and (not brief or getattr(args, "contract", False)):
         out["contract"] = _contract_report(args.project)
     _capture("status", {}, out, int((time.monotonic() - t0) * 1000))
-    _emit(out)
+    if brief:
+        c = out.get("contract")
+        _emit({"ok": out["ok"], "rc_port": out["rc_port"],
+               "contract_ok": (c.get("state") == "current") if isinstance(c, dict) else None,
+               "message": (out.get("error") or (c or {}).get("message")
+                           or ("" if c else "contract not checked (pass --contract)"))})
+    else:
+        _emit(out)
     return 0 if out["rc_reachable"] else 1
 
 
@@ -2479,8 +2659,131 @@ Per-verb flags: uap <verb> --help
 """
 
 
+# `uap help` used to print all of _HELP_CATALOG (27 KB) and agents called it 2-6 times a run.
+# Now it prints this index; `uap help <verb|topic>` prints just that part of the catalog, and
+# `uap help --all` prints the whole catalog exactly as before (plus the NEW section below).
+_HELP_INDEX = r"""uap -- drive the Unreal editor for agent testing. This is the SHORT index.
+  uap help <verb|topic>   detail for one verb      uap help --all   everything (the old text)
+  uap <verb> --help       that verb's flags
+
+RULES THAT BITE
+  * Run via this project's uap.ps1 (pins the editor). Pass the SAME --agent <tok> on every call.
+  * Done = `uap report finish` wrote the HTML report (cite its path), with a screenshot taken
+    by `uap screenshot <abs.png>` from THIS editor. Assert on state you read, not on pixels.
+  * One shared editor: rebuild ONLY via Restart-Editor.ps1. Editor verbs auto-wait through
+    another agent's rebuild or exclusive lease -- slow is not failed.
+  * <= 5 fps means the editor is NOT FOREGROUND (throttled); timings taken then are void.
+  * Never tight-loop exec/rc while PIE is starting: it can hard-crash the editor.
+
+SAVE TOKENS AND TIME
+  $env:UAP_OUTPUT='brief'    compact JSON (~300 B) on lease/status/log; --full = old shape
+  uap lease acquire exclusive --reason pie --agent <tok> --max-block 110
+                             returns within 110s: held:true, or still_waiting:true + position
+                             (your queue place is KEPT -- the harness kill no longer loses it)
+  uap lease wait --agent <tok> --seconds 110      resume from that place. NEVER poll
+                             `lease status` + sleep. $UAP_MAX_BLOCK caps every auto-wait too.
+  uap batch "pie start" "exec print(1)" "pie stop"   many verbs, ONE process (11.0s -> 0.75s)
+
+VERBS (uap help <verb>)
+  status                         liveness, RC port, plugin contract (--contract in brief mode)
+  report start|assert|note|screenshot|diag|finish     the verification record
+  pie start|stop|wait            play-in-editor; start blocks until the world is live
+  lease acquire|wait|release|status|heartbeat|machine-status|machine-release
+  exec "<py>" | exec-file <p>    Python in the editor (read state; never drive RPCs from it)
+  rc <Func> k=v ...              a plugin UFUNCTION over Remote Control
+  read-ui | click <text> | tab <id> | nav <dir>     on-screen UMG / CommonUI
+  screenshot <abs.png> [--window <client>]          3D + UI composite; standalone clients
+  input hold|axis|release|status|mouse              sustained / analog / mouse input
+  sample start|read              per-frame property series (sub-second truth)
+  log cursor|tail|since          editor log ring; --grep, cursor-based sweeps
+  helpers | instances            project test helpers | which processes answer
+  batch "<cmd>" ... | --file f   several verbs in one process
+  timing report [--agent X] [--since 1h]   per-agent uap time, waits, think-time gaps
+TOPICS: mistakes, coordination, machine, mouse, recipes, speed, flags, output
+MORE: docs/agent-testing.md, docs/capabilities.md, docs/known-issues.md
+"""
+
+_HELP_NEW = r"""NEW: BRIEF OUTPUT, HARNESS-SAFE WAITS, TIMING
+  Brief output is OPT-IN: --brief or $UAP_OUTPUT=brief; --full forces the default shape back.
+    lease status   {ok, holder{agent,reason,task,age_s}, queue:[names], my_position, machine_holder}
+    lease acquire|wait|release   one compact line (held / still_waiting / position / resume)
+    status         {ok, rc_port, contract_ok, message}; the contract fetch is skipped unless
+                   --contract (contract_ok is then null)
+    log tail|since with count 0  counts only -- dropped / truncated / stale_cursor / warning are
+                   ALWAYS kept: they say the sweep was blind, which is when 0 means nothing.
+  Waiting without losing your place (an agent harness kills a call after 120-600s):
+    uap lease acquire exclusive --reason pie --agent <tok> --max-block 110 [--wait 900]
+      -> {"held":true,...} or {"held":false,"still_waiting":true,"position":3,"holder":"x",
+          "resume":"uap lease wait --agent <tok>"}. The place is PARKED for 180s
+          ($UAP_WAITER_PARK_TTL) between calls; --wait stays the TOTAL budget across resumes.
+    uap lease wait --agent <tok> --seconds 110      resume. Same answers. `not_queued` if you
+          never queued; `requeued:true` if your park expired and you went to the back.
+    --max-block / $UAP_MAX_BLOCK also caps the automatic waits (another agent's exclusive
+    lease, a rebuild, the machine lock): the call returns busy + still_waiting instead of
+    being killed mid-wait. Re-run the same command to keep waiting.
+  Timing log: one JSONL line per uap call in <reports>/.timing/<project>.jsonl (verb only, no
+    args; $UAP_TIMING_LOG=0 turns it off). `uap timing report [--agent X] [--since 1h]` sums
+    calls, uap time, wait time and the gaps between one agent's calls (its think time).
+"""
+
+_HELP_SECTIONS = {
+    "mistakes": ("COMMON MISTAKES",),
+    "status": ("PREFLIGHT",),
+    "preflight": ("PREFLIGHT",),
+    "report": ("REPORT",),
+    "pie": ("PLAY-IN-EDITOR",),
+    "lease": ("MULTI-AGENT COORDINATION", "TWO PROJECTS", "NEW:"),
+    "coordination": ("MULTI-AGENT COORDINATION", "NEW:"),
+    "machine": ("TWO PROJECTS",),
+    "rc": ("DRIVE + OBSERVE",), "exec": ("DRIVE + OBSERVE",),
+    "exec-file": ("DRIVE + OBSERVE",), "read-ui": ("DRIVE + OBSERVE",),
+    "click": ("DRIVE + OBSERVE",), "tab": ("DRIVE + OBSERVE",), "nav": ("DRIVE + OBSERVE",),
+    "screenshot": ("DRIVE + OBSERVE",), "helpers": ("DRIVE + OBSERVE",),
+    "instances": ("DRIVE + OBSERVE", "FLAGS:"),
+    "input": ("SUSTAINED INPUT", "MOUSE"),
+    "mouse": ("MOUSE",),
+    "sample": ("SAMPLING + LOGS",), "log": ("SAMPLING + LOGS",),
+    "recipes": ("RECIPES",),
+    "batch": ("SPEED:",), "speed": ("SPEED:",),
+    "flags": ("FLAGS:",),
+    "output": ("NEW:",), "brief": ("NEW:",), "timing": ("NEW:",), "wait": ("NEW:",),
+}
+_HELP_HEADS = ("COMMON MISTAKES", "PREFLIGHT", "REPORT", "PLAY-IN-EDITOR",
+               "MULTI-AGENT COORDINATION", "TWO PROJECTS", "DRIVE + OBSERVE", "SUSTAINED INPUT",
+               "MOUSE", "SAMPLING + LOGS", "RECIPES", "SPEED:", "FLAGS:", "MORE:", "NEW:")
+
+
+def _help_sections(text: str) -> dict:
+    """Split the catalog into {header-prefix: section text} on its top-level headers."""
+    out: dict = {}
+    cur = None
+    for line in text.splitlines():
+        head = next((h for h in _HELP_HEADS if line.startswith(h)), None)
+        if head:
+            cur = head
+            out[cur] = [line]
+        elif cur:
+            out[cur].append(line)
+    return {k: "\n".join(v).rstrip() for k, v in out.items()}
+
+
 def _help(args) -> int:
-    print(_HELP_CATALOG)
+    full = _HELP_CATALOG.rstrip() + "\n\n" + _HELP_NEW
+    if getattr(args, "all", False):
+        print(full)
+        return 0
+    topic = (getattr(args, "topic", None) or "").strip().lower()
+    if not topic:
+        print(_HELP_INDEX)
+        return 0
+    heads = _HELP_SECTIONS.get(topic)
+    if heads is None:
+        print(f"uap help: no topic {topic!r}. Verbs and topics are listed by `uap help`; "
+              f"`uap help --all` prints everything.")
+        return 2
+    sections = _help_sections(full)
+    print("\n\n".join(sections[h] for h in heads if h in sections))
+    print(f"\n(flags: uap {topic} --help   everything: uap help --all)")
     return 0
 
 
@@ -2585,20 +2888,31 @@ def _lease(args) -> int:
 def _lease_inner(args) -> int:
     proj = getattr(args, "project", "") or _env_project()
     cmd = args.lease_cmd
-    if cmd == "acquire":
+    if cmd in ("acquire", "wait"):
         task = _task_label(args)
-        res = _coord.acquire(proj, args.mode, reason=args.reason, agent=args.agent,
-                             pid=args.pid, wait=args.wait, ttl=args.ttl, task=task,
-                             requested_by=_requested_by(
-                                 args, args.agent or _coord.default_agent_id()))
+        mb = _max_block(args)
+        if cmd == "acquire":
+            res = _coord.acquire(proj, args.mode, reason=args.reason, agent=args.agent,
+                                 pid=args.pid, wait=args.wait, ttl=args.ttl, task=task,
+                                 requested_by=_requested_by(
+                                     args, args.agent or _coord.default_agent_id()),
+                                 max_block=mb)
+            mode, reason, pid, ttl, wait = args.mode, args.reason, args.pid, args.ttl, args.wait
+        else:
+            secs = args.seconds if args.seconds is not None else (mb if mb is not None else 110.0)
+            res = _coord.wait_turn(proj, agent=args.agent, seconds=secs, mode=args.mode,
+                                   reason=args.reason, task=task or None)
+            mode, reason = res.get("mode") or "exclusive", res.get("reason") or ""
+            pid, ttl, wait, mb = 0, None, secs, secs
         # A declared foreground hold (pie / level / input ...) is a claim on the whole
         # workstation, not just this project's editor, so take the machine turn as well. If the
         # OTHER project has it, give the project lease straight back rather than sitting on a
         # half-held claim that blocks this project's other agents for nothing.
-        if res.get("granted") and _lease_takes_machine(args.mode, args.reason) \
-                and _coord.machine_lock_enabled():
-            mach = _coord.acquire_machine(proj, reason=args.reason, agent=res["agent"],
-                                          pid=args.pid, wait=args.wait, ttl=args.ttl, task=task)
+        if res.get("granted") and not res.get("already_held") \
+                and _lease_takes_machine(mode, reason) and _coord.machine_lock_enabled():
+            mach = _coord.acquire_machine(proj, reason=reason, agent=res["agent"],
+                                          pid=pid, wait=wait if mb is None else min(wait, mb),
+                                          ttl=ttl, task=task)
             if mach.get("busy"):
                 _coord.release(proj, agent=res["agent"])
                 res = dict(mach)
@@ -2721,11 +3035,23 @@ def build_parser() -> argparse.ArgumentParser:
                       help="which instance of that project: 'editor' (default), 'pid:<n>', or "
                            "a substring of the process command line (e.g. Context_2). "
                            "`uap instances` lists what is answering.")
+    # Output mode + harness-safe waiting, accepted by every verb like the flags above.
+    proj.add_argument("--brief", action="store_true", default=False,
+                      help="compact output (also $UAP_OUTPUT=brief). Opt-in; default unchanged.")
+    proj.add_argument("--full", action="store_true", default=False,
+                      help="force the default (full) output even when $UAP_OUTPUT=brief")
+    proj.add_argument("--max-block", dest="max_block", type=float, default=None, metavar="S",
+                      help="return within S seconds from any wait (default $UAP_MAX_BLOCK, "
+                           "unset = old behaviour). A lease acquire keeps its queue place; "
+                           "resume with `uap lease wait`.")
     common = proj
 
-    sub.add_parser("help", parents=[common],
-                   help="catalog of verbs + copy-paste recipes").set_defaults(func=_help)
-    sub.add_parser("tools", parents=[common], help="alias of help").set_defaults(func=_help)
+    for name, text in (("help", "short index; `help <verb>` for detail, `help --all` for all"),
+                       ("tools", "alias of help")):
+        hlp = sub.add_parser(name, parents=[common], help=text)
+        hlp.add_argument("topic", nargs="?", default=None, help="verb or topic")
+        hlp.add_argument("--all", action="store_true", help="the whole catalog (old `uap help`)")
+        hlp.set_defaults(func=_help)
 
     rep = sub.add_parser("report").add_subparsers(dest="rcmd", required=True)
     rs = rep.add_parser("start", parents=[common])
@@ -2775,6 +3101,9 @@ def build_parser() -> argparse.ArgumentParser:
     rf.set_defaults(func=_report_finish)
 
     st = sub.add_parser("status", parents=[proj])
+    st.add_argument("--contract", action="store_true",
+                    help="fetch the CLI/plugin contract in brief mode too (the default shape "
+                         "always includes it)")
     st.set_defaults(func=_status)
     rcp = sub.add_parser("rc", parents=[proj])
     rcp.add_argument("rc_func")
@@ -3060,6 +3389,16 @@ def build_parser() -> argparse.ArgumentParser:
                          "as rebuild-<pid> (default: $UAP_AGENT_ID when it differs from --agent). "
                          "Shown next to the token in `uap lease status` and the overlay.")
     la.set_defaults(func=_lease)
+    lzw = lzs.add_parser("wait", parents=[proj],
+                         help="resume a `lease acquire --max-block` wait WITHOUT losing your "
+                              "queue place")
+    lzw.add_argument("--seconds", type=float, default=None,
+                     help="max seconds to block this call (default --max-block, "
+                          "$UAP_MAX_BLOCK, else 110)")
+    lzw.add_argument("--mode", choices=["exclusive", "shared"], default=None,
+                     help="only needed if you were never queued (default: the parked request)")
+    lzw.add_argument("--reason", default=None)
+    lzw.set_defaults(func=_lease)
     lzr = lzs.add_parser("release", parents=[proj])
     lzr.add_argument("--force", action="store_true",
                      help="release even though PIE is still in progress. Without it, release "
@@ -3084,6 +3423,15 @@ def build_parser() -> argparse.ArgumentParser:
                           "releasing and has not aged out yet -- check `lease machine-status` "
                           "first, because the other project may simply still be playing.")
     lzm.set_defaults(func=_lease)
+
+    tm = sub.add_parser("timing", help="per-call timing log: summaries per agent")
+    tms = tm.add_subparsers(dest="timing_cmd", required=True)
+    tr = tms.add_parser("report", parents=[proj],
+                        help="calls, uap time, wait time and think-time gaps per agent")
+    tr.add_argument("--since", default="1h", help="window: 90s, 15m, 1h, 2d (default 1h)")
+    tr.add_argument("--all-projects", action="store_true",
+                    help="every project's log, not just --project / $UAP_PROJECT")
+    tr.set_defaults(func=_timing_report)
 
     # --- batch --------------------------------------------------------------------------
     b = sub.add_parser(
@@ -3174,6 +3522,9 @@ def _batch(args) -> int:
             argv = [*argv, "--agent", args.agent]
         if "--task" not in argv and getattr(args, "task_label", None):
             argv = [*argv, "--task", args.task_label]
+        for flag in ("--brief", "--full"):
+            if getattr(args, flag[2:], False) and flag not in argv:
+                argv = [*argv, flag]
         step: dict = {"step": i + 1, "argv": argv}
         buf = io.StringIO()
         try:
@@ -3193,6 +3544,7 @@ def _batch(args) -> int:
             step["body"] = None
             step["output"] = out
         results.append(step)
+        _set_output_mode(args)               # the step set its own; the batch lines are ours
         _emit(step)                          # stream, so a long batch is never silent
         if code != 0:
             failed += 1
@@ -3211,27 +3563,236 @@ def _batch(args) -> int:
     return 0 if failed == 0 else 1
 
 
-def _lease_wait_cap() -> float:
+def _max_block(args=None) -> float | None:
+    """--max-block, else $UAP_MAX_BLOCK, else None (= the old, unbounded-by-harness waits)."""
+    v = getattr(args, "max_block", None) if args is not None else None
+    if v is None:
+        raw = os.environ.get("UAP_MAX_BLOCK", "").strip()
+        if raw:
+            try:
+                v = float(raw)
+            except ValueError:
+                v = None
+    return None if v is None else max(0.0, float(v))
+
+
+def _lease_wait_cap(args=None) -> float:
     """Seconds an editor op will wait out another agent's exclusive lease.
 
     $UAP_LEASE_WAIT overrides (0 = do not wait, fail fast with `busy`). Bounded, because a
-    forgotten lease must degrade into a clear error rather than a hang.
+    forgotten lease must degrade into a clear error rather than a hang. --max-block /
+    $UAP_MAX_BLOCK caps it further, so a wait never outlives the agent harness's tool timeout.
     """
     raw = os.environ.get("UAP_LEASE_WAIT")
-    if raw is None or raw.strip() == "":
-        return _coord.DEFAULT_WAIT_CAP
+    cap = _coord.DEFAULT_WAIT_CAP
+    if raw is not None and raw.strip() != "":
+        try:
+            cap = max(0.0, float(raw))
+        except ValueError:
+            cap = _coord.DEFAULT_WAIT_CAP
+    mb = _max_block(args)
+    return cap if mb is None else min(cap, mb)
+
+
+# Time this invocation spent in guard waits / lock passes (for the timing log).
+_TIMING: dict = {"guard_ms": 0.0}
+_TIMING_OFF = {"0", "false", "no", "off"}
+_TIMING_MAX_BYTES = 10 * 1024 * 1024
+_TIMING_TAIL_BYTES = 65536
+
+
+class _CountingOut:
+    """stdout wrapper that counts what this invocation printed (timing log `out_bytes`)."""
+
+    def __init__(self, inner):
+        self.inner = inner
+        self.n = 0
+
+    def write(self, text):
+        self.n += len(text)
+        return self.inner.write(text)
+
+    def __getattr__(self, name):
+        return getattr(self.inner, name)
+
+
+def _timing_path(project: str) -> pathlib.Path:
+    root = os.environ.get("UAP_REPORTS_DIR")
+    base = pathlib.Path(root) if root else (pathlib.Path.home() / ".uap-reports")
+    slug = re.sub(r"[^A-Za-z0-9]+", "-", project or "").strip("-").lower() or "_default"
+    return base / ".timing" / f"{slug}.jsonl"
+
+
+def _timing_marker(path: pathlib.Path, agent: str) -> pathlib.Path:
+    slug = re.sub(r"[^A-Za-z0-9_.-]+", "-", agent).strip("-.")[:80] or "_"
+    return path.parent / "last" / f"{path.stem}.{slug}"
+
+
+def _timing_gap(path: pathlib.Path, agent: str, t_start: float) -> float | None:
+    """ms since `agent`'s previous call in this project ENDED. None for its first call.
+
+    Read from the MTIME of an empty per-agent marker file, set to the previous call's end. Not
+    from the log: reading a file another process has just written costs ~17 ms here (the
+    on-access virus scan), against ~0.1 ms for a stat.
+    """
     try:
-        return max(0.0, float(raw))
-    except ValueError:
-        return _coord.DEFAULT_WAIT_CAP
+        return round(max(0.0, t_start - os.stat(_timing_marker(path, agent)).st_mtime) * 1000, 1)
+    except OSError:
+        return None
+
+
+def _timing_record(args, t_start: float, m0: float, rc, nbytes: int) -> None:
+    """Append ONE short line for this invocation. Never raises, never takes a lock.
+
+    One os.write on an O_APPEND descriptor. The verb only -- never the arguments, which carry
+    paths and script text. Rotation (size check) runs on ~1 call in 50, not every call.
+    """
+    try:
+        if os.environ.get("UAP_TIMING_LOG", "").strip().lower() in _TIMING_OFF:
+            return
+        t_end = time.time()
+        if args is not None:
+            cmd = getattr(args, "cmd", "") or ""
+            sub = next((getattr(args, a) for a in ("lease_cmd", "log_cmd", "pie_cmd", "rcmd",
+                                                   "timing_cmd")
+                        if getattr(args, a, None)), "")
+            verb = f"{cmd} {sub}".strip()
+            agent = getattr(args, "agent", None) or os.environ.get("UAP_AGENT_ID") or ""
+            project = getattr(args, "project", "") or _env_project()
+        else:
+            verb, agent, project = "(parse error)", os.environ.get("UAP_AGENT_ID") or "", \
+                _env_project()
+        agent = _coord.sanitize_label(agent)
+        path = _timing_path(project)
+        rec = {"ts_start": round(t_start, 3), "ts_end": round(t_end, 3), "agent": agent,
+               "verb": verb, "project": project,
+               "duration_ms": round((time.monotonic() - m0) * 1000, 1),
+               "guard_ms": round(_TIMING["guard_ms"], 1),
+               "exit": rc if isinstance(rc, int) else (0 if rc is None else 1),
+               "out_bytes": nbytes,
+               "gap_ms": _timing_gap(path, agent, t_start) if agent else None}
+        line = (json.dumps(rec, separators=(",", ":")) + "\n").encode("utf-8")
+        flags = os.O_WRONLY | os.O_APPEND | os.O_CREAT | getattr(os, "O_BINARY", 0)
+        try:
+            fd = os.open(path, flags, 0o644)
+        except FileNotFoundError:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            fd = os.open(path, flags, 0o644)
+        try:
+            os.write(fd, line)
+        finally:
+            os.close(fd)
+        if agent:
+            mark = _timing_marker(path, agent)
+            try:
+                os.utime(mark, (t_end, t_end))
+            except FileNotFoundError:
+                mark.parent.mkdir(parents=True, exist_ok=True)
+                mark.touch()
+                os.utime(mark, (t_end, t_end))
+        if (time.monotonic_ns() // 1000) % 50 == 0 and path.stat().st_size > _TIMING_MAX_BYTES:
+            os.replace(path, path.with_name(path.name + ".1"))
+    except Exception:
+        pass
+
+
+def _parse_window(text: str) -> float:
+    m = re.fullmatch(r"\s*(\d+(?:\.\d+)?)\s*([smhd]?)\s*", str(text or ""))
+    if not m:
+        raise ValueError(f"bad --since {text!r}; use e.g. 90s, 15m, 1h, 2d")
+    return float(m.group(1)) * {"": 1, "s": 1, "m": 60, "h": 3600, "d": 86400}[m.group(2)]
+
+
+def _pct(vals: list, q: float) -> float:
+    v = sorted(vals)
+    return v[min(len(v) - 1, round(q * (len(v) - 1)))] if v else 0.0
+
+
+def _timing_report(args) -> int:
+    try:
+        window = _parse_window(args.since)
+    except ValueError as exc:
+        _emit({"ok": False, "error": str(exc)})
+        return 2
+    cutoff = time.time() - window
+    proj = getattr(args, "project", "") or _env_project()
+    base = _timing_path(proj).parent
+    if getattr(args, "all_projects", False) or not proj:
+        files = sorted(base.glob("*.jsonl*")) if base.is_dir() else []
+    else:
+        p0 = _timing_path(proj)
+        files = [p0.with_name(p0.name + ".1"), p0]
+    rows: list = []
+    for f in files:
+        try:
+            with open(f, encoding="utf-8", errors="replace") as fh:
+                for line in fh:
+                    try:
+                        r = json.loads(line)
+                    except ValueError:
+                        continue            # a torn or interleaved line: skip, never fail
+                    if isinstance(r, dict) and float(r.get("ts_start", 0)) >= cutoff:
+                        rows.append(r)
+        except OSError:
+            continue
+    want = getattr(args, "agent", None)
+    by: dict = {}
+    for r in sorted(rows, key=lambda r: float(r.get("ts_start", 0))):
+        a = r.get("agent") or "(none)"
+        if want and a != want:
+            continue
+        by.setdefault(a, []).append(r)
+    agents = []
+    for a, rs in by.items():
+        gaps = []
+        for i, r in enumerate(rs):
+            g = r.get("gap_ms")
+            if g is not None and i > 0:
+                gaps.append((float(g), rs[i - 1].get("verb"), r.get("verb")))
+        gv = [g[0] for g in gaps]
+        top = sorted(gaps, key=lambda g: -g[0])[:5]
+        agents.append({
+            "agent": a, "calls": len(rs),
+            "uap_s": round(sum(float(r.get("duration_ms") or 0) for r in rs) / 1000, 1),
+            "wait_s": round(sum(float(r.get("guard_ms") or 0) for r in rs) / 1000, 1),
+            "gap_med_s": round(_pct(gv, 0.5) / 1000, 1),
+            "gap_p90_s": round(_pct(gv, 0.9) / 1000, 1),
+            "gap_max_s": round(max(gv) / 1000, 1) if gv else 0.0,
+            "top_gaps": [f"{g / 1000:.1f}s {b} -> {n}" for g, b, n in top]})
+    agents.sort(key=lambda x: -x["uap_s"])
+    out = {"ok": True, "since": args.since, "calls": sum(x["calls"] for x in agents),
+           "agents": agents}
+    if getattr(args, "full", False):
+        print(json.dumps(out, indent=1))
+    else:
+        print(json.dumps(out, separators=(",", ":")))
+    return 0
 
 
 def main(argv: list[str] | None = None) -> int:
-    return _run_parsed(build_parser().parse_args(argv))
+    t_start = time.time()
+    m0 = time.monotonic()
+    _TIMING["guard_ms"] = 0.0
+    out = _CountingOut(sys.stdout)
+    sys.stdout = out
+    args = None
+    rc = 1
+    try:
+        args = build_parser().parse_args(argv)
+        rc = _run_parsed(args)
+        return rc
+    except SystemExit as exc:
+        rc = exc.code if isinstance(exc.code, int) else (0 if exc.code is None else 2)
+        raise
+    finally:
+        if sys.stdout is out:
+            sys.stdout = out.inner
+        _timing_record(args, t_start, m0, rc, out.n)
 
 
 def _run_parsed(args) -> int:
     cmd = getattr(args, "cmd", None)
+    _set_output_mode(args)
     project = getattr(args, "project", "") or _env_project()
     # `screenshot --window` captures a standalone game client from the OS side. It touches no
     # editor, takes no input and needs no foreground, so it must not queue behind a rebuild, an
@@ -3239,12 +3800,74 @@ def _run_parsed(args) -> int:
     # otherwise wait on itself, and a rebuild of the editor has nothing to do with the client.
     if cmd == "screenshot" and getattr(args, "window", None):
         return args.func(args)
-    # Coordination: if another agent is rebuilding this editor (it's down), wait it out instead of
-    # hard-failing, then proceed against the relaunched editor. Fail-open; only editor-touching
-    # verbs are guarded (lease/report verbs manage or don't need the editor).
     # Say who is using the editor before anything can block, so a call stuck behind a lease or a
     # rebuild still appears (with its task) in `uap lease status` and the overlay. Display only.
     task = _task_label(args)
+    g0 = time.monotonic()
+    tracked = False
+    try:
+        fast = _guard_fast(args, cmd, project, task)
+        if fast is None:
+            rc = _guard_slow(args, cmd, project, task)
+            if rc is not None:
+                return rc
+        elif fast.get("eviction"):
+            _emit(_eviction_body(fast["eviction"], cmd,
+                                 getattr(args, "agent", None) or _coord.default_agent_id()))
+            return 1
+        else:
+            tracked = bool(fast.get("tracked"))
+    finally:
+        _TIMING["guard_ms"] += (time.monotonic() - g0) * 1000
+
+    # ...and finally the MACHINE turn, for the verbs that contend for the one keyboard / one
+    # foreground window / one GPU this workstation has. Without it, a project lease said nothing
+    # about the OTHER project's editor: a Project Broken Wings agent could start PIE while a
+    # School's Out VR agent was mid-session, and neither lease noticed.
+    return _run_under_machine_lock(args, cmd, project, tracked=tracked)
+
+
+def _guard_fast(args, cmd, project: str, task: str) -> dict | None:
+    """The guard chain's uncontended case in ONE locked pass (coordination.guard_pass).
+
+    Returns the pass result when it settled everything (activity note, rebuild check, lease
+    check, eviction notice, own-lease heartbeat and -- when no machine-lock step comes between --
+    the in-flight record), or None when the full chain must run: a rebuild, another agent's
+    exclusive lease, a reap that is due, or any coordination error. Verbs outside the guard sets
+    get {"clear": True} and touch no state at all, exactly as before.
+    """
+    if cmd not in _REBUILD_GUARDED:
+        return {"clear": True, "tracked": False}
+    who = getattr(args, "agent", None) or os.environ.get("UAP_AGENT_ID")
+    agent = getattr(args, "agent", None) or _coord.default_agent_id()
+    # The in-flight record may only be folded in when nothing can wait between it and the verb:
+    # a call queued on the OTHER project's machine turn must not count as activity here.
+    machine_step = _machine_guard(args, cmd) is not None and _coord.machine_lock_enabled()
+    try:
+        res = _coord.guard_pass(project, agent=who or agent, verb=_machine_reason(args, cmd),
+                                task=task, note=bool(who or task),
+                                lease_guarded=cmd in _LEASE_GUARDED, track=not machine_step)
+    except Exception:
+        return None
+    return res if res.get("clear") else None
+
+
+def _eviction_body(note: dict, cmd, agent: str) -> dict:
+    return {"ok": False, "lease_evicted": True, "why": note.get("why"),
+            "error": note.get("message"), "held_reason": note.get("held_reason"),
+            "evicted_at": note.get("evicted_at"), "cmd": cmd, "agent": agent,
+            "hint": "your lease is gone and so is the session it protected. Wait for the "
+                    "editor (Restart-Editor.ps1 if it needs relaunching), then re-acquire "
+                    "with `uap lease acquire exclusive --reason pie --agent <token>` and "
+                    "re-run this command. `uap lease status` shows last_eviction."}
+
+
+def _guard_slow(args, cmd, project: str, task: str) -> int | None:
+    """The original per-call guard chain, step by step, with its waits. None = proceed."""
+    mb = _max_block(args)
+    # Coordination: if another agent is rebuilding this editor (it's down), wait it out instead of
+    # hard-failing, then proceed against the relaunched editor. Fail-open; only editor-touching
+    # verbs are guarded (lease/report verbs manage or don't need the editor).
     if cmd in _REBUILD_GUARDED:
         # First, before this call counts as activity itself: a PIE session uap started that nobody
         # has driven for the idle window, or whose lease aged out, is stopped here
@@ -3258,9 +3881,18 @@ def _run_parsed(args) -> int:
             except Exception:
                 pass
         try:
-            _coord.wait_while_rebuild(project)
+            rb = _coord.wait_while_rebuild(
+                project, wait=_coord.DEFAULT_WAIT_CAP if mb is None else mb)
         except Exception:
-            pass
+            rb = {"ok": True}
+        if mb is not None and rb.get("timed_out"):
+            holder = rb.get("holder") or {}
+            _emit({"ok": False, "busy": True, "rebuilding": True, "still_waiting": True,
+                   "blocked_by": holder.get("agent"), "cmd": cmd,
+                   "waited_seconds": mb, "resume": "re-run the same command",
+                   "hint": "the editor is being rebuilt; --max-block returned before the "
+                           "harness could kill the call. Re-run to keep waiting."})
+            return 1
     # ...and wait out any OTHER agent's exclusive lease. Without this the lease was advisory
     # only: `lease acquire exclusive --reason pie` recorded a holder that nothing consulted, so
     # other agents drove the editor straight through it (swapping levels and starting PIE under
@@ -3268,18 +3900,22 @@ def _run_parsed(args) -> int:
     if cmd in _LEASE_GUARDED:
         agent = getattr(args, "agent", None) or _coord.default_agent_id()
         try:
-            res = _coord.wait_if_blocked(project, agent=agent, wait=_lease_wait_cap())
+            res = _coord.wait_if_blocked(project, agent=agent, wait=_lease_wait_cap(args))
         except Exception:
             res = {"ok": True, "blocked": False}
         if not res.get("ok", True) and res.get("blocked"):
             holder = res.get("holder") or {}
-            _emit({"ok": False, "busy": True, "blocked_by": holder.get("agent"),
+            body = {"ok": False, "busy": True, "blocked_by": holder.get("agent"),
                     "blocked_task": holder.get("task", ""),
                     "reason": holder.get("reason"), "cmd": cmd, "agent": agent,
                     "hint": "another agent holds the exclusive editor lease; wait, or pass "
                             "--agent/$UAP_AGENT_ID if that lease is yours "
                             "(`uap lease status` to inspect, `uap lease release --agent <token>` "
-                            "if it is abandoned)"})
+                            "if it is abandoned)"}
+            if mb is not None:
+                body["still_waiting"] = True
+                body["resume"] = "re-run the same command"
+            _emit(body)
             return 1
         # If the editor died under our pie/level lease, the lease was voided (coordination.py,
         # `_evict_dead_editor`) and the PIE session / loaded level this agent thinks it has died
@@ -3290,13 +3926,7 @@ def _run_parsed(args) -> int:
         except Exception:
             note = None
         if note:
-            _emit({"ok": False, "lease_evicted": True, "why": note.get("why"),
-                   "error": note.get("message"), "held_reason": note.get("held_reason"),
-                   "evicted_at": note.get("evicted_at"), "cmd": cmd, "agent": agent,
-                   "hint": "your lease is gone and so is the session it protected. Wait for the "
-                           "editor (Restart-Editor.ps1 if it needs relaunching), then re-acquire "
-                           "with `uap lease acquire exclusive --reason pie --agent <token>` and "
-                           "re-run this command. `uap lease status` shows last_eviction."})
+            _emit(_eviction_body(note, cmd, agent))
             return 1
         # Using the editor IS liveness: refresh our own lease so an actively-working holder never
         # has it reclaimed mid-hold, and an abandoned one still ages out on TTL.
@@ -3304,12 +3934,7 @@ def _run_parsed(args) -> int:
             _coord.heartbeat(project, agent=agent, task=task)
         except Exception:
             pass
-
-    # ...and finally the MACHINE turn, for the verbs that contend for the one keyboard / one
-    # foreground window / one GPU this workstation has. Without it, a project lease said nothing
-    # about the OTHER project's editor: a Project Broken Wings agent could start PIE while a
-    # School's Out VR agent was mid-session, and neither lease noticed.
-    return _run_under_machine_lock(args, cmd, project)
+    return None
 
 
 def _machine_reason(args, cmd: str) -> str:
@@ -3483,7 +4108,8 @@ def _machine_guard(args, cmd: str | None) -> str | None:
     return None
 
 
-def _run_under_machine_lock(args, cmd: str | None, project: str) -> int:
+def _run_under_machine_lock(args, cmd: str | None, project: str, *,
+                            tracked: bool = False) -> int:
     """Take the machine-wide foreground turn (if this verb needs it), run the verb, hand it back.
 
     Two hold shapes, because two lifetimes:
@@ -3511,10 +4137,11 @@ def _run_under_machine_lock(args, cmd: str | None, project: str) -> int:
             holds_lease = _coord.holds_exclusive(project, agent=agent)
         except Exception:
             holds_lease = False
+        m0 = time.monotonic()
         try:
             machine = _coord.acquire_machine(
                 project, reason=_machine_reason(args, cmd), agent=agent,
-                pid=0 if sticky else None, wait=0 if holds_lease else _lease_wait_cap(),
+                pid=0 if sticky else None, wait=0 if holds_lease else _lease_wait_cap(args),
                 ttl=_coord.MACHINE_TTL if sticky else _coord.MACHINE_TRANSIENT_TTL,
                 task=_task_label(args))
         except Exception as exc:
@@ -3524,17 +4151,27 @@ def _run_under_machine_lock(args, cmd: str | None, project: str) -> int:
             # The deliberate escape hatch is $UAP_MACHINE_LOCK=0.
             machine = {"busy": True, "coordination_unsafe": True,
                        "error": f"{type(exc).__name__}: {exc}"}
+        _TIMING["guard_ms"] += (time.monotonic() - m0) * 1000
         if machine.get("busy"):
-            _emit(_machine_denied(args, cmd, project, agent, machine, holds_lease))
+            if tracked:
+                with contextlib.suppress(Exception):
+                    _coord.end_call(project)
+            body = _machine_denied(args, cmd, project, agent, machine, holds_lease)
+            if _max_block(args) is not None and isinstance(body, dict):
+                body.setdefault("still_waiting", True)
+                body.setdefault("resume", "re-run the same command")
+            _emit(body)
             return 1
     # A verb running against the editor is activity for as long as it runs, so the stale-PIE
-    # reaper never stops a session under a long `sample` / `input hold` / `exec`.
-    tracked = cmd in _REBUILD_GUARDED
-    if tracked:
-        try:
-            _coord.begin_call(project, _machine_reason(args, cmd))
-        except Exception:
-            tracked = False
+    # reaper never stops a session under a long `sample` / `input hold` / `exec`. The fast guard
+    # pass already wrote this record when no machine step could wait in between (`tracked`).
+    if not tracked:
+        tracked = cmd in _REBUILD_GUARDED
+        if tracked:
+            try:
+                _coord.begin_call(project, _machine_reason(args, cmd))
+            except Exception:
+                tracked = False
     requested_at = _coord._now()
     try:
         rc = args.func(args)

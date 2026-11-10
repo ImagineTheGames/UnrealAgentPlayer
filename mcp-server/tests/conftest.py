@@ -42,6 +42,11 @@ def _isolated_coordination_state(tmp_path_factory, monkeypatch):
     """
     monkeypatch.setenv("UAP_REPORTS_DIR", str(tmp_path_factory.mktemp("uap-reports")))
     monkeypatch.setenv("UAP_LEASE_WAIT", "0")
+    # A developer shell with brief output or a max-block set must not change what the suite
+    # asserts about the default shapes and waits.
+    monkeypatch.delenv("UAP_OUTPUT", raising=False)
+    monkeypatch.delenv("UAP_MAX_BLOCK", raising=False)
+    monkeypatch.delenv("UAP_WAITER_PARK_TTL", raising=False)
 
 
 @pytest.fixture(autouse=True)

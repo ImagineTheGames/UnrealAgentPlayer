@@ -515,6 +515,48 @@ The `busy` response carries `queue_position`, `queue_ahead` and `queue_length`, 
 status` / `lease machine-status` name the queue in order -- so an agent that gives up can report
 whether it was next or ninth instead of retrying blind.
 
+### Harness-safe waiting (`--max-block` + `uap lease wait`)
+
+An agent harness kills a tool call after 120-600s, and `acquire --wait 900` blocks for up to 15
+minutes. The kill cost the agent its place: the waiter aged out on the 15s waiter TTL and the next
+acquire re-joined at the BACK, so agents fell back to polling `lease status` + sleep, 8-18 times
+each (measured 2026-11-10).
+
+- `uap lease acquire ... --max-block S` (or `$UAP_MAX_BLOCK`) returns within S seconds:
+  `{"held": true, ...}`, or `{"held": false, "still_waiting": true, "position": k, "holder": ...,
+  "resume": "uap lease wait --agent X"}`. The waiter is PARKED: it keeps its place with no process
+  behind it for `$UAP_WAITER_PARK_TTL` (default 180s) after the call returns. The park is set for
+  the whole blocking call too, so a harness kill mid-wait does not lose the place either.
+- `uap lease wait --agent X [--seconds S]` resumes from that place, reusing the parked request
+  (mode, reason, ttl, task). The same `lease acquire` again also keeps the place.
+- `--wait` stays the TOTAL budget across resumes; when it runs out the waiter leaves the queue
+  exactly as a plain timed-out acquire does.
+- A parked agent that never comes back drops out when its park expires; its request is remembered
+  for an hour, so its next `lease wait` answers `requeued: true` (back of the queue) instead of a
+  bare refusal. `not_queued: true` means there was never anything to resume.
+- The cost: a parked head of the queue holds the line for up to its park TTL after the lease frees.
+  Agents that resume within seconds of `still_waiting` make that negligible.
+- Without `--max-block` nothing changes.
+
+`--max-block` / `$UAP_MAX_BLOCK` also caps the automatic waits in front of every editor verb
+(another agent's exclusive lease, a rebuild, the machine lock): the verb then answers `busy` with
+`still_waiting: true` instead of being killed mid-wait. Those waits have no queue; re-run the verb.
+
+### Brief output, the folded guard pass, and the timing log
+
+- `--brief` / `$UAP_OUTPUT=brief` (opt-in; `--full` forces the default) prints compact answers for
+  `lease status`, `lease acquire|wait|release`, `status` (contract skipped unless `--contract`)
+  and zero-count `log tail|since` (the `dropped` / `truncated` / `stale_cursor` / `warning` signals
+  are always kept). Default output is unchanged.
+- The per-call guard chain (reap check, activity note, rebuild check, lease check, eviction notice,
+  own-lease heartbeat, in-flight record) now runs as ONE locked read-modify-write when nothing is
+  contended (`coordination.guard_pass`); anything else falls through to the original chain, which
+  does the waiting. An uncontended `log tail` takes 2 lock passes instead of 7.
+- Every invocation appends one line to `<reports>/.timing/<project>.jsonl` (verb only, never args;
+  one O_APPEND write, no lock; rotated at 10 MB; `$UAP_TIMING_LOG=0` disables). The gap since the
+  same agent's previous call is read from the mtime of an empty marker file, not from the log.
+  `uap timing report [--agent X] [--since 1h]` summarises calls, uap time, wait time and gaps.
+
 ## Non-goals
 
 - True parallel stateful work on one editor (physically impossible: one level, one PIE).
