@@ -3,6 +3,11 @@
 #include "AgentMotionController.h"
 #include "AgentOverlay.h"
 #include "AgentSampler.h"
+#include "UAPAgentRuntimeSubsystem.h"
+#include "Engine/Engine.h"
+#include "Engine/GameInstance.h"
+#include "Engine/World.h"
+#include "UObject/UObjectGlobals.h"
 #include "Misc/CommandLine.h"
 #include "Misc/Parse.h"
 #include "RemoteControlSettings.h"
@@ -48,6 +53,17 @@ void FUnrealAgentPlayerRuntimeModule::StartupModule()
     // the callback outright rather than early-outing inside it.
     FUAPOverlay::Register();
 
+#if !UE_BUILD_SHIPPING
+    // Standalone -game: give the already-existing GameInstance its runtime subsystem (see header).
+    // The post-world-init hook covers a game instance that is created later than this module.
+    if (!GIsEditor && !IsRunningCommandlet() && !IsRunningDedicatedServer())
+    {
+        EnsureStandaloneSubsystem();
+        PostWorldInitHandle = FWorldDelegates::OnPostWorldInitialization.AddLambda(
+            [this](UWorld*, const UWorld::InitializationValues) { EnsureStandaloneSubsystem(); });
+    }
+#endif
+
 #if WITH_EDITOR
     // RemoteControl HTTP port management so several editors (and -game instances) can each
     // run RemoteControl at once -- required for parallel agent testing. The default port
@@ -76,6 +92,9 @@ void FUnrealAgentPlayerRuntimeModule::ShutdownModule()
 {
     // Drop the per-frame tickers first: they hold statics that outlive the module otherwise.
     FUAPOverlay::Unregister();
+#if !UE_BUILD_SHIPPING
+    ShutdownStandaloneSubsystem();
+#endif
     FAgentInput::ShutdownHolds();
     FAgentSampler::Shutdown();
     if (MotionController.IsValid())
@@ -91,6 +110,46 @@ void FUnrealAgentPlayerRuntimeModule::ShutdownModule()
     }
 #endif
 }
+
+#if !UE_BUILD_SHIPPING
+void FUnrealAgentPlayerRuntimeModule::EnsureStandaloneSubsystem()
+{
+    if (StandaloneSubsystem.IsValid() || !GEngine)
+    {
+        return;
+    }
+    for (const FWorldContext& Context : GEngine->GetWorldContexts())
+    {
+        UGameInstance* GI = Context.OwningGameInstance;
+        if (!GI || GI->GetSubsystem<UUAPAgentRuntimeSubsystem>())
+        {
+            continue;   // none yet, or the engine already made the real one
+        }
+        UUAPAgentRuntimeSubsystem* Sub = NewObject<UUAPAgentRuntimeSubsystem>(GI);
+        Sub->AddToRoot();   // outlives GC; removed in ShutdownStandaloneSubsystem
+        StandaloneSubsystem = Sub;
+        Sub->InitializeRuntime();
+        UE_LOG(LogUAPRuntime, Log,
+            TEXT("Standalone game instance had no UAPAgentRuntimeSubsystem (module loaded after it); created one by hand."));
+        return;
+    }
+}
+
+void FUnrealAgentPlayerRuntimeModule::ShutdownStandaloneSubsystem()
+{
+    if (PostWorldInitHandle.IsValid())
+    {
+        FWorldDelegates::OnPostWorldInitialization.Remove(PostWorldInitHandle);
+        PostWorldInitHandle.Reset();
+    }
+    if (UUAPAgentRuntimeSubsystem* Sub = StandaloneSubsystem.Get())
+    {
+        Sub->ShutdownRuntime();
+        Sub->RemoveFromRoot();
+    }
+    StandaloneSubsystem.Reset();
+}
+#endif // !UE_BUILD_SHIPPING
 
 #if WITH_EDITOR
 void FUnrealAgentPlayerRuntimeModule::EnsureRCPortBound()

@@ -1318,3 +1318,28 @@ foreground window, and every client must be drivable without it.
 **BREAKING (plugin):** 13 UFUNCTIONs gained a trailing `FString Client` parameter, `FocusEditorWindow` was removed.
 Requires a plugin re-sync + rebuild in every project. The CLI refuses `--client` against an older plugin copy rather
 than silently driving client 0.
+
+
+## 40. Every verb with `--instance pid:N` failed against a `-game` standalone: the runtime subsystem never existed -- FIXED
+
+`uap rc|input|read-ui|exec ... --instance pid:N` against a `-game` client answered `Unable to resolve the preset`
+(404) or `this editor's plugin has no HoldKey / ListClients`, and `GET /remote/presets` returned `[]`. [ClickUp 17tm466fxv7]
+
+* **Cause:** `UnrealAgentPlayerRuntime` loads at `PostEngineInit`. In a `-game` process `UGameEngine::Init` has already
+  created the GameInstance and collected its subsystems by then, so `UUAPAgentRuntimeSubsystem` (whose `Initialize`
+  registers `UAP_RuntimePreset`) was never instantiated - only its CDO existed. In PIE the class exists before the
+  game instance, so PIE was never affected.
+* **Fix (plugin):** the module builds the subsystem by hand on the live GameInstance in `StartupModule` (and from
+  `OnPostWorldInitialization` for a game instance created later) through new `InitializeRuntime()` /
+  `ShutdownRuntime()`, which `Initialize` / `Deinitialize` now also call. No-op where the engine already made one
+  (PIE) or when there is no game instance. `#if !UE_BUILD_SHIPPING`; the module is a DeveloperTool, so none of
+  it is in a Shipping build. Confirmed by the client log line `Standalone game instance had no
+  UAPAgentRuntimeSubsystem (module loaded after it); created one by hand.` and `GET /remote/presets` listing
+  `UAP_RuntimePreset`.
+* **Fix (CLI):** a verb whose `--instance` is a standalone `-game` client (role `game`) no longer queues behind the
+  EDITOR's rebuild wait, another agent's exclusive project lease or the machine lock - none of them protect that
+  process, and `uap input clients --instance pid:N` hung for as long as another agent held `lease acquire
+  exclusive --reason pie`. Same reasoning as `screenshot --window`. `--instance` now also routes `sample` and `log`
+  (they were editor-only). Pointing `--instance` at the editor still goes through the guards.
+* Still needs `-RCWebControlEnable -UAPRCPort=<n>` on the client's command line (`launch_2p_standalone.ps1` does).
+  Each client needs its OWN port: two clients on the same `-UAPRCPort` answer from whichever bound first.

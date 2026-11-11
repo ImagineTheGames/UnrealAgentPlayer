@@ -40,6 +40,15 @@ namespace
 void UUAPAgentRuntimeSubsystem::Initialize(FSubsystemCollectionBase& Collection)
 {
     Super::Initialize(Collection);
+    InitializeRuntime();
+}
+
+void UUAPAgentRuntimeSubsystem::InitializeRuntime()
+{
+    if (LogCapture.IsValid())
+    {
+        return;   // already initialised
+    }
     LogCapture = MakeShared<FAgentLogCapture>(4096);
     GLog->AddOutputDevice(LogCapture.Get());
     FAgentRuntimeRCBootstrap::Expose(this);
@@ -71,6 +80,12 @@ void UUAPAgentRuntimeSubsystem::Initialize(FSubsystemCollectionBase& Collection)
 
 void UUAPAgentRuntimeSubsystem::Deinitialize()
 {
+    ShutdownRuntime();
+    Super::Deinitialize();
+}
+
+void UUAPAgentRuntimeSubsystem::ShutdownRuntime()
+{
     FAgentRuntimeRCBootstrap::Unexpose();
     if (LogCapture.IsValid())
     {
@@ -78,7 +93,6 @@ void UUAPAgentRuntimeSubsystem::Deinitialize()
         LogCapture.Reset();
     }
     UE_LOG(LogUAPRuntime, Log, TEXT("UAPAgentRuntimeSubsystem deinitialized."));
-    Super::Deinitialize();
 }
 
 FString UUAPAgentRuntimeSubsystem::GetPluginVersion() const
