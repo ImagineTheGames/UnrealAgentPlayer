@@ -16,7 +16,6 @@ must never take his mouse, keyboard or foreground window.
 import json
 import os
 import re
-import time
 from pathlib import Path
 
 import pytest
@@ -205,7 +204,7 @@ _FORBIDDEN_PY = re.compile(
 
 
 def _strip_cpp_comments(text):
-    text = re.sub(r"/\*.*?\*/", "", text, flags=re.S)
+    text = re.sub(r"/\*.*?\*/", "", text, flags=re.DOTALL)
     return re.sub(r"//[^\n]*", "", text)
 
 
@@ -276,8 +275,8 @@ def test_report_finish_opens_only_when_asked(tmp_path, monkeypatch):
     monkeypatch.setattr(viewer, "_spawn", lambda exe, url: spawned.append(url) or True)
     monkeypatch.setattr(viewer, "find_app_browser", lambda: "chrome.exe")
     monkeypatch.setattr(viewer, "_await_window", lambda before, deadline: 0)
-    monkeypatch.setattr(viewer, "list_windows", lambda: [])
-    monkeypatch.setattr(viewer, "_read_state", lambda: {})
+    monkeypatch.setattr(viewer, "list_windows", list)
+    monkeypatch.setattr(viewer, "_read_state", dict)
     monkeypatch.setattr(viewer, "_write_state", lambda s: None)
     monkeypatch.delenv("UAP_REPORT_NO_OPEN", raising=False)
     monkeypatch.delenv("UAP_NO_BROWSER", raising=False)
