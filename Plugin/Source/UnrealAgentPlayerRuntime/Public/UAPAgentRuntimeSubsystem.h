@@ -48,6 +48,10 @@ public:
     UFUNCTION(BlueprintCallable, Category="Agent|Input") FString GetHeldInput();
     UFUNCTION(BlueprintCallable, Category="Agent|Input") bool InjectXRControllerPose(EAgentXRHand Hand, FVector Position, FRotator Orientation, bool bTracked);
     UFUNCTION(BlueprintCallable, Category="Agent|Input") bool ClearXRControllerOverride(EAgentXRHand Hand);
+    // Opt-in aim-pose emulation (OFF by default) and the injected controllers' state. Same
+    // contract as UUAPAgentSubsystem; both forward to FAgentMotionController.
+    UFUNCTION(BlueprintCallable, Category="Agent|Input") FString SetXRAimEmulation(bool bEnabled, FVector GripToAimLocation, FRotator GripToAimRotation);
+    UFUNCTION(BlueprintCallable, Category="Agent|Input") FString GetXRControllerState();
     UFUNCTION(BlueprintCallable, Category="Agent|UI") FString DumpViewportUI();
     UFUNCTION(BlueprintCallable, Category="Agent|Capture") bool CaptureViewportWithUI(FString Filename);
     UFUNCTION(BlueprintCallable, Category="Agent|Log") int64 GetLogCursor() const;

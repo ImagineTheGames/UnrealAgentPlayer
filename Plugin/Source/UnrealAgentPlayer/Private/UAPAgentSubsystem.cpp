@@ -498,6 +498,14 @@ bool UUAPAgentSubsystem::InjectXRButton(EAgentXRHand Hand, FString ButtonKeyName
         UE_LOG(LogUAP, Warning, TEXT("InjectXRButton: unknown key '%s'"), *ButtonKeyName);
         return false;
     }
+    // The key name already says which hand it belongs to; Hand used to be ignored, so a call
+    // that named the other hand pressed a key the caller did not mean. Refuse the contradiction.
+    if (FAgentMotionController::KeyContradictsHand(Hand, ButtonKeyName))
+    {
+        UE_LOG(LogUAP, Warning, TEXT("InjectXRButton: key '%s' belongs to the other hand (Hand=%s); nothing pressed"),
+            *ButtonKeyName, Hand == EAgentXRHand::Left ? TEXT("Left") : TEXT("Right"));
+        return false;
+    }
     return FAgentInput::InjectKey(Key, bPressed, false);
 }
 
@@ -575,6 +583,23 @@ bool UUAPAgentSubsystem::ClearXRControllerOverride(EAgentXRHand Hand)
     if (!MC) { return false; }
     MC->ClearPose(Hand);
     return true;
+}
+
+FString UUAPAgentSubsystem::SetXRAimEmulation(bool bEnabled, FVector GripToAimLocation, FRotator GripToAimRotation)
+{
+    UAP_ACTIVITY(TEXT("input xr-aim"), bEnabled ? TEXT("on") : TEXT("off"));
+    FUnrealAgentPlayerRuntimeModule* Rtm = FUnrealAgentPlayerRuntimeModule::Get();
+    FAgentMotionController* MC = Rtm ? Rtm->GetMotionController() : nullptr;
+    if (!MC) { return TEXT("{\"ok\":false,\"error\":\"agent motion controller not registered\"}"); }
+    return MC->SetAimEmulationJson(bEnabled, GripToAimLocation, GripToAimRotation);
+}
+
+FString UUAPAgentSubsystem::GetXRControllerState()
+{
+    FUnrealAgentPlayerRuntimeModule* Rtm = FUnrealAgentPlayerRuntimeModule::Get();
+    FAgentMotionController* MC = Rtm ? Rtm->GetMotionController() : nullptr;
+    if (!MC) { return TEXT("{\"ok\":false,\"error\":\"agent motion controller not registered\"}"); }
+    return MC->StateJson();
 }
 
 FString UUAPAgentSubsystem::DumpViewportUI()

@@ -1478,6 +1478,101 @@ def _input(args) -> int:
     return 0 if body.get("ok") else 1
 
 
+# --- XR: the injected motion controllers, as verbs -----------------------------------------
+# The plugin has always been able to place a fake Quest controller (FAgentMotionController, a
+# registered IMotionController), but there was NO verb for it -- only MCP, `rc` with a JSON struct
+# and editor Python -- so agents verifying a grab reached for the flat pawn instead, and hand poses
+# shipped wrong (left hand flipped, plane nose down). These wrap the plugin calls one-to-one.
+# Grip and trigger are not new plugin calls: on a Quest pawn they are the analog FKeys
+# OculusTouch_<Hand>_Grip_Axis / _Trigger_Axis, so they ride `input axis` (same ledger, same
+# overlap refusal, same --wait) under a name that says which hand.
+
+_NEEDS_XR_AIM = ("opt-in aim-pose emulation for the injected XR controllers -- without it the "
+                 "'<Hand>Aim' source answers the GRIP pose, so aim == grip")
+_NEEDS_XR_STATE = "reading back what the injected XR controllers answer (grip AND aim pose)"
+_XR_HANDS = {"left": "Left", "right": "Right"}
+_XR_AXES = {"grip": "Grip_Axis", "trigger": "Trigger_Axis"}
+_XR_CLICKS = {"grip": "Grip_Click", "trigger": "Trigger_Click"}
+_XR_CLICK_THRESHOLD = 0.5
+
+
+def _xr_hands(which: str) -> list[str]:
+    return ["Left", "Right"] if which == "both" else [_XR_HANDS[which]]
+
+
+def _xr(args) -> int:
+    """`uap xr pose|clear|aim|state|grip|trigger`. See the block comment above."""
+    sub = args.xr_cmd
+    if sub in ("grip", "trigger"):
+        # Delegate wholesale to `input axis`: one hold implementation, one ledger, one refusal
+        # rule. Only the key name is derived here.
+        ns = argparse.Namespace(**vars(args))
+        ns.input_cmd = "axis"
+        ns.key = f"OculusTouch_{_XR_HANDS[args.hand]}_{_XR_AXES[sub]}"
+        ns.user = None
+        rc = _input(ns)
+        if rc != 0 or args.value < _XR_CLICK_THRESHOLD or args.no_click:
+            return rc
+        # A real Touch controller reports the squeeze as BOTH the analog axis and the digital
+        # _Click key (the OpenXR runtime thresholds the value). Games bind either - this project's
+        # "use held object" is Trigger_Click - so holding only the axis would leave every _Click
+        # binding dead and read as a broken feature. Press the click for the same window.
+        click = argparse.Namespace(**vars(args))
+        click.input_cmd = "hold"
+        click.key = f"OculusTouch_{_XR_HANDS[args.hand]}_{_XR_CLICKS[sub]}"
+        click.overlap = True
+        click.user = None
+        return _input(click)
+
+    t0 = time.monotonic()
+    body: dict = {"ok": True, "action": f"xr {sub}"}
+    try:
+        if sub == "pose":
+            hand = _XR_HANDS[args.hand]
+            params = {"Hand": hand,
+                      "Position": {"X": args.x, "Y": args.y, "Z": args.z},
+                      "Orientation": {"Pitch": args.pitch, "Yaw": args.yaw, "Roll": args.roll},
+                      "bTracked": not args.untracked}
+            applied = _rc_call("InjectXRControllerPose", params, args.project)
+            body.update({"hand": hand, "applied": bool(applied),
+                         "position": [args.x, args.y, args.z],
+                         "orientation": {"pitch": args.pitch, "yaw": args.yaw, "roll": args.roll},
+                         "tracked": not args.untracked,
+                         "note": "TRACKING-SPACE pose (relative to the pawn's tracking origin, cm). "
+                                 "It stays applied until `uap xr clear`."})
+            if not applied:
+                body["ok"] = False
+                body["error"] = "InjectXRControllerPose returned false (agent motion controller missing)"
+        elif sub == "clear":
+            cleared = {}
+            for hand in _xr_hands(args.hand):
+                cleared[hand] = bool(_rc_call("ClearXRControllerOverride", {"Hand": hand}, args.project))
+            body["cleared"] = cleared
+            body["ok"] = all(cleared.values())
+        elif sub == "aim":
+            enabled = args.mode == "on"
+            loc = args.loc or [0.0, 0.0, 0.0]
+            rot = args.rot or [0.0, 0.0, 0.0]
+            if args.mode == "status":
+                body.update(_rc_json("GetXRControllerState", {}, args.project, needs=_NEEDS_XR_STATE))
+            else:
+                body.update(_rc_json("SetXRAimEmulation",
+                                     {"bEnabled": enabled,
+                                      "GripToAimLocation": {"X": loc[0], "Y": loc[1], "Z": loc[2]},
+                                      "GripToAimRotation": {"Pitch": rot[0], "Yaw": rot[1],
+                                                            "Roll": rot[2]}},
+                                     args.project, needs=_NEEDS_XR_AIM))
+        else:  # state
+            body.update(_rc_json("GetXRControllerState", {}, args.project, needs=_NEEDS_XR_STATE))
+    except (AgentError, json.JSONDecodeError) as exc:
+        body = _err(exc)
+    _capture(f"xr:{sub}", {k: v for k, v in vars(args).items()
+                           if k in ("hand", "x", "y", "z", "pitch", "yaw", "roll", "mode")},
+             body, int((time.monotonic() - t0) * 1000))
+    _emit(body)
+    return 0 if body.get("ok") else 1
+
+
 _NEEDS_MOUSE = ("positioning the mouse INSIDE a captured PIE viewport; the OS cursor cannot be "
                 "moved while PIE holds the mouse, so this has to happen engine-side")
 
@@ -2429,6 +2524,22 @@ SUSTAINED INPUT (a single injected event CANNOT drive locomotion -- see below)
   reach Enhanced Input" has already cost another project several sessions -- it was the
   wrong verb, not a missing capability.
 
+VR HANDS (the injected Quest controllers -- drive the REAL VR pawn's hands with no headset)
+  uap xr pose left|right X Y Z [--pitch P --yaw Y --roll R]   place a hand, TRACKING space (cm)
+  uap xr grip left|right [v] --seconds N   hold OculusTouch_<Hand>_Grip_Axis + _Grip_Click (`input axis`
+                                       hold: same ledger, same overlap refusal, same --wait)
+  uap xr trigger left|right [v] --seconds N   ...OculusTouch_<Hand>_Trigger_Axis + _Trigger_Click
+                                       (a real Touch sends both; --no-click for the axis alone)
+  uap xr aim on|off|status [--loc X Y Z --rot P Y R]   OPT-IN aim-pose emulation. OFF by default,
+                                       '<Hand>Aim' answers the GRIP pose, so aim == grip and a
+                                       check of "does it point where I point" is meaningless.
+                                       ON (default delta = Quest: pitch -60, loc 7.35 0 -6.73)
+                                       makes lasers / distance grab see a real aim ray
+  uap xr state                         grip + aim pose per hand, and whether aim is emulated
+  uap xr clear [left|right|both]       drop the injected pose(s)
+  Rig recipe (possess the VR pawn in flat PIE, camera as the head): the project's own docs.
+  What this cannot be: real OpenXR input, an interaction profile, a stereo/Quest render, feel.
+
 MOUSE (a captured viewport pins the pointer -- the POSITION is the hard part, not the click)
   uap input mouse move <x> <y>         put the agent cursor at an ABSOLUTE screen point
   uap input mouse click [x y] [--button left]   press+release there (omit x y to use the
@@ -2679,7 +2790,7 @@ def _help(args) -> int:
 # Editor-touching verbs auto-wait while another agent is rebuilding this editor (see main()).
 _REBUILD_GUARDED = {"status", "rc", "exec", "exec-file", "pie",
                     "read-ui", "click", "tab", "nav", "screenshot",
-                    "input", "sample", "log", "helpers"}
+                    "input", "xr", "sample", "log", "helpers"}
 
 # ...and additionally wait out ANY other agent's exclusive lease (pie / level / rebuild).
 # `status` is deliberately exempt: it is the health probe you reach for WHILE diagnosing a
@@ -2698,7 +2809,7 @@ _LEASE_GUARDED = _REBUILD_GUARDED - {"status"}
 # behaviour change than the clash being fixed. They remain governed by the per-project lease --
 # except for the `rc` functions and `exec` Python that ARE one of these verbs by another name
 # (start / stop PIE, inject input); see `_machine_guard`.
-_MACHINE_GUARDED = {"pie", "input", "screenshot", "click", "tab", "nav", "read-ui"}
+_MACHINE_GUARDED = {"pie", "input", "xr", "screenshot", "click", "tab", "nav", "read-ui"}
 
 # `uap rc <func>` reaches the same plugin verbs the guarded verbs use, so the functions that start
 # PIE, stop it, or inject input / need the foreground are gated exactly like `pie start`,
@@ -3106,6 +3217,51 @@ def build_parser() -> argparse.ArgumentParser:
     ir.set_defaults(func=_input)
     inps.add_parser("status", parents=[proj],
                     help="what is currently held and for how much longer").set_defaults(func=_input)
+
+    # XR controllers: pose / grip / trigger for the injected Quest hands. See _xr.
+    xr = sub.add_parser("xr", help="place the injected VR hands, press grip/trigger, emulate the aim pose")
+    xrs = xr.add_subparsers(dest="xr_cmd", required=True)
+    xp = xrs.add_parser("pose", parents=[proj],
+                        help="place one injected controller at a TRACKING-SPACE pose (cm, degrees)")
+    xp.add_argument("hand", choices=["left", "right"])
+    xp.add_argument("x", type=float)
+    xp.add_argument("y", type=float)
+    xp.add_argument("z", type=float)
+    xp.add_argument("--pitch", type=float, default=0.0)
+    xp.add_argument("--yaw", type=float, default=0.0)
+    xp.add_argument("--roll", type=float, default=0.0)
+    xp.add_argument("--untracked", action="store_true",
+                    help="report the pose as NOT tracked (a real device then wins, if one exists)")
+    xp.set_defaults(func=_xr)
+    xc = xrs.add_parser("clear", parents=[proj], help="drop the injected pose (default: both hands)")
+    xc.add_argument("hand", nargs="?", default="both", choices=["left", "right", "both"])
+    xc.set_defaults(func=_xr)
+    xa = xrs.add_parser("aim", parents=[proj],
+                        help="opt-in aim-pose emulation: '<Hand>Aim' = grip_to_aim * grip "
+                             "(default delta = Quest: pitch -60, loc 7.35 0 -6.73). OFF by default")
+    xa.add_argument("mode", choices=["on", "off", "status"])
+    xa.add_argument("--loc", type=float, nargs=3, default=None, metavar=("X", "Y", "Z"),
+                    help="grip->aim offset in the grip frame, cm (RIGHT hand; left is mirrored)")
+    xa.add_argument("--rot", type=float, nargs=3, default=None, metavar=("PITCH", "YAW", "ROLL"),
+                    help="grip->aim rotation, degrees (RIGHT hand; left is mirrored)")
+    xa.set_defaults(func=_xr)
+    xrs.add_parser("state", parents=[proj],
+                   help="what the injected controllers answer now: grip pose, aim pose, emulation"
+                   ).set_defaults(func=_xr)
+    for verb in ("grip", "trigger"):
+        xg = xrs.add_parser(verb, parents=[proj],
+                            help=f"hold OculusTouch_<Hand>_{_XR_AXES[verb]} (+ _{_XR_CLICKS[verb]} at >= 0.5) for N seconds "
+                                 f"(an `input axis` hold under the hood)")
+        xg.add_argument("hand", choices=["left", "right"])
+        xg.add_argument("value", type=float, nargs="?", default=1.0, help="0.0 .. 1.0 (default 1)")
+        xg.add_argument("--seconds", type=float, default=1.0)
+        xg.add_argument("--wait", action="store_true", help="block until the hold expires")
+        xg.add_argument("--overlap", action="store_true",
+                        help="allow it alongside a hold already running (e.g. grip held, then trigger)")
+        xg.add_argument("--no-click", dest="no_click", action="store_true",
+                        help=f"do not also hold OculusTouch_<Hand>_{_XR_CLICKS[verb]} (a real controller "
+                             f"sends the _Click with the axis once it passes {_XR_CLICK_THRESHOLD})")
+        xg.set_defaults(func=_xr)
 
     # Mouse position inside a CAPTURED viewport. Not a hold -- a position, which is a different
     # problem: while PIE holds the mouse the pointer cannot be moved at all (Win32 SetCursorPos

@@ -35,6 +35,11 @@ Three injectable surfaces for desktop-mode VR testing (no headset required):
    that returns agent-set Left/Right poses. `UMotionControllerComponent` polls it like a real
    device, so tracked-component transforms follow the injected pose. Clearing a hand makes the
    fake controller return `false` for that source, so real devices win again.
+   **Aim pose (opt-in):** a real runtime answers `<Hand>Aim` with a different pose from the grip
+   (Quest: pitch -60, (7.35, 0, -6.73) cm in the grip frame). By default the fake controller
+   answers every source with the grip pose, so aim == grip; `SetXRAimEmulation` / `uap xr aim on`
+   makes `<Hand>Aim` answer grip_to_aim * grip so lasers and "where does the player point" checks
+   see a real delta. Off by default so nothing changes for a project that does not ask.
 3. **HMD pose — DEFERRED.** There is no `IMotionController`-equivalent injection hook for the
    head pose; overriding it requires a fake `IXRTrackingSystem`/stereo render device, which is
    invasive and risks destabilizing the Meta XR runtime path. Revisit only when a concrete test
@@ -53,6 +58,11 @@ pose-follow needs an actual XR runtime (e.g. Meta XR Simulator) or deeper integr
 guarantees override precedence.** Button injection (FKey path) is unaffected and works. The
 injection API itself (subsystem + modular feature registration) is correct and works for a
 project whose components have no competing real controller.
+
+**Update (School's Out VR, 2026-10-29):** with NO HMD connected there is no competing tracked
+controller, and the injected pose DOES drive VRExpansion's grip controllers (measured: hands
+follow the injected poses, native grip through the pawn's own input works). The limitation above
+applies when a real OpenXR runtime is live (Meta XR Simulator, VR Preview).
 
 ### Perf regression baselines (V2)
 
