@@ -59,6 +59,16 @@ def env_no_open() -> bool:
     return _env_flag("UAP_REPORT_NO_OPEN") or _env_flag("UAP_NO_BROWSER")
 
 
+def env_open() -> bool:
+    """True when the environment OPTS IN to opening the report (`UAP_REPORT_OPEN=1`).
+
+    Opening is OFF by default: a new browser window takes the OS foreground, over whatever the
+    human at this machine is doing, and uap never brings a window to the front (owner rule
+    2026-11-11). The report path is always printed; the human opens it when they want to.
+    """
+    return _env_flag("UAP_REPORT_OPEN")
+
+
 def _open_timeout() -> float:
     try:
         return max(0.0, float(os.environ.get("UAP_REPORT_OPEN_TIMEOUT", "6")))
@@ -237,7 +247,8 @@ def _close_previous(hwnd: Any, keep: int) -> bool:
     return False
 
 
-def open_report(html_path: Any, *, no_open: bool | None = None) -> dict[str, Any]:
+def open_report(html_path: Any, *, no_open: bool | None = None,
+                open_: bool | None = None) -> dict[str, Any]:
     """Show `html_path`, replacing the window the previous report opened.
 
     Returns `{"opened": bool, "mode": "app"|"tab"|"none", ...}`. Never raises: a report
@@ -247,6 +258,12 @@ def open_report(html_path: Any, *, no_open: bool | None = None) -> dict[str, Any
         no_open = env_no_open()
     if no_open:
         return {"opened": False, "mode": "none", "reason": "no-open"}
+    if open_ is None:
+        open_ = env_open()
+    if not open_:
+        return {"opened": False, "mode": "none", "reason": "not-requested",
+                "note": "reports are not opened by default (a new window takes the foreground); "
+                        "pass --open or set UAP_REPORT_OPEN=1 to open one"}
 
     url = Path(html_path).as_uri()
     exe = find_app_browser()

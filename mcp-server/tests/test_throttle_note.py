@@ -59,10 +59,11 @@ def test_frame_ms_alone_detects_it():
 def test_the_note_says_all_four_things_an_agent_needs():
     n = throttle.THROTTLE_NOTE
     assert "foreground" in n                        # what it actually is
-    assert "PIE window" in n and "re-measure" in n  # what to do
+    assert "PIE session" in n and "re-measure" in n  # what to do
     assert "void" in n                              # measurements already taken
-    # ...and what to do when focus CANNOT be taken.
-    assert "SetForegroundWindow" in n and "GetForegroundWindow" in n
+    # ...never by taking focus (owner rule 2026-11-11), but by the in-engine setting.
+    assert "NEVER take focus" in n and "bThrottleCPUWhenNotForeground" in n
+    assert "Focus the PIE window" not in n
     assert "Slate.bAllowThrottling 0" in n and "does NOT lift it" in n
     assert "unmeasurable" in n
     assert "uap sample" in n and "input hold" in n  # what still measures correctly
@@ -73,7 +74,7 @@ def test_the_note_says_all_four_things_an_agent_needs():
 def test_the_sampler_note_covers_the_same_ground():
     n = throttle.SAMPLER_THROTTLE_NOTE
     assert "3 Hz" in n and "void" in n and "re-sample" in n
-    assert "SetForegroundWindow" in n and "unmeasurable" in n
+    assert "NEVER take focus" in n and "unmeasurable" in n
     assert "agentplayertest.md" in n
     assert n.isascii()
 
@@ -173,7 +174,7 @@ def test_report_diag_explains_three_fps_where_the_agent_reads_it(tmp_path, monke
     assert body["perf"]["fps"] == 3.0
     assert body["throttled"] is True
     assert "NOT the game" in body["warning"]
-    assert "PIE window" in body["warning"]
+    assert "PIE session" in body["warning"]
 
 
 def test_report_diag_is_silent_at_a_healthy_rate(tmp_path, monkeypatch, capsys):
@@ -259,7 +260,8 @@ _REPO = pathlib.Path(__file__).resolve().parents[2]
 def test_uap_help_explains_the_low_number_where_the_verb_is_listed():
     h = cli._HELP_CATALOG
     assert "5 fps" in h and "foreground" in h.lower()
-    assert "SetForegroundWindow" in h and "unmeasurable" in h
+    assert "bThrottleCPUWhenNotForeground" in h and "unmeasurable" in h
+    assert "NEVER take focus" in h
     assert "uap sample" in h
 
 
@@ -267,8 +269,10 @@ def test_the_agent_testing_kit_points_at_it_from_the_diag_step():
     md = (_REPO / "agent-testing" / "agentplayertest.md").read_text(encoding="utf-8")
     diag_step = md.split("**Diagnostics**")[1].split("**Scene**")[0]
     assert "throttled: true" in diag_step and "trap #1" in diag_step
-    # Trap #1 itself gains the "cannot take focus" answer, and keeps its own headline.
-    assert "GetForegroundWindow" in md and "unmeasurable" in md
+    # Trap #1 says never to take focus (owner rule 2026-11-11), points at the in-engine
+    # setting, and keeps its own headline.
+    assert "bThrottleCPUWhenNotForeground" in md and "unmeasurable" in md
+    assert "GetForegroundWindow" not in md
 
 
 def test_the_agents_snippet_says_the_tool_now_answers():

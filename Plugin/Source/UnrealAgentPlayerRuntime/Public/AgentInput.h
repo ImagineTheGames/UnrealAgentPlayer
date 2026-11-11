@@ -17,6 +17,10 @@ struct FAgentHeldInputInfo
         that user. Reported back so a caller can SEE which layer is being driven instead of
         assuming; a Slate pre-processor only ever sees the second kind. */
     int32   SlateUserIndex = INDEX_NONE;
+    /** PIE instance of the client this hold is on (INDEX_NONE for a standalone game world). */
+    int32   Client = INDEX_NONE;
+    /** Engine ground truth on THAT client: is the key actually down there. */
+    bool    bDown = false;
 };
 
 class UNREALAGENTPLAYERRUNTIME_API FAgentInput
@@ -158,6 +162,24 @@ public:
      * anything else -> false + OutError
      */
     static bool ResolveSlateUserParam(const FString& SlateUser, int32& OutResolved, FString& OutError);
+
+    // --- Client targeting [17tm466z4a6] -----------------------------------------------
+    // With several PIE clients in one process every verb used to act on the FIRST game world,
+    // so a net client could never be driven. A `Client` selector ("" default, "N" = PIE
+    // instance N, "all") picks the world; see AgentWorld.h. These run Fn once per targeted
+    // client with that client's world current. Everything below the world -- the viewport
+    // routes, the click redirect, the UI reader, the hold registry -- follows it.
+    // In-engine only: no OS window is raised, focused or sent input.
+
+    /** bool verbs. Returns true only if EVERY targeted client took it; OutError says why not. */
+    static bool ForEachClient(const FString& Client, FString& OutError,
+                              TFunctionRef<bool(int32 ClientIndex)> Fn);
+
+    /** ForEachClient for the bool UFUNCTIONs: logs a refusal / partial failure under `Verb` so `uap log` finds it. */
+    static bool OnClients(const TCHAR* Verb, const FString& Client, TFunctionRef<bool()> Fn);
+
+    /** JSON verbs. One client -> that client's own envelope plus "client"; several -> {ok, clients[]}. */
+    static FString ForEachClientJson(const FString& Client, TFunctionRef<FString()> Fn);
 
     /** True when there is a game viewport that will accept injected input right now. */
     static bool HasLiveViewport();

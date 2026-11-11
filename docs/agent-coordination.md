@@ -375,7 +375,7 @@ Also taken, because each is one of those verbs by another name:
   (never waits, like `pie stop`; frees the hold once `IsPIEInProgress` confirms PIE is down), and
   the `rc` input / foreground functions (`InjectKey`, `InjectAxis`, `InjectGamepad`,
   `InjectMouseButton`, `InjectMouseMove`, `SetMousePosition`, `ClickMouse`, `HoldKey`, `HoldAxis`,
-  `InjectXRButton`, `InjectXRControllerPose`, `NavigateUI`, `SelectTab`, `FocusEditorWindow`,
+  `InjectXRButton`, `InjectXRControllerPose`, `NavigateUI`, `SelectTab`,
   `CaptureViewportWithUI`, `DumpViewportUI`; transient, like `input`).
 - `uap exec` / `exec-file` whose Python requests a play session (`editor_request_begin_play`,
   `editor_play_simulate`, `request_play_session`, the plugin's `start_pie` / `start_pie_mode`):

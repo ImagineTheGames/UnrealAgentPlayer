@@ -94,5 +94,5 @@ If the assertion fails, the agent reads the logs, forms a hypothesis, edits, and
 - **Perceive with the cheapest reliable channel.** Order of preference: project test helper → actor property → log line → screenshot. Screenshots are last because `HighResShot` omits UMG.
 - **Use log cursors.** Snapshot a cursor before an action, `log_since` after, and you see exactly what that action produced — nothing else.
 - **Held vs. tapped input.** A down-event with no up-event stays held (continuous movement). For a tap, send down then up.
-- **Don't fight OS focus for input.** Injection is in-process; the editor need not be foreground. Reserve `FocusEditorWindow` for screenshots and native menu driving.
+- **Never take OS focus or send OS input.** Injection is in-process; the editor need not be foreground, and uap switches off the background throttle itself. `FocusEditorWindow` no longer exists.
 - **Fail structured.** Tools return error envelopes, not exceptions — branch on `code`/`retry_hint` and recover.

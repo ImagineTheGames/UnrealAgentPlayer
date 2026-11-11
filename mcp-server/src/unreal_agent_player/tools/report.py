@@ -84,7 +84,8 @@ async def report_finish(*, rc: Any = None, py_exec: Any = None,
     try:
         html_path.write_text(render(s.to_dict()), encoding="utf-8")
         # Reuses one browser window across a session instead of adding a tab per report;
-        # UAP_REPORT_NO_OPEN=1 turns opening off entirely (reporting/viewer.py).
+        # Opening is OFF unless UAP_REPORT_OPEN=1 (reporting/viewer.py): a new window takes the
+        # OS foreground, and uap never activates a window.
         opened = bool(_viewer.open_report(html_path).get("opened"))
     except Exception as exc:
         sess.clear_active()

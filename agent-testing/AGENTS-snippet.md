@@ -124,21 +124,22 @@ and renders an HTML report.
   prefer reading engine state over simulating input and inferring from what you see. Full
   write-up: the "Layer mismatches" section of `.claude/commands/agentplayertest.md`.
   - **An unfocused editor throttles to exactly 3.0 fps**, so any timing measured then is void (a
-    chase watched at 3 fps looked like broken AI and produced a ticket that was not real). Force
-    PIE window focus, then CONFIRM the rate in-engine (`WorldDeltaSeconds`, or the `hz` a sampler
-    reports) BEFORE recording a number. `Slate.bAllowThrottling 0` alone is NOT enough -- foreground
-    focus is the gate. `uap sample` / `uap input hold` are immune: no CLI calls during the window.
+    chase watched at 3 fps looked like broken AI and produced a ticket that was not real). NEVER
+    take focus or raise a window (banned: it steals the human's mouse and keyboard); uap turns
+    `bThrottleCPUWhenNotForeground` off for the PIE session itself. CONFIRM the rate in-engine
+    (`WorldDeltaSeconds`, or the `hz` a sampler reports) BEFORE recording a number.
+    `Slate.bAllowThrottling 0` alone is NOT enough -- `bThrottleCPUWhenNotForeground` is the gate. `uap sample` / `uap input hold` are immune: no CLI calls during the window.
     uap now says this AT the number: any rate <= 5 fps comes back `throttled:true` + a `warning`
     (report diag, perf stats, baselines, and `sample` via its own `hz`), and the HTML report
-    renders it too. If focus cannot be taken at all (SetForegroundWindow False /
-    GetForegroundWindow 0), report the timing as UNMEASURABLE rather than using it.
+    renders it too. If the rate cannot be confirmed in-engine, report the timing as UNMEASURABLE rather than using it.
   - **`InjectKey` never reaches Slate input pre-processors or focus handlers.** It enters below the
     pre-processor chain, so anything registered via `RegisterInputPreProcessor` (e.g. an analog or
     virtual cursor) and anything routed by Slate focus never sees it -- silently, which looks
     exactly like a broken feature. Not a blanket limitation: it works fine for gameplay input
     routed through Enhanced Input (menus, bound actions). It fails at ONE layer. For cursor, focus
-    or pre-processor work use real OS input (`keybd_event`) to the PIE window, or query state
-    instead (`GetDesiredFocusTarget()`, `HasFocusedDescendants`).
+    or pre-processor work use uap's Slate-route input (`--user <N>`, `uap click`) -- NEVER real OS
+    input (`keybd_event`; banned) -- or query state instead (`GetDesiredFocusTarget()`,
+    `HasFocusedDescendants`).
   - **Injected input aimed at the WRONG SLATE USER is discarded -- right layer, wrong user.**
     Slate stamps a USER index on every event and handlers filter on it
     (`FAnalogCursor::IsRelevantInput` is `GetOwnerUserIndex() == InputEvent.GetUserIndex()`,

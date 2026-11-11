@@ -34,21 +34,25 @@ _TRAP_REF = "trap #1 in agent-testing/agentplayertest.md"
 # in the middle of doing something else.
 THROTTLE_NOTE = (
     "This is the editor's not-foreground throttle (it pins ~3.0 fps when the editor is not "
-    "the foreground window), NOT the game's performance -- focus the PIE window and "
-    "re-measure, and treat any timing already taken as void. If focus cannot be taken "
-    "(SetForegroundWindow returns False / GetForegroundWindow is 0; Slate.bAllowThrottling 0 "
-    "does NOT lift it), report the timing as unmeasurable instead of using it -- but "
-    "`uap sample` and `uap input hold`/`input axis` still measure correctly, because they run "
-    "in-engine and need no CLI calls during the window. See " + _TRAP_REF + "."
+    "the foreground window), NOT the game's performance. NEVER take focus or raise a window to "
+    "fix it (banned: SetForegroundWindow and friends steal the human's mouse and keyboard). uap "
+    "turns bThrottleCPUWhenNotForeground off for the whole PIE session itself; a ~3 fps reading "
+    "means that did not take (an older plugin copy: sync and rebuild) -- set it in-engine (exact "
+    "call in docs/agents/uap-traps.md; Slate.bAllowThrottling 0 does NOT lift it), then "
+    "re-measure in the same PIE session, and treat any timing already taken as void. If the rate "
+    "cannot be confirmed above 5 fps, report the timing as unmeasurable instead of using it -- "
+    "but `uap sample` and `uap input hold`/`input axis` still measure correctly, because they "
+    "run in-engine and need no CLI calls during the window. See " + _TRAP_REF + "."
 )
 
 # Same message where the evidence is the sampler's own rate rather than a perf reading.
 SAMPLER_THROTTLE_NOTE = (
     "The sampler ran at roughly the editor's not-foreground throttle rate (~3 Hz), so these "
     "samples are ~333 ms apart: the per-frame deltas, hz and any smoothness/judder verdict "
-    "from them are void. Focus the PIE window and re-sample. If focus cannot be taken "
-    "(SetForegroundWindow returns False / GetForegroundWindow is 0; Slate.bAllowThrottling 0 "
-    "does NOT lift it), report the timing as unmeasurable instead of using it. See "
+    "from them are void. NEVER take focus (banned); turn bThrottleCPUWhenNotForeground off "
+    "(uap does this per PIE session; exact call in docs/agents/uap-traps.md; "
+    "Slate.bAllowThrottling 0 does NOT lift it) and re-sample. If the rate cannot be "
+    "confirmed, report the timing as unmeasurable instead of using it. See "
     + _TRAP_REF + "."
 )
 

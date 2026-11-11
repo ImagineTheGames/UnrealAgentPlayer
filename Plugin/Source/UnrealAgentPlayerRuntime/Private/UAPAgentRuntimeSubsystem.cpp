@@ -96,7 +96,7 @@ FString UUAPAgentRuntimeSubsystem::ExecuteConsoleCommand(FString Command)
     return Ar.Buffer;
 }
 
-bool UUAPAgentRuntimeSubsystem::InjectKey(FString KeyName, bool bPressed, bool bRepeat)
+bool UUAPAgentRuntimeSubsystem::InjectKey(FString KeyName, bool bPressed, bool bRepeat, FString Client)
 {
     UAP_ACTIVITY(TEXT("input key"), KeyName);
     FKey Key(*KeyName);
@@ -105,34 +105,39 @@ bool UUAPAgentRuntimeSubsystem::InjectKey(FString KeyName, bool bPressed, bool b
         UE_LOG(LogUAPRuntime, Warning, TEXT("InjectKey: unknown key '%s'"), *KeyName);
         return false;
     }
-    return FAgentInput::InjectKey(Key, bPressed, bRepeat);
+    return FAgentInput::OnClients(TEXT("InjectKey"), Client, [&]() { return FAgentInput::InjectKey(Key, bPressed, bRepeat); });
 }
 
-bool UUAPAgentRuntimeSubsystem::InjectMouseMove(float X, float Y, bool bAbsolute)
+FString UUAPAgentRuntimeSubsystem::ListClients()
+{
+    return FAgentWorld::DescribeClientsJson();
+}
+
+bool UUAPAgentRuntimeSubsystem::InjectMouseMove(float X, float Y, bool bAbsolute, FString Client)
 {
     UAP_ACTIVITY(TEXT("input mousemove"), FString());
-    return FAgentInput::InjectMouseMove(FVector2D(X, Y), bAbsolute);
+    return FAgentInput::OnClients(TEXT("InjectMouseMove"), Client, [&]() { return FAgentInput::InjectMouseMove(FVector2D(X, Y), bAbsolute); });
 }
 
-bool UUAPAgentRuntimeSubsystem::InjectMouseButton(EAgentMouseButton Button, bool bPressed)
+bool UUAPAgentRuntimeSubsystem::InjectMouseButton(EAgentMouseButton Button, bool bPressed, FString Client)
 {
     UAP_ACTIVITY(TEXT("input mousebutton"), FString());
-    return FAgentInput::InjectMouseButton(Button, bPressed);
+    return FAgentInput::OnClients(TEXT("InjectMouseButton"), Client, [&]() { return FAgentInput::InjectMouseButton(Button, bPressed); });
 }
 
-FString UUAPAgentRuntimeSubsystem::SetMousePosition(float X, float Y)
+FString UUAPAgentRuntimeSubsystem::SetMousePosition(float X, float Y, FString Client)
 {
     UAP_ACTIVITY(TEXT("input mousepos"), FString());
-    return FAgentInput::SetMousePositionJson(X, Y);
+    return FAgentInput::ForEachClientJson(Client, [&]() { return FAgentInput::SetMousePositionJson(X, Y); });
 }
 
-FString UUAPAgentRuntimeSubsystem::ClickMouse(EAgentMouseButton Button, FString X, FString Y)
+FString UUAPAgentRuntimeSubsystem::ClickMouse(EAgentMouseButton Button, FString X, FString Y, FString Client)
 {
     UAP_ACTIVITY(TEXT("click"), FString::Printf(TEXT("%s,%s"), *X, *Y));
-    return FAgentInput::ClickMouseJson(Button, X, Y);
+    return FAgentInput::ForEachClientJson(Client, [&]() { return FAgentInput::ClickMouseJson(Button, X, Y); });
 }
 
-bool UUAPAgentRuntimeSubsystem::InjectAxis(FString AxisName, float Value, FString SlateUser)
+bool UUAPAgentRuntimeSubsystem::InjectAxis(FString AxisName, float Value, FString SlateUser, FString Client)
 {
     UAP_ACTIVITY(TEXT("input axis"), AxisName);
     int32 User = INDEX_NONE;
@@ -144,10 +149,10 @@ bool UUAPAgentRuntimeSubsystem::InjectAxis(FString AxisName, float Value, FStrin
         UE_LOG(LogUAPRuntime, Error, TEXT("InjectAxis: %s"), *UserError);
         return false;
     }
-    return FAgentInput::InjectAxis(FName(*AxisName), Value, User);
+    return FAgentInput::OnClients(TEXT("InjectAxis"), Client, [&]() { return FAgentInput::InjectAxis(FName(*AxisName), Value, User); });
 }
 
-bool UUAPAgentRuntimeSubsystem::InjectGamepad(EAgentGamepadButton Button, bool bPressed, float AnalogValue, FString SlateUser)
+bool UUAPAgentRuntimeSubsystem::InjectGamepad(EAgentGamepadButton Button, bool bPressed, float AnalogValue, FString SlateUser, FString Client)
 {
     UAP_ACTIVITY(TEXT("input gamepad"), FString());
     int32 User = INDEX_NONE;
@@ -157,10 +162,10 @@ bool UUAPAgentRuntimeSubsystem::InjectGamepad(EAgentGamepadButton Button, bool b
         UE_LOG(LogUAPRuntime, Error, TEXT("InjectGamepad: %s"), *UserError);
         return false;
     }
-    return FAgentInput::InjectGamepad(Button, bPressed, AnalogValue, User);
+    return FAgentInput::OnClients(TEXT("InjectGamepad"), Client, [&]() { return FAgentInput::InjectGamepad(Button, bPressed, AnalogValue, User); });
 }
 
-bool UUAPAgentRuntimeSubsystem::InjectXRButton(EAgentXRHand Hand, FString ButtonKeyName, bool bPressed)
+bool UUAPAgentRuntimeSubsystem::InjectXRButton(EAgentXRHand Hand, FString ButtonKeyName, bool bPressed, FString Client)
 {
     UAP_ACTIVITY(TEXT("input xr"), ButtonKeyName);
     FKey Key(*ButtonKeyName);
@@ -177,33 +182,33 @@ bool UUAPAgentRuntimeSubsystem::InjectXRButton(EAgentXRHand Hand, FString Button
             *ButtonKeyName, Hand == EAgentXRHand::Left ? TEXT("Left") : TEXT("Right"));
         return false;
     }
-    return FAgentInput::InjectKey(Key, bPressed, false);
+    return FAgentInput::OnClients(TEXT("InjectXRButton"), Client, [&]() { return FAgentInput::InjectKey(Key, bPressed, false); });
 }
 
 // Thin forwarders: the validate-before-press ordering, the refusal messages and the recovery
 // path all live in FAgentInput so the editor and runtime subsystems cannot drift apart.
-FString UUAPAgentRuntimeSubsystem::HoldKey(FString KeyName, float Seconds)
+FString UUAPAgentRuntimeSubsystem::HoldKey(FString KeyName, float Seconds, FString Client)
 {
     UAP_ACTIVITY(TEXT("input hold"), KeyName);
-    return FAgentInput::HoldKeyJson(KeyName, Seconds);
+    return FAgentInput::ForEachClientJson(Client, [&]() { return FAgentInput::HoldKeyJson(KeyName, Seconds); });
 }
 
-FString UUAPAgentRuntimeSubsystem::HoldAxis(FString AxisKeyName, float Value, float Seconds,
-                                            FString SlateUser)
+FString UUAPAgentRuntimeSubsystem::HoldAxis(FString AxisKeyName, float Value, float Seconds, FString SlateUser, FString Client)
 {
     UAP_ACTIVITY(TEXT("input axis-hold"), AxisKeyName);
-    return FAgentInput::HoldAxisJson(AxisKeyName, Value, Seconds, SlateUser);
+    return FAgentInput::ForEachClientJson(Client, [&]() { return FAgentInput::HoldAxisJson(AxisKeyName, Value, Seconds, SlateUser); });
 }
 
-FString UUAPAgentRuntimeSubsystem::ReleaseHeldInput(FString KeyName)
+FString UUAPAgentRuntimeSubsystem::ReleaseHeldInput(FString KeyName, FString Client)
 {
     UAP_ACTIVITY(TEXT("input release"), KeyName);
-    return FAgentInput::ReleaseHeldJson(KeyName);
+    return FAgentInput::ForEachClientJson(Client, [&]() { return FAgentInput::ReleaseHeldJson(KeyName); });
 }
 
-FString UUAPAgentRuntimeSubsystem::GetHeldInput()
+FString UUAPAgentRuntimeSubsystem::GetHeldInput(FString Client)
 {
-    return FAgentInput::GetHeldJson();
+    // Several clients -> one envelope per client, so a caller can see which client holds what.
+    return FAgentInput::ForEachClientJson(Client, []() { return FAgentInput::GetHeldJson(); });
 }
 
 FString UUAPAgentRuntimeSubsystem::StartPropertySample(FString ObjectPath, FString PropertyPath,
@@ -267,10 +272,10 @@ FString UUAPAgentRuntimeSubsystem::GetXRControllerState()
     return MC->StateJson();
 }
 
-FString UUAPAgentRuntimeSubsystem::DumpViewportUI()
+FString UUAPAgentRuntimeSubsystem::DumpViewportUI(FString Client)
 {
     UAP_ACTIVITY(TEXT("read-ui"), FString());
-    return FAgentUIReader::DumpViewportUI();
+    return FAgentInput::ForEachClientJson(Client, []() { return FAgentUIReader::DumpViewportUI(); });
 }
 
 bool UUAPAgentRuntimeSubsystem::CaptureViewportWithUI(FString Filename)

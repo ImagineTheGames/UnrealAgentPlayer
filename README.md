@@ -77,7 +77,7 @@ backgrounded or PIE ran inside the level viewport; see `docs/architecture.md`.)
 | **Screenshots** | `screenshot_viewport` | Capture the viewport (HighResShot — see [gaps](#whats-proven-vs-known-gaps)). |
 | **Test helpers** | `helper_list` + `CallTestHelper` | Auto-discover and call project-specific Blueprint/C++ assertion helpers (e.g. `IsDoorOpen`). |
 | **Editor menus** | `ui_menu_click` `ui_find_window` `ui_list_menus` | Drive native editor menu bar via Windows UIAutomation. |
-| **Editor focus** | `FocusEditorWindow` (UFUNCTION) | Bring the editor window to front from in-process, for capture/native-chrome driving. |
+| **No focus, no OS input** | `--client N` on input verbs | uap never raises/focuses a window or sends OS input; every client of a multi-client PIE is driven in-engine, and the 3 fps background throttle is switched off per PIE session. |
 | **Standalone** | `game_launch` `game_attach` `game_list` `game_stop` | Launch/attach standalone game instances (each on its own RemoteControl port) and drive them like a player; play tools take a `target`. Parallel instances + editor coexist. |
 
 Full reference with parameters and return shapes: **[docs/capabilities.md](docs/capabilities.md)**.

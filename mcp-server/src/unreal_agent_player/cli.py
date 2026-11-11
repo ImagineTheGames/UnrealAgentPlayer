@@ -427,7 +427,8 @@ def _report_finish(args) -> int:
     # One window per testing session, not one tab per report: this REPLACES the window the
     # previous report opened instead of adding another (see reporting/viewer.py). `html` below
     # still names the per-run file -- agents quote that path, and nothing about it moved.
-    shown = _viewer.open_report(html_path, no_open=getattr(args, "no_open", False) or None)
+    shown = _viewer.open_report(html_path, no_open=getattr(args, "no_open", False) or None,
+                                open_=getattr(args, "open_report", False) or None)
     out = {"ok": True, "html": str(html_path), "verdict": s.status,
            "downgraded": s.status != args.verdict, "pie_stopped": pie_stopped,
            "opened": shown.get("opened", False)}
@@ -524,8 +525,92 @@ def _rc_port_for(project: str | None) -> int:
 _RC_PROBE_TIMEOUT: list = [None]
 
 
+# Which PIE client of a multi-client session the verbs act on (--client / $UAP_CLIENT) [17tm466z4a6].
+# Set once per CLI process by _run_parsed, like _RC_PROBE_TIMEOUT, so no verb has to thread it
+# through. Empty = the plugin's historical default (the first game world).
+_CLIENT: list = [None]
+
+# Every plugin verb whose last parameter is `Client`: the ones that inject input, hold, release,
+# or read the UI of a game world. Anything else is not per-client and never gets the field.
+_CLIENT_VERBS = frozenset({
+    "InjectKey", "InjectMouseMove", "InjectMouseButton", "SetMousePosition", "ClickMouse",
+    "InjectAxis", "InjectGamepad", "InjectXRButton", "HoldKey", "HoldAxis", "ReleaseHeldInput",
+    "GetHeldInput", "DumpViewportUI",
+})
+
+
+def _with_client(func: str, params: dict, project: str | None) -> dict:
+    """Add `Client` to a client-capable verb's params when --client was given.
+
+    An OLDER plugin copy has the verb but not the parameter, and RemoteControl would take the
+    call and silently DROP the unknown argument -- the input would go to the first client while
+    the caller believes it went to the one it named. That is the silent wrong answer this whole
+    feature exists to end, so check the live contract and refuse instead. An unreadable contract
+    proceeds, like every other skew check here."""
+    client = _CLIENT[0]
+    if client is None or str(client).strip() == "" or func not in _CLIENT_VERBS \
+            or "Client" in params:
+        return params
+    gap = _missing_arg(func, "Client", project)
+    if gap:
+        raise _skew_error(func, project,
+                          f"targeting client {client!r}; without it the input would silently go "
+                          f"to the FIRST client")
+    return {**params, "Client": str(client).strip()}
+
+
+# A STANDALONE `-game` client chosen with --instance (a second process: launch_2p_standalone.ps1).
+# It has no editor subsystem, so its verbs live on the runtime subsystem's own preset, on the RC
+# port it was started with (`-RCWebControlEnable -UAPRCPort=<n>`). {port, preset, pid} or None.
+_RC_TARGET: list = [None]
+# Resolved once in _run_parsed, made live (as _RC_TARGET) only around the verb itself, so the lease /
+# machine-lock bookkeeping around it keeps talking to the EDITOR.
+_INSTANCE_TARGET: list = [None]
+_RUNTIME_PRESET = "UAP_RuntimePreset"
+_UAPRCPORT_RE = re.compile(r"-UAPRCPort=(\d+)", re.IGNORECASE)
+# The verbs the runtime subsystem serves, i.e. the ones a standalone client can be driven with.
+_INSTANCE_RC_CMDS = frozenset({"input", "xr", "click", "tab", "nav", "read-ui", "rc"})
+
+
+def _resolve_instance_target(instance: str | None, project: str | None) -> dict | None:
+    """Where --instance <sel> points: the RC port + preset of that standalone client.
+
+    None for no selector / 'editor' (the editor, as always). Raises AgentError, naming the fix,
+    when the selector matches nothing, matches several, or matches a client that was not started
+    with -UAPRCPort (nothing can reach it in-engine, and the only alternative -- real OS input --
+    is banned). Owner rule 2026-11-11: uap never drives a client through the OS.
+    """
+    sel = (instance or "").strip()
+    if not sel or sel.lower() == "editor":
+        return None
+    probe = PythonRemoteExecClient(node_project_substr=project or "", node_instance=sel)
+    nodes = [n for n in probe.list_nodes()
+             if probe._matches_project(n) and probe._matches_instance(n)]
+    if not nodes:
+        raise AgentError(ErrorCode.INSTANCE_NOT_FOUND,
+                         f"--instance {sel!r} matches no running Unreal process of this project. "
+                         f"`uap instances` lists what is answering.")
+    if len(nodes) > 1:
+        raise AgentError(ErrorCode.INSTANCE_NOT_FOUND,
+                         f"--instance {sel!r} matches {len(nodes)} processes "
+                         f"({', '.join(str(n.get('pid')) for n in nodes)}); use pid:<n>.")
+    node = nodes[0]
+    m = _UAPRCPORT_RE.search(str(node.get("cmdline") or ""))
+    if not m:
+        raise AgentError(
+            ErrorCode.INSTANCE_NOT_FOUND,
+            f"process {node.get('pid')} was not started with -UAPRCPort=<n> -RCWebControlEnable, so "
+            f"uap has no in-engine way to reach it. Relaunch it with launch_2p_standalone.ps1 (which "
+            f"now passes them) -- do NOT drive it with real OS input or by focusing its window; "
+            f"both are banned.", recoverable=False)
+    return {"port": int(m.group(1)), "preset": _RUNTIME_PRESET, "pid": node.get("pid")}
+
+
 def _rc_call(func: str, params: dict, project: str | None = None):
-    port = _rc_port_for(project)
+    params = _with_client(func, params, project)
+    target = _RC_TARGET[0]
+    port = target["port"] if target else _rc_port_for(project)
+    preset = target["preset"] if target else None
     timeout = _RC_PROBE_TIMEOUT[0]
 
     def _call(p: int):
@@ -533,6 +618,8 @@ def _rc_call(func: str, params: dict, project: str | None = None):
             rc = RemoteControlClient(port=p) if timeout is None else \
                 RemoteControlClient(port=p, timeout=timeout)
             try:
+                if preset:
+                    return await rc.call_preset(func, params, preset=preset)
                 return await rc.call_preset(func, params)
             finally:
                 await rc.aclose()
@@ -547,7 +634,7 @@ def _rc_call(func: str, params: dict, project: str | None = None):
             raise
         # The cached/default port may be stale (editor restarted on a different port).
         # Re-resolve once via exec and retry -- unless an explicit env override pins the port.
-        if project and not os.environ.get("UAP_RC_PORT"):
+        if project and not os.environ.get("UAP_RC_PORT") and not target:
             fresh = _exec_rc_port(project)
             if fresh and fresh != port:
                 _write_port_cache(project, fresh)
@@ -606,6 +693,9 @@ def _live_contract(project: str | None) -> dict | None:
 
     One localhost GET. Every failure is None, so a call that would have worked still does.
     """
+    target = _RC_TARGET[0]
+    if target:
+        return _contract.fetch_live_contract(target["port"], preset=target["preset"])
     return _contract.fetch_live_contract(_rc_port_for(project))
 
 
@@ -1311,10 +1401,21 @@ def _hold_ledger_read(project) -> dict:
         return {}
 
 
+def _client_tag() -> str:
+    """The --client this process targets, as a ledger/compare tag ('' = the default client)."""
+    return str(_CLIENT[0] or "").strip().lower()
+
+
+def _hold_ledger_id(key: str) -> str:
+    """Ledger entry id: the same key held on two clients is two holds, not one."""
+    tag = _client_tag()
+    return f"{str(key).lower()}@{tag}" if tag else str(key).lower()
+
+
 def _hold_ledger_note(project, key: str, seconds: float, agent: str | None) -> None:
     led = _hold_ledger_read(project)
-    led[str(key).lower()] = {"key": key, "ends_at": time.time() + float(seconds),
-                             "agent": agent or None}
+    led[_hold_ledger_id(key)] = {"key": key, "ends_at": time.time() + float(seconds),
+                                 "agent": agent or None, "client": _client_tag()}
     try:
         p = _hold_ledger_path(project)
         p.parent.mkdir(parents=True, exist_ok=True)
@@ -1326,7 +1427,10 @@ def _hold_ledger_note(project, key: str, seconds: float, agent: str | None) -> N
 def _hold_ledger_clear(project, key: str = "") -> None:
     led = _hold_ledger_read(project)
     if key:
-        led.pop(str(key).lower(), None)
+        led.pop(_hold_ledger_id(key), None)
+    elif _client_tag():
+        # `release` scoped to one client clears only that client's entries.
+        led = {k: e for k, e in led.items() if str(e.get("client") or "") != _client_tag()}
     else:
         led = {}
     try:
@@ -1364,16 +1468,24 @@ def _hold_conflict(key: str, project, *, allow: bool) -> dict | None:
         return None
     now = time.time()
     suspects = [e for k, e in _hold_ledger_read(project).items()
-                if k != str(key).lower() and float(e.get("ends_at") or 0) > now]
+                if k != _hold_ledger_id(key) and float(e.get("ends_at") or 0) > now
+                and str(e.get("client") or "") == _client_tag()]
     if not suspects:
         return None
     try:
         state = _rc_json("GetHeldInput", {}, project, needs=_NEEDS_HOLD)
     except (AgentError, json.JSONDecodeError):
         return None
-    others = [h for h in (state.get("held") or [])
+    # With --client N the plugin already answers for that one client; with --client all (or none)
+    # it lists every client's holds, so compare only the ones on the client this call targets.
+    held = state.get("held")
+    if held is None and isinstance(state.get("clients"), list):
+        held = [h for c in state["clients"] for h in (c.get("held") or [])]
+    tag = _client_tag()
+    others = [h for h in (held or [])
               if str(h.get("key", "")).lower() != str(key).lower()
-              and float(h.get("remaining_seconds") or 0) > 0]
+              and float(h.get("remaining_seconds") or 0) > 0
+              and (not tag or tag == "all" or str(h.get("client", "")) == tag)]
     if not others:
         _hold_ledger_clear(project)     # the ledger was stale; do not keep refusing on it
         return None
@@ -1442,6 +1554,9 @@ def _input(args) -> int:
             body.update(_rc_json("ReleaseHeldInput", {"KeyName": args.key or ""}, args.project,
                                  needs=_NEEDS_HOLD))
             _hold_ledger_clear(args.project, args.key or "")
+        elif sub == "clients":
+            body.update(_rc_json("ListClients", {}, args.project,
+                                 needs="listing the PIE clients you can target with --client"))
         else:  # status
             body.update(_rc_json("GetHeldInput", {}, args.project, needs=_NEEDS_HOLD))
 
@@ -2035,6 +2150,11 @@ def _click(args) -> int:
     center coord will improve precision for large widgets -- see docs/agent-discoverability.md.)"""
     t0 = time.monotonic()
     body: dict = {"ok": True, "label": args.label}
+    if _client_tag() == "all":
+        _emit({"ok": False, "label": args.label, "clicked": False,
+               "error": "--client all makes no sense for a click: it would press the same label on "
+                        "every client. Name one client (--client 0 / 1; `uap input clients` lists them)."})
+        return 1
     try:
         ui_raw = _rc_require("DumpViewportUI", {}, args.project, _NEEDS_UI)
         ui = json.loads(ui_raw) if isinstance(ui_raw, str) else (ui_raw or {})
@@ -2352,10 +2472,12 @@ COMMON MISTAKES (don't)
   * A frame rate at or below 5 fps is NOT a game measurement -- the editor throttles to exactly
     3.0 fps whenever it is not the foreground window, and every timing taken then is void. uap
     now says so on the number itself (`throttled`/`warning` on report diag, perf stats, baselines
-    and sample). Focus the PIE window and re-measure. If focus cannot be taken (SetForegroundWindow
-    returns False / GetForegroundWindow is 0; `Slate.bAllowThrottling 0` does NOT lift it), report
-    the timing as unmeasurable instead of using it -- `uap sample` and `uap input hold`/`axis`
-    still measure correctly, since they run in-engine with no CLI calls during the window.
+    and sample). NEVER take focus or raise a window to fix it (banned): uap turns the editor's
+    bThrottleCPUWhenNotForeground off for the PIE session itself and restores it at the end; a
+    ~3 fps reading means the plugin copy predates that -- set it in-engine (docs/agents/uap-traps.md)
+    and re-measure. `Slate.bAllowThrottling 0` does NOT lift it. If the rate cannot be confirmed,
+    report the timing as unmeasurable -- `uap sample` and `uap input hold`/`axis` still measure
+    correctly, since they run in-engine with no CLI calls during the window.
   * Multiple agents share ONE editor. Rebuild ONLY via Restart-Editor.ps1 (it takes the exclusive
     lease); never kill/msbuild the editor by hand. `uap` editor ops auto-WAIT through another agent's
     rebuild (they block then resume -- a slow call is not an error). Hold PIE/level across calls with
@@ -2384,8 +2506,9 @@ PREFLIGHT
   uap report diag                 capture editor/level/PIE + frame perf into the report
                                   A rate <= 5 fps comes back `throttled:true` + a `warning`:
                                   that is the editor's NOT-FOREGROUND throttle (it pins ~3.0
-                                  fps), not the game. Focus the PIE window and re-measure;
-                                  timing already taken is void. Same flag on `sample` (its own
+                                  fps), not the game. Never take focus (banned); uap turns the
+                                  throttle off per PIE session - re-measure; timing already
+                                  taken is void. Same flag on `sample` (its own
                                   `hz`) and in the HTML report. Never report a sub-5-fps number
                                   as a performance finding -- it is a tooling state.
 
@@ -2395,9 +2518,10 @@ REPORT (a verification is NOT done until `report finish` emits the HTML report; 
   uap report note "<text>"
   uap report finish pass|fail "<summary>"   # pass w/o screenshot -> FAIL; also auto-stops PIE (--keep-pie to skip)
   -> attach proof: `uap screenshot <abs.png>` (auto-attaches), or `uap report screenshot <file>`
-  -> finish shows the report in ONE reusable browser window: each run REPLACES the window the
-     previous report opened instead of leaving a tab behind. `--no-open` (or
-     UAP_REPORT_NO_OPEN=1) renders it without a browser at all; the path is printed either way.
+  -> finish does NOT open a browser by default (a new window takes the OS foreground; uap never
+     activates a window). `--open` (or UAP_REPORT_OPEN=1) opts in: then each run REPLACES the
+     window the previous report opened instead of leaving a tab behind. The path is printed
+     either way.
 
 PLAY-IN-EDITOR
   uap pie start                   start PIE and BLOCK until the play world is live (default; a
@@ -2653,6 +2777,13 @@ every call. --task / $UAP_TASK is a short label of what you are doing; the overl
   it answered `None` for every editor subsystem, which reads as a broken editor. It is now
   refused by name unless you ask for it: --instance Context_2 / --instance pid:53164.
   `uap instances` lists every process that answers and says which one verbs will select.
+  DRIVING A SECOND CLIENT, IN-ENGINE (never through the OS -- real OS input and window focus are
+  BANNED: they steal the human's mouse and keyboard):
+    * several PIE clients in ONE process (PlayNumberOfClients > 1): `--client N|all` on input / xr /
+      click / read-ui / rc. `uap input clients` lists them. A hold belongs to the client it started on.
+    * a `-game` standalone client (launch_2p_standalone.ps1 starts each with -UAPRCPort=<n>):
+      `--instance Context_2` (or pid:<n>) sends input / click / read-ui / rc to THAT process's own RC
+      port. A client started without -UAPRCPort is refused with the fix, not driven another way.
 
 MORE: docs/agent-testing.md (usage), docs/capabilities.md (every tool), docs/known-issues.md.
 Per-verb flags: uap <verb> --help
@@ -2819,7 +2950,7 @@ _RC_PIE_STOP = {"StopPIE", "StopPIEEx"}
 _RC_FOREGROUND = {"InjectKey", "InjectAxis", "InjectGamepad", "InjectMouseButton",
                   "InjectMouseMove", "SetMousePosition", "ClickMouse", "HoldKey", "HoldAxis",
                   "InjectXRButton", "InjectXRControllerPose", "NavigateUI", "SelectTab",
-                  "FocusEditorWindow", "CaptureViewportWithUI", "DumpViewportUI"}
+                  "CaptureViewportWithUI", "DumpViewportUI"}
 
 # `uap exec` / `exec-file` stay ungated (they are the generic transport), EXCEPT for Python that
 # requests a play session: that is a `pie start` by another name and holds the machine the same
@@ -3035,6 +3166,13 @@ def build_parser() -> argparse.ArgumentParser:
                       help="which instance of that project: 'editor' (default), 'pid:<n>', or "
                            "a substring of the process command line (e.g. Context_2). "
                            "`uap instances` lists what is answering.")
+    # Which PIE client of a multi-client session (PlayNumberOfClients > 1). Without it every
+    # verb acts on the FIRST game world, so a net client could never be driven. In-engine
+    # injection: it needs no focus and never raises a window. [17tm466z4a6]
+    proj.add_argument("--client", default=os.environ.get("UAP_CLIENT") or None, metavar="N|all",
+                      help="which PIE client the input / click / read-ui verbs act on: its PIE "
+                           "instance index (0, 1, ...; `uap input clients` lists them) or 'all'. "
+                           "Default $UAP_CLIENT, else the first game world (unchanged).")
     # Output mode + harness-safe waiting, accepted by every verb like the flags above.
     proj.add_argument("--brief", action="store_true", default=False,
                       help="compact output (also $UAP_OUTPUT=brief). Opt-in; default unchanged.")
@@ -3094,10 +3232,14 @@ def build_parser() -> argparse.ArgumentParser:
                     help="do not auto-stop PIE on finish (default: stop it so a finished test "
                          "never leaves the editor stuck in Play-In-Editor)")
     rf.add_argument("--no-open", dest="no_open", action="store_true",
-                    help="render the report but do not show it in a browser (same as "
-                         "UAP_REPORT_NO_OPEN=1). The path is still printed; by default the "
-                         "report REPLACES the window the previous report opened rather than "
-                         "piling up a tab per run")
+                    help="never open the report (the default; kept for old callers, and it wins "
+                         "over --open). Same as UAP_REPORT_NO_OPEN=1")
+    rf.add_argument("--open", dest="open_report", action="store_true",
+                    help="OPT IN to showing the finished report in a browser window (same as "
+                         "UAP_REPORT_OPEN=1). Off by default because a new window takes the OS "
+                         "foreground over whatever the human is doing; the path is always "
+                         "printed. When on, the report REPLACES the window the previous one "
+                         "opened rather than piling up a tab per run")
     rf.set_defaults(func=_report_finish)
 
     st = sub.add_parser("status", parents=[proj])
@@ -3217,6 +3359,9 @@ def build_parser() -> argparse.ArgumentParser:
     ir.set_defaults(func=_input)
     inps.add_parser("status", parents=[proj],
                     help="what is currently held and for how much longer").set_defaults(func=_input)
+    inps.add_parser("clients", parents=[proj],
+                    help="the PIE clients you can target with --client (index, net mode, window)"
+                    ).set_defaults(func=_input)
 
     # XR controllers: pose / grip / trigger for the injected Quest hands. See _xr.
     xr = sub.add_parser("xr", help="place the injected VR hands, press grip/trigger, emulate the aim pose")
@@ -3793,6 +3938,15 @@ def main(argv: list[str] | None = None) -> int:
 def _run_parsed(args) -> int:
     cmd = getattr(args, "cmd", None)
     _set_output_mode(args)
+    _CLIENT[0] = (getattr(args, "client", None) or None)
+    _INSTANCE_TARGET[0] = None
+    if cmd in _INSTANCE_RC_CMDS and (getattr(args, "instance", None) or "").strip().lower() \
+            not in ("", "editor"):
+        try:
+            _INSTANCE_TARGET[0] = _resolve_instance_target(args.instance, getattr(args, "project", None))
+        except AgentError as exc:
+            _emit(_err(exc))
+            return 1
     project = getattr(args, "project", "") or _env_project()
     # `screenshot --window` captures a standalone game client from the OS side. It touches no
     # editor, takes no input and needs no foreground, so it must not queue behind a rebuild, an
@@ -4173,9 +4327,11 @@ def _run_under_machine_lock(args, cmd: str | None, project: str, *,
             except Exception:
                 tracked = False
     requested_at = _coord._now()
+    _RC_TARGET[0] = _INSTANCE_TARGET[0]     # a --instance standalone client: its own RC port/preset
     try:
         rc = args.func(args)
     finally:
+        _RC_TARGET[0] = None
         if tracked:
             try:
                 _coord.end_call(project)

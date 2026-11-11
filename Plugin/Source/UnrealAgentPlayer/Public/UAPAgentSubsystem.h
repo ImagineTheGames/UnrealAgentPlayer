@@ -27,12 +27,6 @@ public:
     UFUNCTION(BlueprintCallable, Category="Agent|Status")
     int32 GetRemoteControlPort() const;
 
-    // Brings the editor's main window to the foreground. Works from inside the editor
-    // process (no cross-process foreground lock), so an external agent can make the
-    // editor frontmost before capturing screenshots or injecting clicks. Windows only.
-    UFUNCTION(BlueprintCallable, Category="Agent|Editor")
-    bool FocusEditorWindow();
-
     UFUNCTION(BlueprintCallable, Category="Agent|PIE")
     EAgentPIEPhase GetPIEPhase() const;
 
@@ -89,14 +83,24 @@ public:
     FString GetLogsSince(int64 AfterCursor, int32 MaxLines,
                          FString CategoryFilter, EAgentLogVerbosity MinVerbosity) const;
 
+    // CLIENT (last parameter of every verb below that injects, holds, releases or reads UI):
+    // which PIE client of a multi-client session the verb acts on. "" = the first game world (the
+    // historical default, so an old caller is unchanged), "N" = PIE instance N, "all" = every
+    // client. It is a string for the RemoteControl reason documented on SlateUser: an omitted
+    // value arrives zero-initialised, and "" is the only value that survives that as "default".
+    // In-engine only - it never raises, focuses or sends OS input to a window. [17tm466z4a6]
+    // ListClients JSON: {"ok":true,"clients":[{client, world, net_mode, default, accepts_input, window_title, pawn}]}
     UFUNCTION(BlueprintCallable, Category="Agent|Input")
-    bool InjectKey(FString KeyName, bool bPressed, bool bRepeat);
+    FString ListClients();
 
     UFUNCTION(BlueprintCallable, Category="Agent|Input")
-    bool InjectMouseMove(float X, float Y, bool bAbsolute);
+    bool InjectKey(FString KeyName, bool bPressed, bool bRepeat, FString Client);
 
     UFUNCTION(BlueprintCallable, Category="Agent|Input")
-    bool InjectMouseButton(EAgentMouseButton Button, bool bPressed);
+    bool InjectMouseMove(float X, float Y, bool bAbsolute, FString Client);
+
+    UFUNCTION(BlueprintCallable, Category="Agent|Input")
+    bool InjectMouseButton(EAgentMouseButton Button, bool bPressed, FString Client);
 
     // The mouse position inside a CAPTURED viewport. Win32 SetCursorPos and
     // FSlateApplication::SetCursorPos are both inert while PIE holds the mouse, so these do not
@@ -106,10 +110,10 @@ public:
     // reported ok:true from the top-left corner. X/Y on ClickMouse are strings so that
     // "omitted" is distinguishable from 0,0. See AgentInput.h.
     UFUNCTION(BlueprintCallable, Category="Agent|Input")
-    FString SetMousePosition(float X, float Y);
+    FString SetMousePosition(float X, float Y, FString Client);
 
     UFUNCTION(BlueprintCallable, Category="Agent|Input")
-    FString ClickMouse(EAgentMouseButton Button, FString X, FString Y);
+    FString ClickMouse(EAgentMouseButton Button, FString X, FString Y, FString Client);
 
     // SlateUser: "" (or omitted) resolves the target Slate user automatically; "0"/"1"/... targets
     // one explicitly and REFUSES LOUDLY if Slate has no such user. It is a string because
@@ -119,13 +123,13 @@ public:
     // handler's owner (FAnalogCursor::IsRelevantInput -- engine AnalogCursor.cpp:192), with no
     // error, so a mis-stamped injection looks exactly like a broken feature.
     UFUNCTION(BlueprintCallable, Category="Agent|Input")
-    bool InjectAxis(FString AxisName, float Value, FString SlateUser);
+    bool InjectAxis(FString AxisName, float Value, FString SlateUser, FString Client);
 
     UFUNCTION(BlueprintCallable, Category="Agent|Input")
-    bool InjectGamepad(EAgentGamepadButton Button, bool bPressed, float AnalogValue, FString SlateUser);
+    bool InjectGamepad(EAgentGamepadButton Button, bool bPressed, float AnalogValue, FString SlateUser, FString Client);
 
     UFUNCTION(BlueprintCallable, Category="Agent|Input")
-    bool InjectXRButton(EAgentXRHand Hand, FString ButtonKeyName, bool bPressed);
+    bool InjectXRButton(EAgentXRHand Hand, FString ButtonKeyName, bool bPressed, FString Client);
 
     // --- Sustained input ------------------------------------------------------------------
     // One injected event cannot drive sustained locomotion from outside the editor: the CLI
@@ -139,14 +143,14 @@ public:
     // Press KeyName and hold it for Seconds (IE_Repeat every frame), then release.
     // {"ok":true,"key":..,"seconds":..,"pressed":true} | {"ok":false,"key":..,"error":..,"pressed":false}
     UFUNCTION(BlueprintCallable, Category="Agent|Input")
-    FString HoldKey(FString KeyName, float Seconds);
+    FString HoldKey(FString KeyName, float Seconds, FString Client);
 
     // Drive an analog axis FKey at Value every frame for Seconds, then recentre to 0. This is
     // the VR locomotion verb: thumbstick keys are axes, not buttons (e.g.
     // OculusTouch_Left_Thumbstick_Y). A single sample is not what the game sees -- a real
     // stick re-sends its value every frame.
     UFUNCTION(BlueprintCallable, Category="Agent|Input")
-    FString HoldAxis(FString AxisKeyName, float Value, float Seconds, FString SlateUser);
+    FString HoldAxis(FString AxisKeyName, float Value, float Seconds, FString SlateUser, FString Client);
 
     // Release input, and the RECOVERY escape hatch. An empty KeyName releases every registry
     // entry AND flushes every key the engine still has down, so a key the registry lost track
@@ -155,12 +159,12 @@ public:
     // {"ok":true,"released":N,"controllers_flushed":N,"flushed":bool}
     // {"ok":true,"key":..,"released":N,"was_held":bool,"forced":bool,"down_before":bool}
     UFUNCTION(BlueprintCallable, Category="Agent|Input")
-    FString ReleaseHeldInput(FString KeyName);
+    FString ReleaseHeldInput(FString KeyName, FString Client);
 
     // JSON: {"ok":true,"held":[{key, analog, value, remaining_seconds, down}]}. `down` is
     // engine ground truth; if it disagrees with the registry, use ReleaseHeldInput("").
     UFUNCTION(BlueprintCallable, Category="Agent|Input")
-    FString GetHeldInput();
+    FString GetHeldInput(FString Client);
 
     // Release a Slate POINTER capture, which ReleaseHeldInput does not touch -- it is a
     // different thing from a held key. While a captor is held, every mouse event is routed to
@@ -227,7 +231,7 @@ public:
     // position, focus) as a JSON string, so an agent can read prompts/labels instead
     // of injecting input blind. Empty/`available:false` when not in PIE.
     UFUNCTION(BlueprintCallable, Category="Agent|UI")
-    FString DumpViewportUI();
+    FString DumpViewportUI(FString Client);
 
     // Selects a CommonUI tab by its TabNameID on the live game's tab list (menus are
     // tab-driven). Returns false if no game-world CommonTabListWidgetBase is found or the
@@ -275,6 +279,7 @@ private:
     // ClearRemoteExecGlobals.
     void OnPreMapLoad(const FString& Filename, struct FCanLoadMap& OutCanLoadMap);
 
+    void OnPreBeginPIE(bool bSimulating);
     void OnPostPIEStarted(bool bSimulating);
     void OnPrePIEEnded(bool bSimulating);
     void OnEndPIE(bool bSimulating);
@@ -282,9 +287,15 @@ private:
     void OnResumePIE(bool bSimulating);
     void OnCancelPIE();
 
+    // bThrottleCPUWhenNotForeground handling; see SuppressBackgroundThrottle.
+    void SuppressBackgroundThrottle(bool bSuppress);
+    bool bThrottleSuppressed = false;
+    bool bPriorThrottleSetting = true;
+
     EAgentPIEPhase CurrentPhase = EAgentPIEPhase::NotPlaying;
     double PIEStartTimeSeconds = 0.0;
 
+    FDelegateHandle HPreBeginPIE;
     FDelegateHandle HPostPIEStarted;
     FDelegateHandle HPrePIEEnded;
     FDelegateHandle HEndPIE;

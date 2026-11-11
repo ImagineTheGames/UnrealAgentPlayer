@@ -15,6 +15,8 @@
 #include "Misc/OutputDevice.h"
 #include "AgentActivity.h"
 #include "AgentInput.h"
+#include "AgentWorld.h"
+#include "Editor/EditorPerformanceSettings.h"
 #include "AgentLogCapture.h"
 #include "Misc/Paths.h"
 #include "UAPAgentSettings.h"
@@ -64,6 +66,7 @@ namespace
 void UUAPAgentSubsystem::Initialize(FSubsystemCollectionBase& Collection)
 {
     Super::Initialize(Collection);
+    HPreBeginPIE   = FEditorDelegates::PreBeginPIE.AddUObject(this, &UUAPAgentSubsystem::OnPreBeginPIE);
     HPostPIEStarted = FEditorDelegates::PostPIEStarted.AddUObject(this, &UUAPAgentSubsystem::OnPostPIEStarted);
     HPrePIEEnded   = FEditorDelegates::PrePIEEnded.AddUObject(this, &UUAPAgentSubsystem::OnPrePIEEnded);
     HEndPIE        = FEditorDelegates::EndPIE.AddUObject(this, &UUAPAgentSubsystem::OnEndPIE);
@@ -85,12 +88,14 @@ void UUAPAgentSubsystem::Initialize(FSubsystemCollectionBase& Collection)
 
 void UUAPAgentSubsystem::Deinitialize()
 {
+    SuppressBackgroundThrottle(false);
     FAgentRemoteControlBootstrap::Unexpose();
     if (LogCapture.IsValid())
     {
         GLog->RemoveOutputDevice(LogCapture.Get());
         LogCapture.Reset();
     }
+    FEditorDelegates::PreBeginPIE.Remove(HPreBeginPIE);
     FEditorDelegates::PostPIEStarted.Remove(HPostPIEStarted);
     FEditorDelegates::PrePIEEnded.Remove(HPrePIEEnded);
     FEditorDelegates::EndPIE.Remove(HEndPIE);
@@ -129,71 +134,41 @@ FString UUAPAgentSubsystem::ExecuteConsoleCommand(FString Command)
     return Ar.Buffer;
 }
 
-bool UUAPAgentSubsystem::FocusEditorWindow()
+// The editor drops to exactly 3.0 fps whenever it is not the OS-foreground window
+// (UEditorPerformanceSettings::bThrottleCPUWhenNotForeground), which voids every timing taken
+// then. The old cure was to take focus - raising the editor window over whatever the human at
+// the machine was doing. Owner rule 2026-11-11: uap never activates a window. So the setting
+// itself is turned off for the length of a PIE session and put back when it ends. In memory only
+// (no SaveConfig), so nothing is left changed on disk, and a crashed editor comes back with the
+// ini value. Nothing here needs, or takes, focus.
+void UUAPAgentSubsystem::SuppressBackgroundThrottle(bool bSuppress)
 {
-    UAP_ACTIVITY(TEXT("focus"), FString());
-#if PLATFORM_WINDOWS
-    if (!FSlateApplication::IsInitialized()) { return false; }
-    FSlateApplication& App = FSlateApplication::Get();
-
-    // Pick the main editor window: the regular top-level window whose title ends in
-    // "Unreal Editor" (format "<Project> - Unreal Editor"). GetActiveTopLevelWindow can
-    // return a transient dialog (e.g. Restore Packages), so title-match first and fall
-    // back to the active window, then to the first regular window.
-    TSharedPtr<SWindow> Win;
-    for (const TSharedRef<SWindow>& W : App.GetTopLevelWindows())
+    UEditorPerformanceSettings* Settings = GetMutableDefault<UEditorPerformanceSettings>();
+    if (!Settings) { return; }
+    if (bSuppress)
     {
-        if (W->IsRegularWindow() && W->GetTitle().ToString().Contains(TEXT("Unreal Editor")))
-        {
-            Win = W;
-            break;
-        }
+        if (bThrottleSuppressed) { return; }
+        bPriorThrottleSetting = Settings->bThrottleCPUWhenNotForeground;
+        Settings->bThrottleCPUWhenNotForeground = false;
+        bThrottleSuppressed = true;
+        UE_LOG(LogUAP, Log, TEXT("bThrottleCPUWhenNotForeground off for the PIE session (was %d); restored when PIE ends."),
+               bPriorThrottleSetting ? 1 : 0);
     }
-    if (!Win.IsValid()) { Win = App.GetActiveTopLevelWindow(); }
-    if (!Win.IsValid() || !Win->IsRegularWindow())
+    else if (bThrottleSuppressed)
     {
-        for (const TSharedRef<SWindow>& W : App.GetTopLevelWindows())
-        {
-            if (W->IsRegularWindow()) { Win = W; break; }
-        }
+        Settings->bThrottleCPUWhenNotForeground = bPriorThrottleSetting;
+        bThrottleSuppressed = false;
+        UE_LOG(LogUAP, Log, TEXT("bThrottleCPUWhenNotForeground restored to %d."), bPriorThrottleSetting ? 1 : 0);
     }
-    if (!Win.IsValid()) { return false; }
-
-    TSharedPtr<FGenericWindow> Native = Win->GetNativeWindow();
-    HWND Hwnd = Native.IsValid() ? reinterpret_cast<HWND>(Native->GetOSWindowHandle()) : nullptr;
-    if (!Hwnd) { return false; }
-
-    // Raise Z-order first (TOPMOST/NOTOPMOST bounce) - always works in-process, focus or not.
-    ::ShowWindow(Hwnd, SW_RESTORE);
-    ::SetWindowPos(Hwnd, HWND_TOPMOST,   0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE);
-    ::SetWindowPos(Hwnd, HWND_NOTOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE);
-    ::BringWindowToTop(Hwnd);
-
-    // Grabbing OS keyboard focus while another app is foreground is normally blocked by
-    // Windows' foreground lock. Attaching our input queue to the current foreground
-    // thread's queue (and AllowSetForegroundWindow) lets SetForegroundWindow succeed.
-    // Combined with SPI_SETFOREGROUNDLOCKTIMEOUT=0 set at module startup.
-    const HWND  ForegroundWnd = ::GetForegroundWindow();
-    const DWORD ForegroundTid = ForegroundWnd ? ::GetWindowThreadProcessId(ForegroundWnd, nullptr) : 0;
-    const DWORD ThisTid       = ::GetCurrentThreadId();
-    const bool  bAttach       = ForegroundTid != 0 && ForegroundTid != ThisTid;
-    // Use 1/0, not TRUE/FALSE: those Win32 macros are undef'd by HideWindowsPlatformTypes.
-    if (bAttach) { ::AttachThreadInput(ThisTid, ForegroundTid, 1); }
-    ::AllowSetForegroundWindow(ASFW_ANY);
-    const bool bFg = ::SetForegroundWindow(Hwnd) != 0;
-    if (bAttach) { ::AttachThreadInput(ThisTid, ForegroundTid, 0); }
-    return bFg;
-#else
-    return false;
-#endif
 }
 
-void UUAPAgentSubsystem::OnPostPIEStarted(bool) { CurrentPhase = EAgentPIEPhase::Playing; PIEStartTimeSeconds = FPlatformTime::Seconds(); }
+void UUAPAgentSubsystem::OnPreBeginPIE(bool)    { SuppressBackgroundThrottle(true); }
+void UUAPAgentSubsystem::OnPostPIEStarted(bool) { SuppressBackgroundThrottle(true); CurrentPhase = EAgentPIEPhase::Playing; PIEStartTimeSeconds = FPlatformTime::Seconds(); }
 void UUAPAgentSubsystem::OnPrePIEEnded(bool)    { CurrentPhase = EAgentPIEPhase::Ending; }
-void UUAPAgentSubsystem::OnEndPIE(bool)         { CurrentPhase = EAgentPIEPhase::NotPlaying; PIEStartTimeSeconds = 0.0; }
+void UUAPAgentSubsystem::OnEndPIE(bool)         { SuppressBackgroundThrottle(false); CurrentPhase = EAgentPIEPhase::NotPlaying; PIEStartTimeSeconds = 0.0; }
 void UUAPAgentSubsystem::OnPausePIE(bool)       { CurrentPhase = EAgentPIEPhase::Paused; }
 void UUAPAgentSubsystem::OnResumePIE(bool)      { CurrentPhase = EAgentPIEPhase::Playing; }
-void UUAPAgentSubsystem::OnCancelPIE()          { CurrentPhase = EAgentPIEPhase::NotPlaying; PIEStartTimeSeconds = 0.0; }
+void UUAPAgentSubsystem::OnCancelPIE()          { SuppressBackgroundThrottle(false); CurrentPhase = EAgentPIEPhase::NotPlaying; PIEStartTimeSeconds = 0.0; }
 
 EAgentPIEPhase UUAPAgentSubsystem::GetPIEPhase() const { return CurrentPhase; }
 
@@ -424,7 +399,7 @@ FString UUAPAgentSubsystem::GetLogsSince(
     return Out;
 }
 
-bool UUAPAgentSubsystem::InjectKey(FString KeyName, bool bPressed, bool bRepeat)
+bool UUAPAgentSubsystem::InjectKey(FString KeyName, bool bPressed, bool bRepeat, FString Client)
 {
     UAP_ACTIVITY(TEXT("input key"), KeyName);
     FKey Key(*KeyName);
@@ -433,34 +408,39 @@ bool UUAPAgentSubsystem::InjectKey(FString KeyName, bool bPressed, bool bRepeat)
         UE_LOG(LogUAP, Warning, TEXT("InjectKey: unknown key '%s'"), *KeyName);
         return false;
     }
-    return FAgentInput::InjectKey(Key, bPressed, bRepeat);
+    return FAgentInput::OnClients(TEXT("InjectKey"), Client, [&]() { return FAgentInput::InjectKey(Key, bPressed, bRepeat); });
 }
 
-bool UUAPAgentSubsystem::InjectMouseMove(float X, float Y, bool bAbsolute)
+FString UUAPAgentSubsystem::ListClients()
+{
+    return FAgentWorld::DescribeClientsJson();
+}
+
+bool UUAPAgentSubsystem::InjectMouseMove(float X, float Y, bool bAbsolute, FString Client)
 {
     UAP_ACTIVITY(TEXT("input mousemove"), FString());
-    return FAgentInput::InjectMouseMove(FVector2D(X, Y), bAbsolute);
+    return FAgentInput::OnClients(TEXT("InjectMouseMove"), Client, [&]() { return FAgentInput::InjectMouseMove(FVector2D(X, Y), bAbsolute); });
 }
 
-bool UUAPAgentSubsystem::InjectMouseButton(EAgentMouseButton Button, bool bPressed)
+bool UUAPAgentSubsystem::InjectMouseButton(EAgentMouseButton Button, bool bPressed, FString Client)
 {
     UAP_ACTIVITY(TEXT("input mousebutton"), FString());
-    return FAgentInput::InjectMouseButton(Button, bPressed);
+    return FAgentInput::OnClients(TEXT("InjectMouseButton"), Client, [&]() { return FAgentInput::InjectMouseButton(Button, bPressed); });
 }
 
-FString UUAPAgentSubsystem::SetMousePosition(float X, float Y)
+FString UUAPAgentSubsystem::SetMousePosition(float X, float Y, FString Client)
 {
     UAP_ACTIVITY(TEXT("input mousepos"), FString());
-    return FAgentInput::SetMousePositionJson(X, Y);
+    return FAgentInput::ForEachClientJson(Client, [&]() { return FAgentInput::SetMousePositionJson(X, Y); });
 }
 
-FString UUAPAgentSubsystem::ClickMouse(EAgentMouseButton Button, FString X, FString Y)
+FString UUAPAgentSubsystem::ClickMouse(EAgentMouseButton Button, FString X, FString Y, FString Client)
 {
     UAP_ACTIVITY(TEXT("click"), FString::Printf(TEXT("%s,%s"), *X, *Y));
-    return FAgentInput::ClickMouseJson(Button, X, Y);
+    return FAgentInput::ForEachClientJson(Client, [&]() { return FAgentInput::ClickMouseJson(Button, X, Y); });
 }
 
-bool UUAPAgentSubsystem::InjectAxis(FString AxisName, float Value, FString SlateUser)
+bool UUAPAgentSubsystem::InjectAxis(FString AxisName, float Value, FString SlateUser, FString Client)
 {
     UAP_ACTIVITY(TEXT("input axis"), AxisName);
     int32 User = INDEX_NONE;
@@ -472,10 +452,10 @@ bool UUAPAgentSubsystem::InjectAxis(FString AxisName, float Value, FString Slate
         UE_LOG(LogUAP, Error, TEXT("InjectAxis: %s"), *UserError);
         return false;
     }
-    return FAgentInput::InjectAxis(FName(*AxisName), Value, User);
+    return FAgentInput::OnClients(TEXT("InjectAxis"), Client, [&]() { return FAgentInput::InjectAxis(FName(*AxisName), Value, User); });
 }
 
-bool UUAPAgentSubsystem::InjectGamepad(EAgentGamepadButton Button, bool bPressed, float AnalogValue, FString SlateUser)
+bool UUAPAgentSubsystem::InjectGamepad(EAgentGamepadButton Button, bool bPressed, float AnalogValue, FString SlateUser, FString Client)
 {
     UAP_ACTIVITY(TEXT("input gamepad"), FString());
     int32 User = INDEX_NONE;
@@ -485,10 +465,10 @@ bool UUAPAgentSubsystem::InjectGamepad(EAgentGamepadButton Button, bool bPressed
         UE_LOG(LogUAP, Error, TEXT("InjectGamepad: %s"), *UserError);
         return false;
     }
-    return FAgentInput::InjectGamepad(Button, bPressed, AnalogValue, User);
+    return FAgentInput::OnClients(TEXT("InjectGamepad"), Client, [&]() { return FAgentInput::InjectGamepad(Button, bPressed, AnalogValue, User); });
 }
 
-bool UUAPAgentSubsystem::InjectXRButton(EAgentXRHand Hand, FString ButtonKeyName, bool bPressed)
+bool UUAPAgentSubsystem::InjectXRButton(EAgentXRHand Hand, FString ButtonKeyName, bool bPressed, FString Client)
 {
     UAP_ACTIVITY(TEXT("input xr"), ButtonKeyName);
     // Quest Touch buttons are regular FKeys (e.g. OculusTouch_Left_X_Click). Route via Slate.
@@ -506,33 +486,33 @@ bool UUAPAgentSubsystem::InjectXRButton(EAgentXRHand Hand, FString ButtonKeyName
             *ButtonKeyName, Hand == EAgentXRHand::Left ? TEXT("Left") : TEXT("Right"));
         return false;
     }
-    return FAgentInput::InjectKey(Key, bPressed, false);
+    return FAgentInput::OnClients(TEXT("InjectXRButton"), Client, [&]() { return FAgentInput::InjectKey(Key, bPressed, false); });
 }
 
 // Thin forwarders: the validate-before-press ordering, the refusal messages and the recovery
 // path all live in FAgentInput so the editor and runtime subsystems cannot drift apart.
-FString UUAPAgentSubsystem::HoldKey(FString KeyName, float Seconds)
+FString UUAPAgentSubsystem::HoldKey(FString KeyName, float Seconds, FString Client)
 {
     UAP_ACTIVITY(TEXT("input hold"), KeyName);
-    return FAgentInput::HoldKeyJson(KeyName, Seconds);
+    return FAgentInput::ForEachClientJson(Client, [&]() { return FAgentInput::HoldKeyJson(KeyName, Seconds); });
 }
 
-FString UUAPAgentSubsystem::HoldAxis(FString AxisKeyName, float Value, float Seconds,
-                                     FString SlateUser)
+FString UUAPAgentSubsystem::HoldAxis(FString AxisKeyName, float Value, float Seconds, FString SlateUser, FString Client)
 {
     UAP_ACTIVITY(TEXT("input axis-hold"), AxisKeyName);
-    return FAgentInput::HoldAxisJson(AxisKeyName, Value, Seconds, SlateUser);
+    return FAgentInput::ForEachClientJson(Client, [&]() { return FAgentInput::HoldAxisJson(AxisKeyName, Value, Seconds, SlateUser); });
 }
 
-FString UUAPAgentSubsystem::ReleaseHeldInput(FString KeyName)
+FString UUAPAgentSubsystem::ReleaseHeldInput(FString KeyName, FString Client)
 {
     UAP_ACTIVITY(TEXT("input release"), KeyName);
-    return FAgentInput::ReleaseHeldJson(KeyName);
+    return FAgentInput::ForEachClientJson(Client, [&]() { return FAgentInput::ReleaseHeldJson(KeyName); });
 }
 
-FString UUAPAgentSubsystem::GetHeldInput()
+FString UUAPAgentSubsystem::GetHeldInput(FString Client)
 {
-    return FAgentInput::GetHeldJson();
+    // Several clients -> one envelope per client, so a caller can see which client holds what.
+    return FAgentInput::ForEachClientJson(Client, []() { return FAgentInput::GetHeldJson(); });
 }
 
 FString UUAPAgentSubsystem::ReleaseSlatePointerCapture()
@@ -602,10 +582,10 @@ FString UUAPAgentSubsystem::GetXRControllerState()
     return MC->StateJson();
 }
 
-FString UUAPAgentSubsystem::DumpViewportUI()
+FString UUAPAgentSubsystem::DumpViewportUI(FString Client)
 {
     UAP_ACTIVITY(TEXT("read-ui"), FString());
-    return FAgentUIReader::DumpViewportUI();
+    return FAgentInput::ForEachClientJson(Client, []() { return FAgentUIReader::DumpViewportUI(); });
 }
 
 bool UUAPAgentSubsystem::SelectTab(FString TabId)

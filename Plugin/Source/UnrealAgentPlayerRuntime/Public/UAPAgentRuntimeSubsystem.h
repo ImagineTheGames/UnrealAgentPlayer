@@ -14,9 +14,17 @@ public:
 
     UFUNCTION(BlueprintCallable, Category="Agent|Status") FString GetPluginVersion() const;
     UFUNCTION(BlueprintCallable, Category="Agent|Status") FString ExecuteConsoleCommand(FString Command);
-    UFUNCTION(BlueprintCallable, Category="Agent|Input") bool InjectKey(FString KeyName, bool bPressed, bool bRepeat);
-    UFUNCTION(BlueprintCallable, Category="Agent|Input") bool InjectMouseMove(float X, float Y, bool bAbsolute);
-    UFUNCTION(BlueprintCallable, Category="Agent|Input") bool InjectMouseButton(EAgentMouseButton Button, bool bPressed);
+    // CLIENT (last parameter of every verb below that injects, holds, releases or reads UI):
+    // which PIE client of a multi-client session the verb acts on. "" = the first game world (the
+    // historical default, so an old caller is unchanged), "N" = PIE instance N, "all" = every
+    // client. It is a string for the RemoteControl reason documented on SlateUser: an omitted
+    // value arrives zero-initialised, and "" is the only value that survives that as "default".
+    // In-engine only - it never raises, focuses or sends OS input to a window. [17tm466z4a6]
+    // ListClients JSON: {"ok":true,"clients":[{client, world, net_mode, default, accepts_input, window_title, pawn}]}
+    UFUNCTION(BlueprintCallable, Category="Agent|Input") FString ListClients();
+    UFUNCTION(BlueprintCallable, Category="Agent|Input") bool InjectKey(FString KeyName, bool bPressed, bool bRepeat, FString Client);
+    UFUNCTION(BlueprintCallable, Category="Agent|Input") bool InjectMouseMove(float X, float Y, bool bAbsolute, FString Client);
+    UFUNCTION(BlueprintCallable, Category="Agent|Input") bool InjectMouseButton(EAgentMouseButton Button, bool bPressed, FString Client);
     // The mouse position inside a CAPTURED viewport. Win32 SetCursorPos and
     // FSlateApplication::SetCursorPos are both inert while PIE holds the mouse, so these do not
     // move the pointer -- they stamp the position onto the injected pointer events, which is
@@ -24,8 +32,8 @@ public:
     // the WIDGET FOUND UNDER THE POINT, because the failure this replaced was a click that
     // reported ok:true from the top-left corner. X/Y on ClickMouse are strings so that
     // "omitted" is distinguishable from 0,0. See AgentInput.h.
-    UFUNCTION(BlueprintCallable, Category="Agent|Input") FString SetMousePosition(float X, float Y);
-    UFUNCTION(BlueprintCallable, Category="Agent|Input") FString ClickMouse(EAgentMouseButton Button, FString X, FString Y);
+    UFUNCTION(BlueprintCallable, Category="Agent|Input") FString SetMousePosition(float X, float Y, FString Client);
+    UFUNCTION(BlueprintCallable, Category="Agent|Input") FString ClickMouse(EAgentMouseButton Button, FString X, FString Y, FString Client);
     // SlateUser: "" (or omitted) resolves the target Slate user automatically; "0"/"1"/... targets
     // one explicitly and REFUSES LOUDLY if Slate has no such user. It is a string because
     // RemoteControl zero-initialises the argument struct: an omitted int32 would arrive as 0,
@@ -33,26 +41,26 @@ public:
     // Why it exists at all: Slate DISCARDS an event whose user index does not match the
     // handler's owner (FAnalogCursor::IsRelevantInput -- engine AnalogCursor.cpp:192), with no
     // error, so a mis-stamped injection looks exactly like a broken feature.
-    UFUNCTION(BlueprintCallable, Category="Agent|Input") bool InjectAxis(FString AxisName, float Value, FString SlateUser);
-    UFUNCTION(BlueprintCallable, Category="Agent|Input") bool InjectGamepad(EAgentGamepadButton Button, bool bPressed, float AnalogValue, FString SlateUser);
-    UFUNCTION(BlueprintCallable, Category="Agent|Input") bool InjectXRButton(EAgentXRHand Hand, FString ButtonKeyName, bool bPressed);
+    UFUNCTION(BlueprintCallable, Category="Agent|Input") bool InjectAxis(FString AxisName, float Value, FString SlateUser, FString Client);
+    UFUNCTION(BlueprintCallable, Category="Agent|Input") bool InjectGamepad(EAgentGamepadButton Button, bool bPressed, float AnalogValue, FString SlateUser, FString Client);
+    UFUNCTION(BlueprintCallable, Category="Agent|Input") bool InjectXRButton(EAgentXRHand Hand, FString ButtonKeyName, bool bPressed, FString Client);
     // Sustained input: re-asserted every frame in-engine for Seconds, then released. A single
     // injected event cannot drive locomotion across a ~1s CLI round-trip, and HoldAxis is the
     // VR locomotion verb (thumbsticks are axis FKeys, not buttons). All return JSON so a
     // refusal says why; they validate before injecting, so a refusal has no side effects.
     // ReleaseHeldInput("") is the recovery hatch: it also flushes keys the registry lost
     // track of, so a stuck key never needs a PIE restart. See AgentInput.h.
-    UFUNCTION(BlueprintCallable, Category="Agent|Input") FString HoldKey(FString KeyName, float Seconds);
-    UFUNCTION(BlueprintCallable, Category="Agent|Input") FString HoldAxis(FString AxisKeyName, float Value, float Seconds, FString SlateUser);
-    UFUNCTION(BlueprintCallable, Category="Agent|Input") FString ReleaseHeldInput(FString KeyName);
-    UFUNCTION(BlueprintCallable, Category="Agent|Input") FString GetHeldInput();
+    UFUNCTION(BlueprintCallable, Category="Agent|Input") FString HoldKey(FString KeyName, float Seconds, FString Client);
+    UFUNCTION(BlueprintCallable, Category="Agent|Input") FString HoldAxis(FString AxisKeyName, float Value, float Seconds, FString SlateUser, FString Client);
+    UFUNCTION(BlueprintCallable, Category="Agent|Input") FString ReleaseHeldInput(FString KeyName, FString Client);
+    UFUNCTION(BlueprintCallable, Category="Agent|Input") FString GetHeldInput(FString Client);
     UFUNCTION(BlueprintCallable, Category="Agent|Input") bool InjectXRControllerPose(EAgentXRHand Hand, FVector Position, FRotator Orientation, bool bTracked);
     UFUNCTION(BlueprintCallable, Category="Agent|Input") bool ClearXRControllerOverride(EAgentXRHand Hand);
     // Opt-in aim-pose emulation (OFF by default) and the injected controllers' state. Same
     // contract as UUAPAgentSubsystem; both forward to FAgentMotionController.
     UFUNCTION(BlueprintCallable, Category="Agent|Input") FString SetXRAimEmulation(bool bEnabled, FVector GripToAimLocation, FRotator GripToAimRotation);
     UFUNCTION(BlueprintCallable, Category="Agent|Input") FString GetXRControllerState();
-    UFUNCTION(BlueprintCallable, Category="Agent|UI") FString DumpViewportUI();
+    UFUNCTION(BlueprintCallable, Category="Agent|UI") FString DumpViewportUI(FString Client);
     UFUNCTION(BlueprintCallable, Category="Agent|Capture") bool CaptureViewportWithUI(FString Filename);
     UFUNCTION(BlueprintCallable, Category="Agent|Log") int64 GetLogCursor() const;
     UFUNCTION(BlueprintCallable, Category="Agent|Log") FString GetLogsSince(int64 AfterCursor, int32 MaxLines, FString CategoryFilter, EAgentLogVerbosity MinVerbosity) const;

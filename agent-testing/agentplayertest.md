@@ -118,9 +118,11 @@ the one most likely to be in code you wrote yourself.
   was filed off that observation and later closed as not-real.
 - **Blast radius:** anything measured in seconds or per-frame from OUTSIDE the engine -- "did it
   reach me within 4s", "does it judder", any stopwatch wrapped around CLI calls.
-- **Do instead:** force PIE window focus, then **confirm the frame rate in-engine BEFORE recording
-  any number** -- read `WorldDeltaSeconds`, or check the `hz` a sampler window reports for itself.
-  `Slate.bAllowThrottling 0` alone is **NOT** sufficient; foreground focus is the actual gate.
+- **Do instead:** NEVER take focus or raise a window (banned -- it steals the human's mouse and
+  keyboard). uap turns `bThrottleCPUWhenNotForeground` off for the PIE session itself; **confirm the
+  frame rate in-engine BEFORE recording any number** -- read `WorldDeltaSeconds`, or check the `hz` a
+  sampler window reports for itself. `Slate.bAllowThrottling 0` alone is **NOT** sufficient;
+  `bThrottleCPUWhenNotForeground` is the actual gate.
 - **Immune:** `uap sample` and `uap input hold` / `uap input axis` run entirely in-engine and need
   no CLI calls during the measurement window. A sampler that comes back at ~3 Hz is itself telling
   you the editor was throttled.
@@ -129,15 +131,12 @@ the one most likely to be in code you wrote yourself.
   plus a one-paragraph `warning` when the rate is at or below **5 fps** -- the throttle pins
   exactly 3.0, and nothing real lives under 5. The HTML report renders the same warning, so a
   human reading "fps 3.0" later cannot draw the wrong conclusion second-hand either.
-- **If focus CANNOT be taken** -- `SetForegroundWindow` returns False with `GetForegroundWindow()`
-  reporting 0 because your shell has no foreground window on this station, and `AttachThreadInput`,
-  a synthetic ALT and `SetWindowPos` TOPMOST all fail the same way (`Slate.bAllowThrottling 0` does
-  not lift it either) -- then say so and **report every timing-based conclusion as unmeasurable**.
-  Do not quietly use the numbers anyway. Non-timing work continues normally: state reads are
+- **If the rate still cannot be CONFIRMED in-engine** (an older plugin copy that predates the per-session
+  throttle switch: set the property by hand, exact call in the project's uap-traps notes) -- then say so and
+  **report every timing-based conclusion as unmeasurable**. Never try `SetForegroundWindow`,
+  `AttachThreadInput`, a synthetic ALT or `SetWindowPos` TOPMOST. Do not quietly use the numbers anyway. Non-timing work continues normally: state reads are
   unaffected, and `uap sample` / `uap input hold` still drive and measure correctly in-engine.
-- **Taking focus from PowerShell:** an inline `Add-Type` P/Invoke passed through
-  `powershell.exe -Command` gets its quoting mangled. Write the P/Invoke to a scratch `.ps1` and
-  run it with `-File`.
+- **Taking focus from PowerShell: do not.** Window activation and OS input from a script are banned.
 
 ### 2. `InjectKey` never reaches Slate input pre-processors or focus handlers
 
@@ -157,7 +156,8 @@ the one most likely to be in code you wrote yourself.
 - **What it cost:** an agent testing the cursor with `InjectKey` would have reported "still broken"
   on a fix that was actually working -- avoided only because the trap was already documented from
   an earlier encounter. The cost was paid once; the note is what saved the second run.
-- **Do instead:** real OS input (`keybd_event`) to the PIE window, OR skip input simulation
+- **Do instead:** uap's Slate-route input (`uap input axis ... --user <N>`, `uap click`) -- NEVER real OS
+  input (`keybd_event`; banned) -- OR skip input simulation
   entirely and query engine state -- for focus questions, reading `GetDesiredFocusTarget()` and
   `HasFocusedDescendants` is more reliable than synthesising a keypress and inferring from what
   you see.

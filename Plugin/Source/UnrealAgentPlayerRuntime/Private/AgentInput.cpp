@@ -21,6 +21,7 @@
 #include "Dom/JsonObject.h"
 #include "Serialization/JsonSerializer.h"
 #include "Serialization/JsonWriter.h"
+#include "Serialization/JsonReader.h"
 
 TSharedPtr<SWidget> FAgentInput::FindPIEViewportWidget()
 {
@@ -416,7 +417,10 @@ bool FAgentInput::InjectMouseMove(FVector2D Delta, bool bAbsolute, int32 UserInd
         /*WheelDelta*/ 0.f,
         /*ModifierKeys*/ App.GetModifierKeys()
     );
-    App.SetCursorPos(NewPos);
+    // NOT App.SetCursorPos(NewPos): FSlateApplication::SetCursorPos writes the PLATFORM cursor
+    // (Win32 SetCursorPos), i.e. it would drag the HUMAN's real mouse pointer across the screen
+    // while they work. The event position below is what Slate routes by, which is all a
+    // synthetic move needs. Owner rule 2026-11-11: uap never touches the OS cursor.
     FWidgetPath Redirected;
     if (UAPRedirectPathToActiveGameWindow(NewPos, User, /*bIgnoreEnabledStatus*/ false, Redirected))
     {
@@ -555,6 +559,11 @@ namespace
         // Held on the entry so the release at the end goes back out the SAME way it went in:
         // recentring an analog axis on the other route leaves the first one latched.
         int32  SlateUserIndex = INDEX_NONE;
+        // The client (game world) this hold belongs to. A hold is re-asserted EVERY FRAME from a
+        // core ticker, long after the call that started it returned, so the world it targets has
+        // to be remembered here and made current again on each tick. Weak: a PIE world torn
+        // down under a live hold drops the hold rather than dangling.
+        TWeakObjectPtr<UWorld> World;
     };
 
     TArray<FUAPHeldInput> GHeldInputs;
@@ -574,23 +583,33 @@ namespace
 
     void UAPReleaseOne(const FUAPHeldInput& H)
     {
+        // Go back out through the SAME client the hold went in on.
+        FAgentWorld::FScope Scope(H.World.Get());
         if (H.bAnalog) { UAPHoldInject(H, 0.f); }
         else if (H.bStarted) { FAgentInput::InjectKey(H.Key, /*bPressed*/ false, /*bRepeat*/ false); }
     }
 
     bool UAPHoldTick(float /*DeltaTime*/)
     {
-        // No game viewport (PIE ended / not started) -- nothing can be held; forget everything
-        // rather than spinning forever re-injecting into nothing.
-        if (!FAgentInput::HasLiveViewport())
-        {
-            GHeldInputs.Reset();
-        }
-
         const double Now = FPlatformTime::Seconds();
         for (int32 i = GHeldInputs.Num() - 1; i >= 0; --i)
         {
             FUAPHeldInput& H = GHeldInputs[i];
+            // The client this hold was started on went away (PIE ended / that client closed),
+            // or its viewport no longer takes input: nothing can be held there. Forget it
+            // rather than spinning forever re-injecting into nothing.
+            UWorld* HeldWorld = H.World.Get();
+            if (!HeldWorld)
+            {
+                GHeldInputs.RemoveAt(i);
+                continue;
+            }
+            FAgentWorld::FScope Scope(HeldWorld);
+            if (!FAgentInput::HasLiveViewport())
+            {
+                GHeldInputs.RemoveAt(i);
+                continue;
+            }
             if (Now >= H.EndRealTime)
             {
                 UAPReleaseOne(H);
@@ -627,22 +646,26 @@ namespace
         }
     }
 
+    // One hold per (key, client). The same key held on two clients at once is two holds.
     FUAPHeldInput& UAPFindOrAddHold(FKey Key)
     {
+        UWorld* World = FAgentWorld::GetActiveGameWorld();
         for (FUAPHeldInput& H : GHeldInputs)
         {
-            if (H.Key == Key) { return H; }
+            if (H.Key == Key && H.World.Get() == World) { return H; }
         }
         FUAPHeldInput New;
         New.Key = Key;
+        New.World = World;
         return GHeldInputs[GHeldInputs.Add(New)];
     }
 
     bool UAPIsHeld(FKey Key)
     {
+        UWorld* World = FAgentWorld::GetActiveGameWorld();
         for (const FUAPHeldInput& H : GHeldInputs)
         {
-            if (H.Key == Key) { return true; }
+            if (H.Key == Key && H.World.Get() == World) { return true; }
         }
         return false;
     }
@@ -819,10 +842,14 @@ FString FAgentInput::HoldAxisJson(const FString& AxisKeyName, float Value, float
 
 int32 FAgentInput::ReleaseHeld(FKey Key)
 {
+    // Inside a client scope, release only that client's holds. With no scope, release them all:
+    // the recovery path must be able to clear every client without naming each one.
+    UWorld* Only = FAgentWorld::GetOverrideWorld();
     int32 Count = 0;
     for (int32 i = GHeldInputs.Num() - 1; i >= 0; --i)
     {
         if (Key.IsValid() && GHeldInputs[i].Key != Key) { continue; }
+        if (Only && GHeldInputs[i].World.Get() != Only) { continue; }
         UAPReleaseOne(GHeldInputs[i]);
         GHeldInputs.RemoveAt(i);
         ++Count;
@@ -836,15 +863,20 @@ int32 FAgentInput::FlushAllPressedKeys()
     // and clears the key-state map. This is the recovery hatch for a key the registry lost
     // track of -- without it, one stuck key silently corrupts every later test in the same
     // PIE session and only a PIE restart clears it.
-    UWorld* World = FAgentWorld::GetActiveGameWorld();
-    if (!World) { return 0; }
+    // One client when scoped to one, every game world otherwise.
+    TArray<UWorld*> Worlds;
+    if (UWorld* Only = FAgentWorld::GetOverrideWorld()) { Worlds.Add(Only); }
+    else { FAgentWorld::GetAllGameWorlds(Worlds); }
     int32 Count = 0;
-    for (FConstPlayerControllerIterator It = World->GetPlayerControllerIterator(); It; ++It)
+    for (UWorld* World : Worlds)
     {
-        if (APlayerController* PC = It->Get())
+        for (FConstPlayerControllerIterator It = World->GetPlayerControllerIterator(); It; ++It)
         {
-            PC->FlushPressedKeys();
-            ++Count;
+            if (APlayerController* PC = It->Get())
+            {
+                PC->FlushPressedKeys();
+                ++Count;
+            }
         }
     }
     return Count;
@@ -893,9 +925,17 @@ void FAgentInput::GetHeld(TArray<FAgentHeldInputInfo>& Out)
 {
     const double Now = FPlatformTime::Seconds();
     Out.Reset(GHeldInputs.Num());
+    UWorld* Only = FAgentWorld::GetOverrideWorld();
     for (const FUAPHeldInput& H : GHeldInputs)
     {
+        if (Only && H.World.Get() != Only) { continue; }
         FAgentHeldInputInfo Info;
+        Info.Client = FAgentWorld::GetClientIndex(H.World.Get());
+        {
+            // Engine ground truth is read on the hold's OWN client, not on the default one.
+            FAgentWorld::FScope Scope(H.World.Get());
+            Info.bDown = FAgentInput::IsKeyDown(H.Key);
+        }
         Info.Key = H.Key.ToString();
         Info.bAnalog = H.bAnalog;
         Info.Value = H.Value;
@@ -919,6 +959,7 @@ FString FAgentInput::GetHeldJson()
         O->SetBoolField(TEXT("analog"), H.bAnalog);
         O->SetNumberField(TEXT("value"), H.Value);
         O->SetNumberField(TEXT("remaining_seconds"), H.RemainingSeconds);
+        O->SetNumberField(TEXT("client"), H.Client);
         // Which layer this hold is being re-asserted on. A Slate pre-processor (analog or
         // virtual cursor) only ever sees route "slate"; "viewport" reaching nothing is the
         // shape of the original silent defect, and this is how you see it without guessing.
@@ -930,7 +971,7 @@ FString FAgentInput::GetHeldJson()
         }
         // Engine ground truth alongside the registry's view: if these ever disagree, the
         // registry has lost track of a key and `input release` (no key) is the recovery.
-        O->SetBoolField(TEXT("down"), FAgentInput::IsKeyDown(FKey(*H.Key)));
+        O->SetBoolField(TEXT("down"), H.bDown);
         Arr.Add(MakeShared<FJsonValueObject>(O));
     }
     Root->SetBoolField(TEXT("ok"), true);
@@ -946,6 +987,105 @@ void FAgentInput::ShutdownHolds()
         FTSTicker::RemoveTicker(GHoldTicker);
         GHoldTicker.Reset();
     }
+}
+
+// --- Client targeting -------------------------------------------------------------------
+// See AgentWorld.h. These run a verb once per targeted client with that client's world current.
+
+bool FAgentInput::ForEachClient(const FString& Client, FString& OutError,
+                                TFunctionRef<bool(int32 ClientIndex)> Fn)
+{
+    TArray<UWorld*> Worlds;
+    if (!FAgentWorld::ResolveClients(Client, Worlds, OutError)) { return false; }
+    if (Worlds.Num() == 0)
+    {
+        // No selector: the historical default, no override.
+        return Fn(FAgentWorld::GetClientIndex(FAgentWorld::GetActiveGameWorld()));
+    }
+    bool bAll = true;
+    for (UWorld* W : Worlds)
+    {
+        FAgentWorld::FScope Scope(W);
+        if (!Fn(FAgentWorld::GetClientIndex(W)))
+        {
+            bAll = false;
+            if (OutError.IsEmpty())
+            {
+                OutError = FString::Printf(TEXT("client %d did not take the input (no live viewport, or "
+                                                "its viewport is ignoring input)"),
+                                           FAgentWorld::GetClientIndex(W));
+            }
+        }
+    }
+    return bAll;
+}
+
+bool FAgentInput::OnClients(const TCHAR* Verb, const FString& Client, TFunctionRef<bool()> Fn)
+{
+    FString Error;
+    const bool bOk = ForEachClient(Client, Error, [&Fn](int32) { return Fn(); });
+    if (!bOk && !Error.IsEmpty())
+    {
+        // A bool cannot carry a reason, so it goes to the log where `uap log since` finds it.
+        UE_LOG(LogUAPRuntime, Error, TEXT("%s: %s"), Verb, *Error);
+    }
+    return bOk;
+}
+
+FString FAgentInput::ForEachClientJson(const FString& Client, TFunctionRef<FString()> Fn)
+{
+    auto Refuse = [](const FString& Error)
+    {
+        TSharedRef<FJsonObject> O = MakeShared<FJsonObject>();
+        O->SetBoolField(TEXT("ok"), false);
+        O->SetBoolField(TEXT("pressed"), false);
+        O->SetStringField(TEXT("error"), Error);
+        return UAPJson(O);
+    };
+
+    TArray<UWorld*> Worlds;
+    FString Error;
+    if (!FAgentWorld::ResolveClients(Client, Worlds, Error)) { return Refuse(Error); }
+    if (Worlds.Num() == 0) { return Fn(); }   // no selector: unchanged behaviour, unchanged JSON
+
+    auto Decode = [](const FString& Json) -> TSharedPtr<FJsonObject>
+    {
+        TSharedPtr<FJsonObject> Obj;
+        TSharedRef<TJsonReader<>> Reader = TJsonReaderFactory<>::Create(Json);
+        if (!FJsonSerializer::Deserialize(Reader, Obj) || !Obj.IsValid()) { return nullptr; }
+        return Obj;
+    };
+
+    TArray<TSharedPtr<FJsonValue>> Results;
+    bool bAllOk = true;
+    for (UWorld* W : Worlds)
+    {
+        FAgentWorld::FScope Scope(W);
+        const FString One = Fn();
+        TSharedPtr<FJsonObject> Obj = Decode(One);
+        if (!Obj.IsValid())
+        {
+            Obj = MakeShared<FJsonObject>();
+            Obj->SetBoolField(TEXT("ok"), false);
+            Obj->SetStringField(TEXT("error"), TEXT("verb returned something other than JSON"));
+        }
+        bool bOk = true;
+        Obj->TryGetBoolField(TEXT("ok"), bOk);
+        bAllOk = bAllOk && bOk;
+        Obj->SetNumberField(TEXT("client"), FAgentWorld::GetClientIndex(W));
+        Results.Add(MakeShared<FJsonValueObject>(Obj.ToSharedRef()));
+    }
+
+    if (Results.Num() == 1)
+    {
+        // One client: return that client's own envelope (with "client" added), so a caller
+        // reading ok / error / pressed / held does not need to know a fan-out exists.
+        return UAPJson(Results[0]->AsObject().ToSharedRef());
+    }
+    TSharedRef<FJsonObject> Root = MakeShared<FJsonObject>();
+    Root->SetBoolField(TEXT("ok"), bAllOk);
+    Root->SetArrayField(TEXT("clients"), Results);
+    return UAPJson(Root);
 }
 
 // --- Mouse position ---------------------------------------------------------------------
@@ -969,13 +1109,16 @@ namespace
     }
 
     /**
-     * Set the GAME-side mouse cache and read it back. This one is genuinely settable under
-     * capture -- APlayerController::SetMouseLocation goes to FSceneViewport::SetMouse, which
-     * writes CachedCursorPos, and that is what GetMousePosition / GetHitResultUnderCursor
-     * read. It is reported separately from the Slate side because the two can disagree and a
-     * caller chasing a gameplay trace needs to know which one moved.
+     * READ the GAME-side mouse cache (what GetMousePosition / GetHitResultUnderCursor return)
+     * and report whether it agrees with the target. It is NOT written from here any more:
+     * APlayerController::SetMouseLocation -> FSceneViewport::SetMouse ends in
+     * FSlateApplication::SetCursorPos, which moves the human's REAL mouse pointer. The cache
+     * is updated the legitimate way instead -- the pointer-move event we route to the viewport
+     * widget runs FSceneViewport::UpdateCachedCursorPos. Reported separately from the Slate side
+     * because the two can disagree and a caller chasing a gameplay trace needs to know which one
+     * moved. Call this AFTER the move event has been delivered.
      */
-    void UAPSetGameMouse(const TSharedRef<FJsonObject>& O, FVector2D Absolute)
+    void UAPReadGameMouse(const TSharedRef<FJsonObject>& O, FVector2D Absolute)
     {
         UWorld* World = FAgentWorld::GetActiveGameWorld();
         APlayerController* PC = World ? World->GetFirstPlayerController() : nullptr;
@@ -985,8 +1128,6 @@ namespace
             O->SetBoolField(TEXT("game_mouse_set"), false);
             return;
         }
-        PC->SetMouseLocation(FMath::RoundToInt(Local.X), FMath::RoundToInt(Local.Y));
-
         float MX = 0.f, MY = 0.f;
         const bool bRead = PC->GetMousePosition(MX, MY);
         O->SetBoolField(TEXT("game_mouse_set"),
@@ -1087,21 +1228,17 @@ namespace
         O->SetNumberField(TEXT("x"), Target.X);
         O->SetNumberField(TEXT("y"), Target.Y);
 
-        // 2. Ask the platform cursor as well, then READ IT BACK. Under capture this does
-        //    nothing, and saying so is the point: a caller who needs the real pointer (an OS
-        //    drag, a native tooltip) has to know it did not move, and a caller who only needs
-        //    a click can see that it does not matter.
-        App.SetCursorPos(Target);
+        // 2. The platform (OS) cursor is deliberately NOT moved: that is the human's real mouse
+        //    pointer, and uap never touches it (owner rule 2026-11-11). It is only READ back, so
+        //    a caller can see it stayed where the human left it.
         const FVector2D OsAfter = App.GetCursorPos();
-        const bool bOsMoved = FVector2D::Distance(OsAfter, Target) <= 2.0;
+        const bool bOsMoved = FVector2D::Distance(OsAfter, Target) <= 2.0;   // coincidence at most
         O->SetBoolField(TEXT("os_cursor_moved"), bOsMoved);
+        O->SetBoolField(TEXT("os_cursor_untouched"), true);
         O->SetNumberField(TEXT("os_cursor_x"), OsAfter.X);
         O->SetNumberField(TEXT("os_cursor_y"), OsAfter.Y);
 
-        // 3. The game-side cache (GetMousePosition / GetHitResultUnderCursor).
-        UAPSetGameMouse(O, Target);
-
-        // 4. A real move event at the target, so hover / OnMouseEnter fire like a user's.
+        // 3. A real move event at the target, so hover / OnMouseEnter fire like a user's.
         const TSet<FKey> NoButtons;   // named: FPointerEvent keeps a pointer to it
         FPointerEvent Move((uint32)User, /*PointerIndex*/ 0u, Target, Target, NoButtons,
                            EKeys::Invalid, 0.f, App.GetModifierKeys());
@@ -1111,6 +1248,10 @@ namespace
                 ? App.RoutePointerMoveEvent(Redirected, Move, /*bIsSynthetic*/ false)
                 : App.ProcessMouseMoveEvent(Move));
         O->SetBoolField(TEXT("redirected_to_active_game_window"), Redirected.IsValid());
+
+        // 4. The game-side cache (GetMousePosition / GetHitResultUnderCursor), which that move
+        //    event just updated. Read back, not written -- see UAPReadGameMouse.
+        UAPReadGameMouse(O, Target);
 
         // 5. WHAT IS ACTUALLY THERE. The same lookup the click will do. An empty path, or one
         //    ending at SViewport, means the click will hit the 3D scene and no UI -- report it

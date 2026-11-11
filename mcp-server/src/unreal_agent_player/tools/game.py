@@ -20,6 +20,22 @@ def _track_proc(instance_id: str, proc: Any) -> None:
     _PROCS[instance_id] = proc
 
 
+def _no_activate_kwargs() -> dict:
+    """Popen kwargs that start the child window minimised WITHOUT activating it.
+
+    A new game window normally takes the foreground, over whatever the human at this machine is
+    doing. STARTF_USESHOWWINDOW + SW_SHOWMINNOACTIVE (7) is the process-wide default for the
+    first ShowWindow the child makes, so its window opens in the taskbar instead. Owner rule
+    2026-11-11: uap never brings a window to the front. Windows only; elsewhere no kwargs.
+    """
+    if os.name != "nt":
+        return {}
+    info = subprocess.STARTUPINFO()
+    info.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+    info.wShowWindow = 7   # SW_SHOWMINNOACTIVE
+    return {"startupinfo": info}
+
+
 def _spawn(port: int, mapname: str | None, extra: list[str] | None,
            no_vr: bool = True) -> subprocess.Popen:
     exe = os.environ.get("UAP_EDITOR_EXE", r"E:\ImagineGames\IG_MetaEngine\Engine\Binaries\Win64\UnrealEditor.exe")
@@ -36,7 +52,7 @@ def _spawn(port: int, mapname: str | None, extra: list[str] | None,
         args.append("-nohmd")
     if extra:
         args += extra
-    return subprocess.Popen(args)
+    return subprocess.Popen(args, **_no_activate_kwargs())
 
 
 async def _wait_rc_ready(port: int, timeout: float = 90.0) -> bool:
