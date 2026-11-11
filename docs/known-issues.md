@@ -1297,3 +1297,49 @@ not collide loudly, they collided quietly.**
 **Still open:** identity is only as good as the token. With no `--agent` on either side there is
 nothing to compare, so the take proceeds. `AGENTS.md` should say to pass one on every report call,
 the same way it already does for the editor lease.
+
+## 39. `uap input` only reached the first PIE world, and uap took the human's window and mouse -- FIXED
+
+Two problems, one owner rule (2026-11-11): agent testing must never steal the human's mouse, keyboard or
+foreground window, and every client must be drivable without it.
+
+* **Every input verb acted on the FIRST game world**, so a net client of a multi-client PIE could not be
+  driven [ClickUp 17tm466z4a6]. Fixed: a trailing `Client` argument ("" = first world as before, "N" = PIE
+  instance, "all") on the input / hold / release / click / read-ui UFUNCTIONs, `--client` in the CLI, and
+  `uap input clients`. A hold remembers its world and is re-asserted there each tick.
+  `--instance Context_2|pid:N` reaches a `-game` standalone on its own `-UAPRCPort`.
+* **uap raised windows and moved the real cursor**: `FocusEditorWindow` (TOPMOST bounce, BringWindowToTop,
+  AttachThreadInput, SetForegroundWindow), a persistent `ForegroundLockTimeout=0` write at module startup (it let
+  any background process jump in front of the user; a leftover 0 is restored to the 200000 ms default),
+  `FSlateApplication::SetCursorPos` and `APlayerController::SetMouseLocation` (both end in the OS cursor), and a
+  browser window opened by `report finish`. All removed; `report finish --open` / `UAP_REPORT_OPEN=1` opts in. The
+  editor's 3 fps not-foreground throttle is switched off in memory for the PIE session instead of by taking focus.
+
+**BREAKING (plugin):** 13 UFUNCTIONs gained a trailing `FString Client` parameter, `FocusEditorWindow` was removed.
+Requires a plugin re-sync + rebuild in every project. The CLI refuses `--client` against an older plugin copy rather
+than silently driving client 0.
+
+
+## 40. Every verb with `--instance pid:N` failed against a `-game` standalone: the runtime subsystem never existed -- FIXED
+
+`uap rc|input|read-ui|exec ... --instance pid:N` against a `-game` client answered `Unable to resolve the preset`
+(404) or `this editor's plugin has no HoldKey / ListClients`, and `GET /remote/presets` returned `[]`. [ClickUp 17tm466fxv7]
+
+* **Cause:** `UnrealAgentPlayerRuntime` loads at `PostEngineInit`. In a `-game` process `UGameEngine::Init` has already
+  created the GameInstance and collected its subsystems by then, so `UUAPAgentRuntimeSubsystem` (whose `Initialize`
+  registers `UAP_RuntimePreset`) was never instantiated - only its CDO existed. In PIE the class exists before the
+  game instance, so PIE was never affected.
+* **Fix (plugin):** the module builds the subsystem by hand on the live GameInstance in `StartupModule` (and from
+  `OnPostWorldInitialization` for a game instance created later) through new `InitializeRuntime()` /
+  `ShutdownRuntime()`, which `Initialize` / `Deinitialize` now also call. No-op where the engine already made one
+  (PIE) or when there is no game instance. `#if !UE_BUILD_SHIPPING`; the module is a DeveloperTool, so none of
+  it is in a Shipping build. Confirmed by the client log line `Standalone game instance had no
+  UAPAgentRuntimeSubsystem (module loaded after it); created one by hand.` and `GET /remote/presets` listing
+  `UAP_RuntimePreset`.
+* **Fix (CLI):** a verb whose `--instance` is a standalone `-game` client (role `game`) no longer queues behind the
+  EDITOR's rebuild wait, another agent's exclusive project lease or the machine lock - none of them protect that
+  process, and `uap input clients --instance pid:N` hung for as long as another agent held `lease acquire
+  exclusive --reason pie`. Same reasoning as `screenshot --window`. `--instance` now also routes `sample` and `log`
+  (they were editor-only). Pointing `--instance` at the editor still goes through the guards.
+* Still needs `-RCWebControlEnable -UAPRCPort=<n>` on the client's command line (`launch_2p_standalone.ps1` does).
+  Each client needs its OWN port: two clients on the same `-UAPRCPort` answer from whichever bound first.

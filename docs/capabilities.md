@@ -383,12 +383,20 @@ Requires the `[windows]` extra (`comtypes`). Import-guarded: on a platform/witho
 
 ---
 
-## Editor focus
+## No window activation, no OS input
 
-### `FocusEditorWindow` (UFUNCTION)
-Brings the editor's main window to the foreground **from inside the editor process**, so an external agent can make the editor frontmost before capturing or driving native chrome. Because it runs in-process it bypasses the Win32 cross-process foreground lock; it title-matches the main editor window (not a transient dialog) and uses an `AttachThreadInput` + `AllowSetForegroundWindow` sequence to take focus reliably. Windows only.
+uap never raises, focuses or sends OS input to a window. `FocusEditorWindow` was **removed** (it did `ShowWindow` + a TOPMOST bounce + `BringWindowToTop` + `AttachThreadInput` + `SetForegroundWindow`, and the plugin module zeroed the Windows foreground-lock timeout persistently so that would work). Why: agent testing kept stealing the human's mouse and keyboard while they worked on the same PC.
 
-> Note: in-process **input injection does not need this** — it routes through Slate regardless of OS focus. `FocusEditorWindow` is for screen capture and for driving native menus, which do need real OS focus. Only one window can be OS-foreground at a time, so this is a single-editor operation.
+Everything it was for is done in-engine instead:
+
+- **Input** is injected inside the engine (viewport route / Slate route), so it needs no focus. With several PIE clients, `--client N` / `--client all` picks the client (see "Multi-client PIE" below).
+- **The 3 fps not-foreground throttle** is turned off by the plugin for the whole PIE session (`UEditorPerformanceSettings::bThrottleCPUWhenNotForeground`, in memory only) and put back when PIE ends.
+- **Screenshots** use the game backbuffer (`CaptureViewportWithUI`) or a passive `PrintWindow` of a standalone client; neither needs the window in front.
+- `uap report finish` no longer opens a browser window by default (a new window takes the foreground); pass `--open` or set `UAP_REPORT_OPEN=1`.
+
+## Multi-client PIE (`--client`)
+
+With `PlayNumberOfClients > 1` the editor runs several game worlds in one process. Every input / hold / release / click / read-ui verb takes `--client <N|all>` (or `$UAP_CLIENT`): the PIE instance index, or every client. `uap input clients` lists them (index, net mode, window title, pawn). Without `--client` the first game world is used, as before. A hold belongs to the client it started on (the same key held on two clients is two holds). An older plugin copy that lacks the parameter is refused (it would silently drive client 0), never ignored.
 
 ---
 
@@ -415,9 +423,9 @@ Launch and drive standalone `-game` processes independently from the editor, eac
 
 The C++ functions on `UAPAgentSubsystem`, callable directly over Remote Control:
 
-`GetPluginVersion` · `ExecuteConsoleCommand` · `GetRemoteControlPort` · `FocusEditorWindow` · `GetPIEPhase` · `GetPIEElapsedSeconds` · `StartPIE` · `StartPIEMode` · `StopPIE` · `StopPIEEx` · `IsInPIE` · `IsPIEInProgress` · `GetLogCursor` · `GetLogsSince` · `InjectKey` · `InjectMouseMove` · `InjectMouseButton` · `InjectAxis` · `InjectGamepad` · `InjectXRButton` · `InjectXRControllerPose` · `ClearXRControllerOverride` · `SetXRAimEmulation` · `GetXRControllerState` · `HoldKey` · `HoldAxis` · `ReleaseHeldInput` · `GetHeldInput` · `ListTestHelpers` · `ListTestHelpersJson` · `CallTestHelper` · `StartPropertySample` · `ReadPropertySample` · `StopPropertySample` · `GetStatGroupText` · `DumpViewportUI` · `SelectTab` · `NavigateUI` · `CaptureViewportWithUI`
+`GetPluginVersion` · `ExecuteConsoleCommand` · `GetRemoteControlPort` · `GetPIEPhase` · `GetPIEElapsedSeconds` · `StartPIE` · `StartPIEMode` · `StopPIE` · `StopPIEEx` · `IsInPIE` · `IsPIEInProgress` · `GetLogCursor` · `GetLogsSince` · `InjectKey` · `InjectMouseMove` · `InjectMouseButton` · `InjectAxis` · `InjectGamepad` · `InjectXRButton` · `InjectXRControllerPose` · `ClearXRControllerOverride` · `SetXRAimEmulation` · `GetXRControllerState` · `HoldKey` · `HoldAxis` · `ReleaseHeldInput` · `GetHeldInput` · `ListTestHelpers` · `ListTestHelpersJson` · `CallTestHelper` · `StartPropertySample` · `ReadPropertySample` · `StopPropertySample` · `GetStatGroupText` · `DumpViewportUI` · `SelectTab` · `NavigateUI` · `CaptureViewportWithUI`
 
-The same surface (minus the editor-only PIE and focus verbs) exists on `UAPAgentRuntimeSubsystem` for standalone `-game` processes.
+The same surface (minus the editor-only PIE verbs) exists on `UAPAgentRuntimeSubsystem` for standalone `-game` processes.
 
 New tools can be added in the Python layer over `exec_python` and the existing UFUNCTIONs **without recompiling the engine**; only genuinely new in-process capabilities require a plugin change.
 

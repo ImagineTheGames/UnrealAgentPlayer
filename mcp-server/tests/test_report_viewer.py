@@ -34,6 +34,9 @@ class FakeDesktop:
 
 def _run_report(tmp_path, monkeypatch, *extra):
     monkeypatch.setenv("UAP_REPORTS_DIR", str(tmp_path))
+    # Opening a window is OPT-IN since 2026-11-11 (a new window takes the OS foreground, and uap
+    # never activates a window). These tests are about HOW the window is shown once asked for.
+    monkeypatch.setenv("UAP_REPORT_OPEN", "1")
     assert main(["report", "start", "a test"]) == 0
     assert main(["report", "finish", "pass", "done", "--keep-pie", *extra]) == 0
 

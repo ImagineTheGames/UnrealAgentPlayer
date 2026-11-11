@@ -86,7 +86,12 @@ def test_expected_contract_is_read_from_this_repos_plugin_header():
     assert exp is not None, "plugin header not found; the skew check would be permanently blind"
     assert len(exp) > 30, f"only parsed {len(exp)} UFUNCTIONs -- the parser is missing some"
     assert exp["HoldAxis"] == {"AxisKeyName": "FString", "Value": "float",
-                               "Seconds": "float", "SlateUser": "FString"}
+                               "Seconds": "float", "SlateUser": "FString",
+                               "Client": "FString"}
+    # [17tm466z4a6] every input/hold/UI-read verb takes a trailing Client selector
+    assert exp["InjectKey"]["Client"] == "FString"
+    assert exp["ListClients"] == {}
+    assert "FocusEditorWindow" not in exp   # uap never activates a window
     assert exp["InjectGamepad"]["SlateUser"] == "FString"
     # multi-line declaration, mixed integer widths, an enum argument
     assert exp["GetLogsSince"] == {"AfterCursor": "int64", "MaxLines": "int32",

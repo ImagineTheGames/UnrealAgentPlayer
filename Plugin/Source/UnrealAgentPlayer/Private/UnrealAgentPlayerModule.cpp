@@ -15,13 +15,25 @@ DEFINE_LOG_CATEGORY(LogUAP);
 void FUnrealAgentPlayerModule::StartupModule()
 {
     UE_LOG(LogUAP, Log, TEXT("UnrealAgentPlayer module started."));
+    // This module used to set SPI_SETFOREGROUNDLOCKTIMEOUT to 0 - with SPIF_UPDATEINIFILE, so a
+    // PERSISTENT per-user Windows setting (HKCU\Control Panel\Desktop\ForegroundLockTimeout) -
+    // so that FocusEditorWindow could steal the foreground. FocusEditorWindow is gone (uap never
+    // activates a window: owner rule 2026-11-11) and the zero is worse than useless now: it
+    // switches OFF the foreground lock that stops a background process, such as this editor
+    // opening a PIE window on a remote request, from jumping in front of whatever the human is
+    // using. So if an older build left it at 0, put back the Windows default (200000 ms) once.
+    // Only the value this plugin itself wrote is touched; any other non-default setting is left.
 #if PLATFORM_WINDOWS
-    // Drop the foreground-lock timeout so FocusEditorWindow's SetForegroundWindow is
-    // honored even when another app currently holds focus. Lets an external agent raise
-    // the editor for menu-bar / native-chrome driving (the in-process key/mouse injection
-    // path does not need this). Editor-only tool, so changing the per-session setting is fine.
-    ::SystemParametersInfo(SPI_SETFOREGROUNDLOCKTIMEOUT, 0, (PVOID)0,
-                           SPIF_SENDWININICHANGE | SPIF_UPDATEINIFILE);
+    {
+        DWORD Timeout = 1;
+        if (::SystemParametersInfo(SPI_GETFOREGROUNDLOCKTIMEOUT, 0, &Timeout, 0) && Timeout == 0)
+        {
+            const BOOL bRestored = ::SystemParametersInfo(SPI_SETFOREGROUNDLOCKTIMEOUT, 0,
+                                       (PVOID)(UPTRINT)200000, SPIF_SENDWININICHANGE | SPIF_UPDATEINIFILE);
+            UE_LOG(LogUAP, Log, TEXT("Windows foreground-lock timeout was 0 (an older uap build set it persistently); restored the default 200000 ms: %s"),
+                   bRestored ? TEXT("ok") : TEXT("FAILED"));
+        }
+    }
 #endif
 
     FPropertyEditorModule& PropEd = FModuleManager::LoadModuleChecked<FPropertyEditorModule>("PropertyEditor");
