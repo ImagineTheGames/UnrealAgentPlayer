@@ -1297,3 +1297,24 @@ not collide loudly, they collided quietly.**
 **Still open:** identity is only as good as the token. With no `--agent` on either side there is
 nothing to compare, so the take proceeds. `AGENTS.md` should say to pass one on every report call,
 the same way it already does for the editor lease.
+
+## 39. `uap input` only reached the first PIE world, and uap took the human's window and mouse -- FIXED
+
+Two problems, one owner rule (2026-11-11): agent testing must never steal the human's mouse, keyboard or
+foreground window, and every client must be drivable without it.
+
+* **Every input verb acted on the FIRST game world**, so a net client of a multi-client PIE could not be
+  driven [ClickUp 17tm466z4a6]. Fixed: a trailing `Client` argument ("" = first world as before, "N" = PIE
+  instance, "all") on the input / hold / release / click / read-ui UFUNCTIONs, `--client` in the CLI, and
+  `uap input clients`. A hold remembers its world and is re-asserted there each tick.
+  `--instance Context_2|pid:N` reaches a `-game` standalone on its own `-UAPRCPort`.
+* **uap raised windows and moved the real cursor**: `FocusEditorWindow` (TOPMOST bounce, BringWindowToTop,
+  AttachThreadInput, SetForegroundWindow), a persistent `ForegroundLockTimeout=0` write at module startup (it let
+  any background process jump in front of the user; a leftover 0 is restored to the 200000 ms default),
+  `FSlateApplication::SetCursorPos` and `APlayerController::SetMouseLocation` (both end in the OS cursor), and a
+  browser window opened by `report finish`. All removed; `report finish --open` / `UAP_REPORT_OPEN=1` opts in. The
+  editor's 3 fps not-foreground throttle is switched off in memory for the PIE session instead of by taking focus.
+
+**BREAKING (plugin):** 13 UFUNCTIONs gained a trailing `FString Client` parameter, `FocusEditorWindow` was removed.
+Requires a plugin re-sync + rebuild in every project. The CLI refuses `--client` against an older plugin copy rather
+than silently driving client 0.
