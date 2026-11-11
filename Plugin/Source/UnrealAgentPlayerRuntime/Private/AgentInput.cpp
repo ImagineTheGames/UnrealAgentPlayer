@@ -12,6 +12,7 @@
 #include "Widgets/SViewport.h"
 #include "Widgets/SWindow.h"
 #include "Layout/WidgetPath.h"
+#include "Engine/Engine.h"
 #include "InputKeyEventArgs.h"
 #include "GenericPlatform/GenericPlatformInputDeviceMapper.h"
 #include "HAL/PlatformTime.h"
@@ -25,6 +26,60 @@ TSharedPtr<SWidget> FAgentInput::FindPIEViewportWidget()
 {
     UGameViewportClient* GV = FAgentWorld::GetActiveGameViewport();
     return GV ? GV->GetGameViewportWidget() : nullptr;
+}
+
+namespace
+{
+    /**
+     * Flat PIE with several clients in ONE process (PlayNumberOfClients > 1, the SchoolsOut default)
+     * opens one OS window per client, all at the SAME screen rect. Slate hit-tests the topmost
+     * window, so a click at a read-ui coordinate landed on a SIBLING client's viewport - which has
+     * no menu open - and ended on its SPIEViewport / a border, while read-ui had read the ACTIVE
+     * world's UI. Tabs never switched and the call still said clicked [17tm466z5j8].
+     *
+     * When the topmost window under Pos is a sibling PIE game window and the active game window
+     * also covers Pos, return a path located inside the ACTIVE game window only. Returns false
+     * (OutPath untouched) in every other case, so ordinary editor / single-client clicks are
+     * unchanged.
+     */
+    bool UAPRedirectPathToActiveGameWindow(FVector2D Pos, int32 User, bool bIgnoreEnabledStatus, FWidgetPath& OutPath)
+    {
+        if (!FSlateApplication::IsInitialized() || !GEngine) { return false; }
+        FSlateApplication& App = FSlateApplication::Get();
+        UGameViewportClient* ActiveGV = FAgentWorld::GetActiveGameViewport();
+        TSharedPtr<SWindow> Active = ActiveGV ? ActiveGV->GetWindow() : nullptr;
+        if (!Active.IsValid() || !Active->GetRectInScreen().ContainsPoint(Pos)) { return false; }
+
+        const FWidgetPath Top = App.LocateWindowUnderMouse(
+            Pos, App.GetInteractiveTopLevelWindows(), bIgnoreEnabledStatus, User);
+        if (!Top.IsValid() || !Top.TopLevelWindow.IsValid() || Top.TopLevelWindow == Active) { return false; }
+
+        bool bTopIsSiblingPIE = false;
+        for (const FWorldContext& Ctx : GEngine->GetWorldContexts())
+        {
+            UGameViewportClient* GV = (Ctx.WorldType == EWorldType::PIE && Ctx.World()) ? Ctx.World()->GetGameViewport() : nullptr;
+            if (GV && GV->GetWindow() == Top.TopLevelWindow) { bTopIsSiblingPIE = true; break; }
+        }
+        if (!bTopIsSiblingPIE) { return false; }
+
+        TArray<TSharedRef<SWindow>> OnlyActive;
+        OnlyActive.Add(Active.ToSharedRef());
+        OutPath = App.LocateWindowUnderMouse(Pos, OnlyActive, bIgnoreEnabledStatus, User);
+        return OutPath.IsValid();
+    }
+
+    /** Windows to hit-test for Pos: only the active game window when a sibling PIE client covers it, else all. */
+    TArray<TSharedRef<SWindow>> UAPWindowsForPoint(FVector2D Pos, int32 User)
+    {
+        FWidgetPath Redirected;
+        if (UAPRedirectPathToActiveGameWindow(Pos, User, /*bIgnoreEnabledStatus*/ true, Redirected))
+        {
+            TArray<TSharedRef<SWindow>> One;
+            One.Add(Redirected.TopLevelWindow.ToSharedRef());
+            return One;
+        }
+        return FSlateApplication::Get().GetInteractiveTopLevelWindows();
+    }
 }
 
 namespace
@@ -362,6 +417,11 @@ bool FAgentInput::InjectMouseMove(FVector2D Delta, bool bAbsolute, int32 UserInd
         /*ModifierKeys*/ App.GetModifierKeys()
     );
     App.SetCursorPos(NewPos);
+    FWidgetPath Redirected;
+    if (UAPRedirectPathToActiveGameWindow(NewPos, User, /*bIgnoreEnabledStatus*/ false, Redirected))
+    {
+        return App.RoutePointerMoveEvent(Redirected, Evt, /*bIsSynthetic*/ false);
+    }
     return App.ProcessMouseMoveEvent(Evt);
 }
 
@@ -396,6 +456,16 @@ bool FAgentInput::InjectMouseButtonAt(EAgentMouseButton Btn, bool bPressed, FVec
         (uint32)User, /*PointerIndex*/ 0u, ScreenPos, ScreenPos,
         Pressed, Key, 0.f, App.GetModifierKeys()
     );
+    // A sibling PIE client covers this point (see UAPRedirectPathToActiveGameWindow): route the
+    // event straight to the ACTIVE game window's widget path - ProcessMouseButton*Event would
+    // re-locate the topmost window and hand the click to the sibling.
+    FWidgetPath Redirected;
+    if (UAPRedirectPathToActiveGameWindow(ScreenPos, User, /*bIgnoreEnabledStatus*/ false, Redirected))
+    {
+        const FReply Reply = bPressed ? App.RoutePointerDownEvent(Redirected, Evt)
+                                      : App.RoutePointerUpEvent(Redirected, Evt);
+        return Reply.IsEventHandled();
+    }
     if (bPressed) { return App.ProcessMouseButtonDownEvent(nullptr, Evt); }
     return App.ProcessMouseButtonUpEvent(Evt);
 }
@@ -408,7 +478,7 @@ FString FAgentInput::DescribeWidgetsAt(FVector2D ScreenPos, int32 UserIndex)
     // The same lookup ProcessMouseButtonDownEvent performs for a real click
     // (SlateApplication.cpp:5282), so what this reports is what the click will actually hit.
     FWidgetPath Path = App.LocateWindowUnderMouse(
-        ScreenPos, App.GetInteractiveTopLevelWindows(), /*bIgnoreEnabledStatus*/ false, UserIndex);
+        ScreenPos, UAPWindowsForPoint(ScreenPos, UserIndex), /*bIgnoreEnabledStatus*/ false, UserIndex);
     if (!Path.IsValid() || Path.Widgets.Num() == 0) { return FString(); }
 
     // Leafmost few only: the full path is a 40-deep chain of layout panels nobody reads.
@@ -961,11 +1031,11 @@ namespace
         FSlateApplication& App = FSlateApplication::Get();
 
         FWidgetPath Ungated = App.LocateWindowUnderMouse(
-            ScreenPos, App.GetInteractiveTopLevelWindows(), /*bIgnoreEnabledStatus*/ true, User);
+            ScreenPos, UAPWindowsForPoint(ScreenPos, User), /*bIgnoreEnabledStatus*/ true, User);
         if (!Ungated.IsValid() || Ungated.Widgets.Num() == 0) { return false; }
 
         FWidgetPath Gated = App.LocateWindowUnderMouse(
-            ScreenPos, App.GetInteractiveTopLevelWindows(), /*bIgnoreEnabledStatus*/ false, User);
+            ScreenPos, UAPWindowsForPoint(ScreenPos, User), /*bIgnoreEnabledStatus*/ false, User);
         const int32 GatedNum = (Gated.IsValid() ? Gated.Widgets.Num() : 0);
         if (GatedNum >= Ungated.Widgets.Num()) { return false; }
 
@@ -1035,7 +1105,12 @@ namespace
         const TSet<FKey> NoButtons;   // named: FPointerEvent keeps a pointer to it
         FPointerEvent Move((uint32)User, /*PointerIndex*/ 0u, Target, Target, NoButtons,
                            EKeys::Invalid, 0.f, App.GetModifierKeys());
-        O->SetBoolField(TEXT("hover_delivered"), App.ProcessMouseMoveEvent(Move));
+        FWidgetPath Redirected;
+        O->SetBoolField(TEXT("hover_delivered"),
+            UAPRedirectPathToActiveGameWindow(Target, User, /*bIgnoreEnabledStatus*/ false, Redirected)
+                ? App.RoutePointerMoveEvent(Redirected, Move, /*bIsSynthetic*/ false)
+                : App.ProcessMouseMoveEvent(Move));
+        O->SetBoolField(TEXT("redirected_to_active_game_window"), Redirected.IsValid());
 
         // 5. WHAT IS ACTUALLY THERE. The same lookup the click will do. An empty path, or one
         //    ending at SViewport, means the click will hit the 3D scene and no UI -- report it
