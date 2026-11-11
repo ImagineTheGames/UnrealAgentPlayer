@@ -12,6 +12,13 @@ public:
     virtual void Initialize(FSubsystemCollectionBase& Collection) override;
     virtual void Deinitialize() override;
 
+    // The body of Initialize / Deinitialize, callable without a subsystem collection. A -game
+    // process loads this module AFTER its GameInstance has collected its subsystems, so the engine
+    // never creates this class there; the module then builds one by hand (see
+    // FUnrealAgentPlayerRuntimeModule::EnsureStandaloneSubsystem) and drives it through these two.
+    void InitializeRuntime();
+    void ShutdownRuntime();
+
     UFUNCTION(BlueprintCallable, Category="Agent|Status") FString GetPluginVersion() const;
     UFUNCTION(BlueprintCallable, Category="Agent|Status") FString ExecuteConsoleCommand(FString Command);
     // CLIENT (last parameter of every verb below that injects, holds, releases or reads UI):

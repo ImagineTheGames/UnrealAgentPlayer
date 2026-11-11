@@ -569,7 +569,7 @@ _INSTANCE_TARGET: list = [None]
 _RUNTIME_PRESET = "UAP_RuntimePreset"
 _UAPRCPORT_RE = re.compile(r"-UAPRCPort=(\d+)", re.IGNORECASE)
 # The verbs the runtime subsystem serves, i.e. the ones a standalone client can be driven with.
-_INSTANCE_RC_CMDS = frozenset({"input", "xr", "click", "tab", "nav", "read-ui", "rc"})
+_INSTANCE_RC_CMDS = frozenset({"input", "xr", "click", "tab", "nav", "read-ui", "rc", "sample", "log"})
 
 
 def _resolve_instance_target(instance: str | None, project: str | None) -> dict | None:
@@ -603,7 +603,34 @@ def _resolve_instance_target(instance: str | None, project: str | None) -> dict 
             f"uap has no in-engine way to reach it. Relaunch it with launch_2p_standalone.ps1 (which "
             f"now passes them) -- do NOT drive it with real OS input or by focusing its window; "
             f"both are banned.", recoverable=False)
-    return {"port": int(m.group(1)), "preset": _RUNTIME_PRESET, "pid": node.get("pid")}
+    return {"port": int(m.group(1)), "preset": _RUNTIME_PRESET, "pid": node.get("pid"),
+            "role": node.get("role")}
+
+
+def _standalone_instance_selected(args, target: dict | None) -> bool:
+    """Is --instance pointing at a standalone `-game` client (not the editor)?
+
+    A standalone client is its own process: nothing it does touches the editor, its PIE session or
+    the foreground, so the editor's rebuild wait, exclusive project lease and the machine turn have
+    nothing to protect. Queueing behind them made a standalone drive hang for as long as ANOTHER
+    agent held `lease acquire exclusive --reason pie` on the editor (measured: `uap input clients
+    --instance pid:N` blocked on a different agent's PIE lease). `screenshot --window` is exempt for
+    the same reason. [17tm466fxv7]
+    """
+    sel = (getattr(args, "instance", None) or "").strip()
+    if sel.lower() in ("", "editor"):
+        return False
+    if target is not None:                       # an input/click/read-ui/rc target we resolved
+        return target.get("role") == "game"
+    # exec / exec-file reach the process over Python remote-exec, not a resolved RC target.
+    try:
+        probe = PythonRemoteExecClient(node_project_substr=getattr(args, "project", "") or "",
+                                       node_instance=sel)
+        nodes = [n for n in probe.list_nodes()
+                 if probe._matches_project(n) and probe._matches_instance(n)]
+    except Exception:
+        return False
+    return len(nodes) == 1 and nodes[0].get("role") == "game"
 
 
 def _rc_call(func: str, params: dict, project: str | None = None):
@@ -3954,6 +3981,14 @@ def _run_parsed(args) -> int:
     # otherwise wait on itself, and a rebuild of the editor has nothing to do with the client.
     if cmd == "screenshot" and getattr(args, "window", None):
         return args.func(args)
+    # `--instance` at a standalone -game client: same reasoning, see _standalone_instance_selected.
+    if cmd in (_INSTANCE_RC_CMDS | {"exec", "exec-file"}) and _standalone_instance_selected(
+            args, _INSTANCE_TARGET[0]):
+        _RC_TARGET[0] = _INSTANCE_TARGET[0]
+        try:
+            return args.func(args)
+        finally:
+            _RC_TARGET[0] = None
     # Say who is using the editor before anything can block, so a call stuck behind a lease or a
     # rebuild still appears (with its task) in `uap lease status` and the overlay. Display only.
     task = _task_label(args)

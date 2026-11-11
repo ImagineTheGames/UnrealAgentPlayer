@@ -322,7 +322,7 @@ def _nodes(monkeypatch, *nodes):
 def test_instance_selector_resolves_to_the_clients_runtime_preset_and_port(monkeypatch):
     _nodes(monkeypatch, _EDITOR, _CLIENT2)
     t = cli._resolve_instance_target("Context_2", "SchoolsOut")
-    assert t == {"port": 30102, "preset": "UAP_RuntimePreset", "pid": 22}
+    assert t == {"port": 30102, "preset": "UAP_RuntimePreset", "pid": 22, "role": "game"}
 
 
 def test_no_instance_or_editor_means_the_editor(monkeypatch):
@@ -379,3 +379,41 @@ def test_the_launcher_starts_each_client_with_its_uap_rc_port():
         pytest.skip("the SchoolsOut launcher is not beside this checkout")
     text = ps1.read_text(encoding="utf-8")
     assert "-UAPRCPort=$RcPortA" in text and "-UAPRCPort=$RcPortB" in text
+
+
+# --- a standalone client must not queue behind the EDITOR's lease / rebuild / machine turn [17tm466fxv7] ---
+
+def _run_with_guards_that_must_not_run(monkeypatch, args):
+    def boom(*a, **k):
+        raise AssertionError("the editor guard chain ran for a standalone client")
+    for name in ("_guard_fast", "_guard_slow", "_run_under_machine_lock"):
+        monkeypatch.setattr(cli, name, boom)
+    return cli._run_parsed(args)
+
+
+def _args(cmd, instance, calls):
+    import types
+    def func(a):
+        calls.append(cli._RC_TARGET[0])
+        return 0
+    return types.SimpleNamespace(cmd=cmd, instance=instance, project="SchoolsOut", func=func,
+                                 client=None, agent="t", task=None)
+
+
+@pytest.mark.parametrize("cmd", ["input", "read-ui", "rc", "sample", "log", "exec", "exec-file"])
+def test_verbs_at_a_standalone_instance_skip_the_editor_lease_and_machine_lock(monkeypatch, cmd):
+    _nodes(monkeypatch, _EDITOR, _CLIENT2)
+    calls = []
+    rc = _run_with_guards_that_must_not_run(monkeypatch, _args(cmd, "pid:22", calls))
+    assert rc == 0 and len(calls) == 1
+    if cmd not in ("exec", "exec-file"):          # these go over Python remote-exec, no RC target
+        assert calls[0]["port"] == 30102
+    assert cli._RC_TARGET[0] is None             # never leaks into the next call
+
+
+def test_an_instance_that_is_the_editor_still_goes_through_the_guards(monkeypatch):
+    _nodes(monkeypatch, _EDITOR, _CLIENT2)
+    args = _args("exec", "pid:10", [])
+    assert cli._standalone_instance_selected(args, None) is False
+    assert cli._standalone_instance_selected(_args("exec", "editor", []), None) is False
+    assert cli._standalone_instance_selected(_args("exec", None, []), None) is False
