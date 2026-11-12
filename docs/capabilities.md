@@ -350,6 +350,7 @@ next frame and failed with *"an idle editor viewport never renders one"*.)
   is piloting an actor returns a `pose_warnings` entry (the editor re-applies the pilot's camera).
 - The path is made absolute by the CLI first: the engine resolves a relative path against ITS working
   directory, which used to read as "no frame rendered".
+- PowerShell splits an unquoted `--location=-900,-1300,900` into separate arguments; the CLI re-joins them (quoting is still the safest spelling).
 - Needs a plugin build with `CaptureLevelViewport` / `LevelViewportPose`; an older copy is named as
   skew (sync + rebuild), never answered by the old next-frame verb.
 

@@ -179,3 +179,26 @@ def test_new_plugin_verbs_are_in_the_contract():
     from unreal_agent_player import contract
     assert "CaptureLevelViewport" in contract.PURPOSE
     assert "LevelViewportPose" in contract.PURPOSE
+
+
+@pytest.mark.parametrize("argv, expected", [
+    (["--rotation", "-12,90,0"], ["--rotation=-12,90,0"]),
+    # PowerShell turns an unquoted `--location=-900,-1300,900` into separate arguments.
+    (["--location=-900", "-1300", "900"], ["--location=-900,-1300,900"]),
+    (["--location", "-900", "-1300", "900"], ["--location=-900,-1300,900"]),
+    (["--location=1,2,3", "9"], ["--location=1,2,3", "9"]),
+    (["--look-at", "0,0,50", "--fov", "70"], ["--look-at=0,0,50", "--fov", "70"]),
+    (["--location", "abc"], ["--location", "abc"]),
+    (["shot.png", "--rotation=-5,0,0"], ["shot.png", "--rotation=-5,0,0"]),
+])
+def test_vector_flags_survive_powershell_and_negative_values(argv, expected):
+    assert cli._glue_negative_vectors(argv) == expected
+
+
+def test_powershell_split_vector_reaches_the_plugin_intact(monkeypatch, tmp_path, capsys):
+    seen = _plugin(monkeypatch, tmp_path, in_pie=False)
+    assert cli.main(["screenshot", str(tmp_path / "ps.png"), "--location=-900", "-1300", "900",
+                     "--look-at", "0", "0", "0"]) == 0
+    pose = json.loads(seen[0][1]["PoseJson"])
+    assert pose["location"] == [-900, -1300, 900] and pose["look_at"] == [0, 0, 0]
+    _out(capsys)

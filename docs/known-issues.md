@@ -1391,6 +1391,20 @@ per channel was entirely fictitious; the real figure was 2.5). [ClickUp 17tm466f
   the old next-frame verb.
 * Refused rather than faked: zero-size pane (minimised window), orthographic pane given a pose, one-flat-colour
   frame.
+* **Verified live (2026-11-12, School's Out editor, `Map_MarbleRace`, NO PIE, four-pane layout, editor not the
+  foreground window - `SteamVR Settings` was):** six captures of a known actor (`MR_Shell`, bounds centre
+  396,-600,150) from poses set in the same call. Each image matched its pose: `--location -900,-1300,900
+  --look-at 0,0,0` = a three-quarter view with the room's corner at screen centre; `--location 396,-600,1400
+  --rotation -90,0,0 --fov 70` = a top-down plan with the room centred; `--location 396,-1900,700 --look-at
+  396,-600,150` = the room centred from the south; `--location 400,-1500,120 --rotation 5,90,0` = the exterior
+  south brick wall. Each result read back the pose that was captured. Refusals: an orthographic pane with a pose
+  and an unknown pane name were `ok:false` with the reason; a hidden pane (maximised layout) reported
+  `0x0 viewport`. Relative paths landed at the absolute path. The editor was at 60 fps in-engine, so the
+  throttle was not involved. Not exercised: a layout whose active pane is NOT the first perspective one (this
+  layout has a single perspective pane); that branch is covered by the `pane_is_unreal_editor_subsystem_pane`
+  warning and read from the engine source only.
+* **PowerShell:** an unquoted `--location=-900,-1300,900` arrives as three separate arguments; the CLI re-joins
+  them, so quoting is optional (`'--location=-900,-1300,900'` is still the safest spelling).
 * **Not a defect, still true:** `editor_set_viewport_realtime(True)` logs a handled ensure
   (`!bCheckMissingOverride || bRemoved`). It is the engine's, harmless, and `CaptureLevelViewport` does not need
   realtime at all.

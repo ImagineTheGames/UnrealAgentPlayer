@@ -4203,23 +4203,34 @@ def _timing_report(args) -> int:
 
 # Vector flags whose value routinely starts with a minus (a pitch of -12, a world X of -6000).
 # argparse reads "-12,90,0" as an unknown OPTION, so `--rotation -12,90,0` dies with "expected one
-# argument" -- on the very first downward-looking camera.
+# argument" -- on the very first downward-looking camera. And PowerShell turns an unquoted
+# `--location=-900,-1300,900` into SEPARATE arguments ("--location=-900" "-1300" "900"), which
+# argparse rejects as stray. Both are normalised to one `--flag=x,y,z` token here.
 _VECTOR_FLAGS = frozenset({"--location", "--rotation", "--look-at"})
-_NEGATIVE_VECTOR = re.compile(r"^-(?:\d|\.\d)[\d.,;eE+\- ]*$")
+_NUMBER = r"[-+]?(?:\d+\.?\d*|\.\d+)(?:[eE][-+]?\d+)?"
+_NUMBER_RUN = re.compile(rf"^{_NUMBER}(?:[,;]{_NUMBER})*$")
 
 
 def _glue_negative_vectors(argv: list[str]) -> list[str]:
-    """`--rotation -12,90,0` -> `--rotation=-12,90,0` so argparse takes it as the flag's value."""
+    """Join `--rotation -12,90,0`, `--location=-900 -1300 900` and `--rotation -12 90 0` into
+    `--rotation=-12,90,0` so argparse takes the whole vector as the flag's value."""
     out: list[str] = []
     i = 0
     while i < len(argv):
         tok = argv[i]
-        if tok in _VECTOR_FLAGS and i + 1 < len(argv) and _NEGATIVE_VECTOR.match(argv[i + 1]):
-            out.append(f"{tok}={argv[i + 1]}")
-            i += 2
+        flag, eq, val = tok.partition("=")
+        if flag not in _VECTOR_FLAGS:
+            out.append(tok)
+            i += 1
             continue
-        out.append(tok)
+        parts = [val] if eq and val else []
+        count = len(re.split(r"[,;]", val)) if parts else 0
         i += 1
+        while count < 3 and i < len(argv) and _NUMBER_RUN.match(argv[i]):
+            parts.append(argv[i])
+            count += len(re.split(r"[,;]", argv[i]))
+            i += 1
+        out.append(f"{flag}={','.join(parts)}" if parts else tok)
     return out
 
 
