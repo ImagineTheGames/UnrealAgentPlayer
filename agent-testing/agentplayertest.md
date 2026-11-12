@@ -86,8 +86,8 @@ These are the errors agents make every time. Don't.
 
 ## Layer mismatches -- six traps that silently give you a WRONG answer
 
-**Three of these five are the same headline risk: input you injected silently never arrives.**
-Say that once, plainly, rather than leaving a reader to infer it across five entries -- it is the
+**Three of these six are the same headline risk: input you injected silently never arrives.**
+Say that once, plainly, rather than leaving a reader to infer it across six entries -- it is the
 single biggest way this tooling produces a confident wrong answer. An injected event goes missing
 three ways, and they look identical from outside (no error, a success return, and a feature that
 appears broken):

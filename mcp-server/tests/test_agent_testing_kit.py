@@ -103,15 +103,15 @@ def test_docs_no_stale_slate_input_claim():
         assert "in-process via Slate" not in text, rel
 
 
-def test_layer_mismatch_section_is_titled_for_five_and_says_the_headline_once():
-    """Three of the five traps are one risk -- input you injected silently never arriving. The
-    PBW director asked for that stated plainly and prominently rather than inferred across five
+def test_layer_mismatch_section_is_titled_for_six_and_says_the_headline_once():
+    """Three of the six traps are one risk -- input you injected silently never arriving. The
+    PBW director asked for that stated plainly and prominently rather than inferred across six
     entries, because it is the single biggest way this tooling produces a confident wrong answer.
-    Pinned so a later edit cannot quietly drop it (or leave the title saying four)."""
+    Pinned so a later edit cannot quietly drop it (or leave the title saying five)."""
     text = _read("agentplayertest.md")
-    assert "## Layer mismatches -- five traps" in text
-    assert "four traps" not in text
-    assert "Three of these five are the same headline risk" in text
+    assert "## Layer mismatches -- six traps" in text
+    assert "five traps" not in text
+    assert "Three of these six are the same headline risk" in text
     assert "input you injected silently never arrives" in text
 
 
