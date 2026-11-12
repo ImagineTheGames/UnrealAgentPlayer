@@ -1343,3 +1343,21 @@ than silently driving client 0.
   (they were editor-only). Pointing `--instance` at the editor still goes through the guards.
 * Still needs `-RCWebControlEnable -UAPRCPort=<n>` on the client's command line (`launch_2p_standalone.ps1` does).
   Each client needs its OWN port: two clients on the same `-UAPRCPort` answer from whichever bound first.
+
+
+## 41. `uap input hold` could not hit a timing window under ~1.5 s -- FIXED with `input sequence`
+
+`hold` starts counting when the CLI call lands in the engine, and the CLI-to-engine hop added 0.2-0.6 s of jitter,
+so agents could not schedule a jump 0.85 s into a run, a vanishing platform or an obstacle gap; Cloud Race testers
+faked jumps with in-engine `ACharacter::Jump` calls. [ClickUp 17tm466zqax]
+
+* **Fix (plugin + CLI):** `uap input sequence "hold W 0-2.0s; press SpaceBar at 0.85s"` ships the whole script in ONE
+  call and the plugin plays it in-engine from a core ticker against the client's world time
+  (`RunInputSequence` / `GetInputSequenceLog`, both on the editor and runtime subsystems). Every offset is relative to
+  arrival (or to `--at`), so the round trip no longer matters; a step fires on the first tick at or after its time
+  (error 0 .. one frame, never early) and the engine records when each one actually did (`input sequence-status`).
+* A plugin without `RunInputSequence` is named as skew by the CLI (sync + rebuild the project); nothing falls back to
+  CLI-timed holds, because that answers a different question.
+* Not covered: aligning the script's 0 to a GAME event (a platform that starts vanishing at an unknown moment). Start
+  the script from an in-engine trigger instead, or read `arrival_world_time` and use `--at` against a world time you
+  derived from game state.

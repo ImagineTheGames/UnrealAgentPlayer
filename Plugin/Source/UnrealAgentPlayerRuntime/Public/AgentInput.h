@@ -213,6 +213,19 @@ public:
     static FString ReleaseHeldJson(const FString& KeyName);
     static FString GetHeldJson();
 
+    /**
+     * Play a whole TIMED input script in-engine [17tm466zqax]. ScriptJson is
+     * {"steps":[{"kind":"hold"|"axis","key":"W","value":1.0,"start":0.0,"end":2.0}, ...]} with
+     * start/end in seconds after the script's 0. The script is validated in full before anything
+     * is pressed, then played from a core ticker against the target client's WORLD time, so the
+     * CLI round trip does not move any step. StartAt: "" = when the call lands, "+x" = x s after
+     * it lands, "x" = an absolute world time of that client. Steps use the same hold registry as
+     * HoldKey/HoldAxis, so `input status` shows them and `input release` cancels the rest.
+     */
+    static FString RunSequenceJson(const FString& ScriptJson, const FString& StartAt);
+    /** When every recent script's steps ACTUALLY fired (world + real time, frame, error in ms). */
+    static FString GetSequenceLogJson();
+
     /** Press Key now and hold it (IE_Repeat every frame) for Seconds, then release. */
     static bool HoldKey(FKey Key, float Seconds);
 

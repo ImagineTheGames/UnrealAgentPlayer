@@ -535,7 +535,7 @@ _CLIENT: list = [None]
 _CLIENT_VERBS = frozenset({
     "InjectKey", "InjectMouseMove", "InjectMouseButton", "SetMousePosition", "ClickMouse",
     "InjectAxis", "InjectGamepad", "InjectXRButton", "HoldKey", "HoldAxis", "ReleaseHeldInput",
-    "GetHeldInput", "DumpViewportUI",
+    "GetHeldInput", "DumpViewportUI", "RunInputSequence", "GetInputSequenceLog",
 })
 
 
@@ -1530,6 +1530,92 @@ def _hold_conflict(key: str, project, *, allow: bool) -> dict | None:
     }
 
 
+_NEEDS_SEQUENCE = ("timed input scripts played in-engine against world time, so the CLI round trip "
+                   "cannot move a step")
+
+
+def _sequence_summary(log: dict, seq_id) -> dict:
+    """Condense GetInputSequenceLog for ONE sequence: its state and the playback error."""
+    for s in log.get("sequences") or []:
+        if s.get("sequence") == seq_id:
+            steps = s.get("steps") or []
+            errs = [float(x["start_error_ms"]) for x in steps if "start_error_ms" in x]
+            errs += [float(x["end_error_ms"]) for x in steps if "end_error_ms" in x]
+            return {"state": s.get("state"), "max_error_ms": s.get("max_error_ms"),
+                    "errors_ms": [round(e, 2) for e in errs],
+                    "failures": [x for x in steps if x.get("failure")], "steps": steps,
+                    "note": s.get("note")}
+    return {"state": "unknown", "note": "the engine no longer has this sequence in its log"}
+
+
+def _input_sequence(args) -> int:
+    """`input sequence "<script>"`: the whole timed script in ONE call, played in-engine.
+
+    `hold` / `axis` start counting when the call ARRIVES, and the CLI-to-engine hop adds 0.2-0.6 s
+    of jitter to that, so nothing under ~1.5 s could be timed from outside. Here the script is
+    parsed on this side, shipped as JSON, and the plugin plays it from a core ticker against the
+    client's WORLD time: every offset is relative to arrival (or to --at), so the round trip stops
+    mattering. Returns as soon as the script is scheduled; --wait blocks until it has played out
+    and reports how far from the script each step actually fired."""
+    from . import input_script
+
+    t0 = time.monotonic()
+    text = args.script
+    if args.file:
+        try:
+            with open(args.file, encoding="utf-8") as fh:
+                text = fh.read()
+        except OSError as exc:
+            _emit({"ok": False, "action": "sequence", "error": f"cannot read --file: {exc}"})
+            return 1
+    try:
+        steps = input_script.parse_script(text)
+    except (ValueError, json.JSONDecodeError) as exc:
+        _emit({"ok": False, "action": "sequence", "pressed": False, "error": str(exc)})
+        return 1
+    total = max(s["end"] for s in steps)
+    body: dict = {"ok": True, "action": "sequence", "steps": steps}
+    if args.dry_run:
+        body["dry_run"] = True
+        body["total_seconds"] = total
+        _emit(body)
+        return 0
+    try:
+        body.update(_rc_json("RunInputSequence",
+                             {"ScriptJson": json.dumps({"steps": steps}), "StartAt": args.at or ""},
+                             args.project, needs=_NEEDS_SEQUENCE))
+        if body.get("ok"):
+            for s in steps:     # so a plain `hold` right after sees the keys as taken
+                _hold_ledger_note(args.project, s["key"], float(s["end"]) + 1.0,
+                                  getattr(args, "agent", None))
+            if args.wait:
+                lead = float(body.get("starts_in_seconds") or 0.0)
+                deadline = time.monotonic() + lead + total + 5.0
+                time.sleep(lead + total)
+                summary: dict = {"state": "running"}
+                while True:
+                    log = _rc_json("GetInputSequenceLog", {}, args.project, needs=_NEEDS_SEQUENCE)
+                    summary = _sequence_summary(log, body.get("sequence"))
+                    if summary.get("state") != "running" or time.monotonic() > deadline:
+                        break
+                    time.sleep(0.1)
+                body["playback"] = summary
+                body["waited"] = True
+                _hold_ledger_clear(args.project)
+                if summary.get("state") != "done" or summary.get("failures"):
+                    body["ok"] = False
+                    body["error"] = f"the script did not play out cleanly: {summary.get('state')}"
+            else:
+                body["note"] = (f"{body.get('note', '')} Scheduled for ~{total:.2f}s; it is NOT "
+                                f"blocking. --wait blocks and reports playback error; `uap input "
+                                f"sequence-status` reads it any time.").strip()
+    except (AgentError, json.JSONDecodeError) as exc:
+        body = _err(exc)
+    _capture("input:sequence", {"script": text, "at": args.at}, body, int((time.monotonic() - t0) * 1000))
+    _emit(body)
+    return 0 if body.get("ok") else 1
+
+
 def _input(args) -> int:
     """Sustained input. A single injected event cannot drive locomotion: the CLI round-trip is
     ~1s and a latched key is silently dropped by any FlushPressedKeys, so the plugin re-asserts
@@ -1541,6 +1627,8 @@ def _input(args) -> int:
     knowable, and a hold that would overlap one already running is REFUSED unless --overlap.
     See _hold_conflict."""
     sub = args.input_cmd
+    if sub == "sequence":
+        return _input_sequence(args)
     t0 = time.monotonic()
     body: dict = {"ok": True, "action": sub}
     try:
@@ -1581,6 +1669,8 @@ def _input(args) -> int:
             body.update(_rc_json("ReleaseHeldInput", {"KeyName": args.key or ""}, args.project,
                                  needs=_NEEDS_HOLD))
             _hold_ledger_clear(args.project, args.key or "")
+        elif sub == "sequence-status":
+            body.update(_rc_json("GetInputSequenceLog", {}, args.project, needs=_NEEDS_SEQUENCE))
         elif sub == "clients":
             body.update(_rc_json("ListClients", {}, args.project,
                                  needs="listing the PIE clients you can target with --client"))
@@ -2653,6 +2743,25 @@ SUSTAINED INPUT (a single injected event CANNOT drive locomotion -- see below)
                                        the only route an analog/virtual cursor or any
                                        RegisterInputPreProcessor handler can see. Without it
                                        the sample goes to the game viewport, BELOW Slate
+  uap input sequence "<script>"        a whole TIMED script in ONE call, played IN-ENGINE against
+                                       world time -- THE WAY TO HIT A TIMING WINDOW (< ~1.5 s: a
+                                       vanishing platform, an obstacle gap, a jump 0.85 s into a run).
+                                       `hold`/`axis` start when the call ARRIVES, and the CLI hop
+                                       adds 0.2-0.6 s of jitter to that; a sequence does not, every
+                                       offset is relative to arrival. Statements split on ; or newline:
+                                         hold <Key> 0-2.0s | hold <Key> at 0 for 2
+                                         press <Key> at 0.85s [for 0.1s]   (0.1 s down by default)
+                                         axis <Key> <v> 0-2s
+                                       e.g.  uap input sequence "hold W 0-2.0s; press SpaceBar at 0.85s"
+                                       --at +1.5 starts 1.5 s after arrival (pinned in-engine), --at
+                                       412.7 at that absolute world time, --wait blocks and reports
+                                       playback.max_error_ms, --dry-run only parses. Returns at once
+                                       otherwise. Same keys, same hold registry: `input status` shows
+                                       the steps, `input release` cancels the rest of the script.
+                                       One key cannot overlap itself; a key already held is refused.
+                                       Needs a plugin build that has RunInputSequence.
+  uap input sequence-status            when each step of recent scripts ACTUALLY fired: world time,
+                                       frame, start_error_ms (0 .. one frame, never early)
   uap input release                    RECOVERY: release every hold AND flush any key the
                                        engine still has down (clears a stuck key without a
                                        PIE restart). Run it if input starts behaving oddly.
@@ -3384,6 +3493,27 @@ def build_parser() -> argparse.ArgumentParser:
     ir = inps.add_parser("release", parents=[proj], help="end a hold early (default: all holds)")
     ir.add_argument("key", nargs="?", default="", help="FKey name; omit to release everything")
     ir.set_defaults(func=_input)
+    isq = inps.add_parser("sequence", parents=[proj],
+                          help="play a whole TIMED input script in-engine (exact timing)")
+    isq.add_argument("script", nargs="?", default="",
+                     help='e.g. "hold W 0-2.0s; press SpaceBar at 0.85s". Statements split on ; or '
+                          'newline: hold <Key> A-B | hold <Key> at A for D | press <Key> at T '
+                          '[for D] | axis <Key> <v> A-B. Times are seconds after the start '
+                          '(0.85, 0.85s, 850ms). JSON ({"steps":[...]}) also accepted')
+    isq.add_argument("--file", default=None, help="read the script from a file instead")
+    isq.add_argument("--at", default=None, metavar="WHEN",
+                     help="when the script's 0 is: omitted = the moment the call lands in the "
+                          "engine; +1.5 = 1.5 s after it lands (pinned in-engine); 412.7 = an "
+                          "absolute WORLD time of that client")
+    isq.add_argument("--wait", action="store_true",
+                     help="block until the script has played out, then report how far from the "
+                          "script each step actually fired (playback.max_error_ms)")
+    isq.add_argument("--dry-run", dest="dry_run", action="store_true",
+                     help="parse and print the steps; send nothing")
+    isq.set_defaults(func=_input)
+    inps.add_parser("sequence-status", parents=[proj],
+                    help="recent scripts: when each step ACTUALLY fired (error in ms, frame)"
+                    ).set_defaults(func=_input)
     inps.add_parser("status", parents=[proj],
                     help="what is currently held and for how much longer").set_defaults(func=_input)
     inps.add_parser("clients", parents=[proj],

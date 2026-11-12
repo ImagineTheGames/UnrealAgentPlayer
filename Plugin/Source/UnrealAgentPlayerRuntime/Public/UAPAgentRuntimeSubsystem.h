@@ -61,6 +61,13 @@ public:
     UFUNCTION(BlueprintCallable, Category="Agent|Input") FString HoldAxis(FString AxisKeyName, float Value, float Seconds, FString SlateUser, FString Client);
     UFUNCTION(BlueprintCallable, Category="Agent|Input") FString ReleaseHeldInput(FString KeyName, FString Client);
     UFUNCTION(BlueprintCallable, Category="Agent|Input") FString GetHeldInput(FString Client);
+    // Timed input script: the whole thing in ONE call, played in-engine against world time, so the
+    // CLI round trip (0.2-0.6 s of jitter on `HoldKey`) cannot move a step [17tm466zqax].
+    // ScriptJson {"steps":[{"kind":"hold"|"axis","key","value","start","end"}]} (seconds after 0);
+    // StartAt "" = now, "+x" = x s after arrival, "x" = absolute world time. GetInputSequenceLog
+    // answers when each step ACTUALLY fired (start_error_ms, frame), for measuring the playback.
+    UFUNCTION(BlueprintCallable, Category="Agent|Input") FString RunInputSequence(FString ScriptJson, FString StartAt, FString Client);
+    UFUNCTION(BlueprintCallable, Category="Agent|Input") FString GetInputSequenceLog(FString Client);
     UFUNCTION(BlueprintCallable, Category="Agent|Input") bool InjectXRControllerPose(EAgentXRHand Hand, FVector Position, FRotator Orientation, bool bTracked);
     UFUNCTION(BlueprintCallable, Category="Agent|Input") bool ClearXRControllerOverride(EAgentXRHand Hand);
     // Opt-in aim-pose emulation (OFF by default) and the injected controllers' state. Same

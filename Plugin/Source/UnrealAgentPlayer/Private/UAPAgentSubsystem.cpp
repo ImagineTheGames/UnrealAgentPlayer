@@ -509,6 +509,17 @@ FString UUAPAgentSubsystem::ReleaseHeldInput(FString KeyName, FString Client)
     return FAgentInput::ForEachClientJson(Client, [&]() { return FAgentInput::ReleaseHeldJson(KeyName); });
 }
 
+FString UUAPAgentSubsystem::RunInputSequence(FString ScriptJson, FString StartAt, FString Client)
+{
+    UAP_ACTIVITY(TEXT("input sequence"), FString());
+    return FAgentInput::ForEachClientJson(Client, [&]() { return FAgentInput::RunSequenceJson(ScriptJson, StartAt); });
+}
+
+FString UUAPAgentSubsystem::GetInputSequenceLog(FString Client)
+{
+    return FAgentInput::ForEachClientJson(Client, []() { return FAgentInput::GetSequenceLogJson(); });
+}
+
 FString UUAPAgentSubsystem::GetHeldInput(FString Client)
 {
     // Several clients -> one envelope per client, so a caller can see which client holds what.
