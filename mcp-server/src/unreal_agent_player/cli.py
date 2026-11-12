@@ -2367,13 +2367,31 @@ def _screenshot_body(file: str, exists: bool) -> dict:
         return {"ok": True, "exists": True, "path": file}
     return {
         "ok": False, "exists": False, "path": file,
-        "error": ("screenshot not written: CaptureViewportWithUI renders on the next game "
-                  "frame, but an idle editor viewport never renders one. Requires active PIE "
-                  "(uap pie start) / a renderable frame."),
+        "error": ("screenshot not written: the editor never produced the file. In PIE that means "
+                  "no frame rendered (check `uap sample` hz); with no PIE the level viewport is "
+                  "captured by `CaptureLevelViewport`, so this plugin copy is probably older than "
+                  "this CLI: sync and rebuild the project (Restart-Editor.ps1). If the path was "
+                  "relative, pass an ABSOLUTE .png path."),
     }
 
 
 _MAX_FRAMES = 60
+
+
+def _add_level_pose_args(p) -> None:
+    """The level-viewport pose flags shared by `screenshot` and `viewport pose`."""
+    p.add_argument("--pane", default=None,
+                   help="level viewport pane: omitted/auto = the ACTIVE pane if perspective, else the "
+                        "first perspective one; active; first-perspective (the pane Python "
+                        "set_level_viewport_camera_info moves); or a pane key / unique suffix (Viewport1)")
+    p.add_argument("--location", default=None, help="camera location X,Y,Z (cm)")
+    p.add_argument("--rotation", default=None,
+                   help="camera rotation PITCH,YAW,ROLL in degrees (NOT unreal.Rotator order)")
+    p.add_argument("--look-at", dest="look_at", default=None,
+                   help="aim the camera at world X,Y,Z from --location (or the current location)")
+    p.add_argument("--fov", type=float, default=None, help="horizontal field of view, degrees")
+    p.add_argument("--draw-frames", dest="draw_frames", type=int, default=None,
+                   help="frames to draw before the readback (default 3; 1..30)")
 
 
 def _window_frame_paths(file: str, frames: int) -> list[str]:
@@ -2540,17 +2558,96 @@ def _window_screenshot(args) -> int:
     return _done(body)
 
 
+def _csv_floats(text: str, n: int, what: str) -> list[float]:
+    try:
+        vals = [float(p) for p in str(text).replace(";", ",").split(",")]
+    except ValueError:
+        vals = []
+    if len(vals) != n:
+        raise AgentError(ErrorCode.SCHEMA_VALIDATION,
+                         f"{what} must be {n} comma-separated numbers, got {text!r}",
+                         recoverable=False)
+    return vals
+
+
+def _level_pose_json(args) -> dict:
+    """The level-viewport pose request the plugin takes (see CaptureLevelViewport).
+
+    Rotation is PITCH,YAW,ROLL in degrees. NOT `unreal.Rotator(a, b, c)`, whose positional order
+    is (roll, pitch, yaw) -- that mix-up aimed a whole pose set at the sky (17tm466ft2k)."""
+    req: dict = {}
+    if getattr(args, "location", None):
+        req["location"] = _csv_floats(args.location, 3, "--location")
+    if getattr(args, "rotation", None):
+        req["rotation"] = _csv_floats(args.rotation, 3, "--rotation")
+    if getattr(args, "look_at", None):
+        req["look_at"] = _csv_floats(args.look_at, 3, "--look-at")
+    if getattr(args, "rotation", None) and getattr(args, "look_at", None):
+        raise AgentError(ErrorCode.SCHEMA_VALIDATION,
+                         "--rotation and --look-at both set the camera direction; pass one",
+                         recoverable=False)
+    if getattr(args, "fov", None) is not None:
+        req["fov"] = float(args.fov)
+    if getattr(args, "pane", None):
+        req["pane"] = args.pane
+    if getattr(args, "draw_frames", None):
+        req["frames"] = int(args.draw_frames)
+    return req
+
+
+def _wants_level_viewport(args) -> bool:
+    return bool(getattr(args, "editor", False) or getattr(args, "pane", None)
+                or getattr(args, "location", None) or getattr(args, "rotation", None)
+                or getattr(args, "look_at", None) or getattr(args, "fov", None) is not None)
+
+
+def _screenshot_level_viewport(args, out_path: str) -> dict:
+    """Capture the LEVEL EDITOR viewport (no PIE needed, no focus needed).
+
+    The plugin draws the pane itself and reads the pixels back in one call, so nothing waits for
+    a frame an idle or unfocused editor never renders. The pose (if any) is applied, read back and
+    captured on ONE pane inside that single call -- never as two calls an active-pane change could
+    split (17tm466fv84)."""
+    pose = _level_pose_json(args)
+    body = _rc_json("CaptureLevelViewport",
+                    {"Filename": out_path, "PoseJson": json.dumps(pose) if pose else ""},
+                    args.project,
+                    needs="capturing the LEVEL EDITOR viewport with no PIE (the plugin draws the "
+                          "pane itself; an older plugin only queues a frame an idle editor never renders)")
+    body["path"] = body.get("path") or out_path
+    body["exists"] = bool(body.get("ok")) and os.path.exists(out_path)
+    if body.get("ok") and not body["exists"]:
+        body["ok"] = False
+        body["error"] = f"plugin reported ok but {out_path} does not exist"
+    return body
+
+
 def _screenshot(args) -> int:
     if getattr(args, "window", None):
         return _window_screenshot(args)
     t0 = time.monotonic()
     try:
-        _rc_require("CaptureViewportWithUI", {"Filename": args.file}, args.project,
-                    "capturing the viewport WITH its UMG/Slate UI")
-        deadline = time.monotonic() + 8.0
-        while time.monotonic() < deadline and not os.path.exists(args.file):
-            time.sleep(0.25)
-        body = _screenshot_body(args.file, os.path.exists(args.file))
+        # The ENGINE writes this file relative to ITS working directory, while this process polls
+        # relative to ITS OWN: a relative path is checked in the wrong place and reads as "no
+        # frame rendered" (ClickUp 17tm466ft2k, Prom report). Always hand the engine an absolute path.
+        args.file = os.path.abspath(args.file)
+        level = _wants_level_viewport(args)
+        if not level:
+            # No flags: PIE -> the PIE game viewport (unchanged). No PIE -> the level viewport,
+            # because the PIE path would have queued a frame the idle editor never draws.
+            try:
+                level = not bool(_rc_call("IsInPIE", {}, args.project))
+            except AgentError:
+                level = False
+        if level:
+            body = _screenshot_level_viewport(args, args.file)
+        else:
+            _rc_require("CaptureViewportWithUI", {"Filename": args.file}, args.project,
+                        "capturing the viewport WITH its UMG/Slate UI")
+            deadline = time.monotonic() + 8.0
+            while time.monotonic() < deadline and not os.path.exists(args.file):
+                time.sleep(0.25)
+            body = _screenshot_body(args.file, os.path.exists(args.file))
         body["caption"] = args.caption
         if body.get("exists"):
             # Stamp which editor this shot came from, so report finish can reject a pass whose
@@ -2563,11 +2660,34 @@ def _screenshot(args) -> int:
     return 0 if body["ok"] else 1
 
 
+def _viewport(args) -> int:
+    """`uap viewport pose ...`: set (and always read back) the LEVEL EDITOR viewport pose, on the
+    SAME pane `uap screenshot` captures. `unreal.get_editor_subsystem(UnrealEditorSubsystem)
+    .set_level_viewport_camera_info` moves the FIRST PERSPECTIVE pane while a capture takes the
+    ACTIVE one, so in a multi-pane layout the two silently disagree (17tm466fv84)."""
+    t0 = time.monotonic()
+    try:
+        pose = _level_pose_json(args)
+        body = _rc_json("LevelViewportPose", {"PoseJson": json.dumps(pose) if pose else ""},
+                        args.project, needs="reading/setting the LEVEL EDITOR viewport pose")
+    except AgentError as exc:
+        body = _err(exc)
+    _capture("viewport", {k: v for k, v in vars(args).items() if k not in ("func",)}, body,
+             int((time.monotonic() - t0) * 1000))
+    _emit(body)
+    return 0 if body.get("ok") else 1
+
+
 _HELP_CATALOG = r"""uap -- drive the Unreal editor for agent testing. Commands target the
 editor named by --project (default $UAP_PROJECT, pinned by this project's uap.ps1 launcher).
 
 COMMON MISTAKES (don't)
   * Screenshots: use `uap screenshot <abs.png>` (composites 3D + UMG + CommonUI + Slate).
+    With NO PIE it captures the LEVEL EDITOR viewport (drawn in-engine: no PIE, no focus, no
+    waiting for a frame). Aim it in the SAME call: `--location X,Y,Z --look-at X,Y,Z` or
+    `--location ... --rotation PITCH,YAW,ROLL`; `uap viewport pose` sets/reads the same pane.
+    NEVER set the pose with Python `set_level_viewport_camera_info` and shoot in another call:
+    that moves the first perspective pane, the shot takes the ACTIVE one.
     HighResShot and most MCP screenshot tools capture the 3D SCENE ONLY (no UI). Missing UI
     in a shot = wrong tool, not "UI can't be captured."
   * Targeting: run via this project's uap.ps1 (it pins UAP_PROJECT). Calling the venv python
@@ -3006,6 +3126,7 @@ _HELP_SECTIONS = {
     "exec-file": ("DRIVE + OBSERVE",), "read-ui": ("DRIVE + OBSERVE",),
     "click": ("DRIVE + OBSERVE",), "tab": ("DRIVE + OBSERVE",), "nav": ("DRIVE + OBSERVE",),
     "screenshot": ("DRIVE + OBSERVE",), "helpers": ("DRIVE + OBSERVE",),
+    "viewport": ("DRIVE + OBSERVE",),
     "instances": ("DRIVE + OBSERVE", "FLAGS:"),
     "input": ("SUSTAINED INPUT", "MOUSE"),
     "mouse": ("MOUSE",),
@@ -3056,7 +3177,7 @@ def _help(args) -> int:
 
 # Editor-touching verbs auto-wait while another agent is rebuilding this editor (see main()).
 _REBUILD_GUARDED = {"status", "rc", "exec", "exec-file", "pie",
-                    "read-ui", "click", "tab", "nav", "screenshot",
+                    "read-ui", "click", "tab", "nav", "screenshot", "viewport",
                     "input", "xr", "sample", "log", "helpers"}
 
 # ...and additionally wait out ANY other agent's exclusive lease (pie / level / rebuild).
@@ -3086,7 +3207,7 @@ _RC_PIE_STOP = {"StopPIE", "StopPIEEx"}
 _RC_FOREGROUND = {"InjectKey", "InjectAxis", "InjectGamepad", "InjectMouseButton",
                   "InjectMouseMove", "SetMousePosition", "ClickMouse", "HoldKey", "HoldAxis",
                   "InjectXRButton", "InjectXRControllerPose", "NavigateUI", "SelectTab",
-                  "CaptureViewportWithUI", "DumpViewportUI"}
+                  "CaptureViewportWithUI", "CaptureLevelViewport", "DumpViewportUI"}
 
 # `uap exec` / `exec-file` stay ungated (they are the generic transport), EXCEPT for Python that
 # requests a play session: that is a `pie start` by another name and holds the machine the same
@@ -3449,9 +3570,18 @@ def build_parser() -> argparse.ArgumentParser:
                          "Ambiguous matches are refused with the candidates listed.")
     sc.add_argument("--frames", type=int, default=1,
                     help=f"with --window: capture N frames (1..{_MAX_FRAMES}) as motion proof")
+    sc.add_argument("--editor", action="store_true",
+                    help="capture the LEVEL EDITOR viewport even while PIE runs (default with no PIE)")
+    _add_level_pose_args(sc)
     sc.add_argument("--interval-ms", dest="interval_ms", type=int, default=500,
                     help="with --window --frames: milliseconds between frames (default 500)")
     sc.set_defaults(func=_screenshot)
+    vp = sub.add_parser("viewport", help="level editor viewport pose (same pane `screenshot` captures)")
+    vps = vp.add_subparsers(dest="viewport_cmd", required=True)
+    vpp = vps.add_parser("pose", parents=[proj],
+                         help="set (when a pose flag is given) and ALWAYS read back the pose + pane")
+    _add_level_pose_args(vpp)
+    vpp.set_defaults(func=_viewport)
 
     # Sustained input. The plugin re-asserts the input every frame in-engine for the duration,
     # which is the only way to hold anything across a ~1s CLI round-trip -- and the only way to
@@ -3831,7 +3961,7 @@ def _batch(args) -> int:
         buf = io.StringIO()
         try:
             with contextlib.redirect_stdout(buf):
-                code = _batch_run_step(parser.parse_args(argv))
+                code = _batch_run_step(parser.parse_args(_glue_negative_vectors(list(argv))))
         except SystemExit as exc:            # argparse refused the step's own arguments
             code = int(exc.code or 2)
         except Exception as exc:             # a bad step must not kill the whole batch
@@ -4071,6 +4201,28 @@ def _timing_report(args) -> int:
     return 0
 
 
+# Vector flags whose value routinely starts with a minus (a pitch of -12, a world X of -6000).
+# argparse reads "-12,90,0" as an unknown OPTION, so `--rotation -12,90,0` dies with "expected one
+# argument" -- on the very first downward-looking camera.
+_VECTOR_FLAGS = frozenset({"--location", "--rotation", "--look-at"})
+_NEGATIVE_VECTOR = re.compile(r"^-(?:\d|\.\d)[\d.,;eE+\- ]*$")
+
+
+def _glue_negative_vectors(argv: list[str]) -> list[str]:
+    """`--rotation -12,90,0` -> `--rotation=-12,90,0` so argparse takes it as the flag's value."""
+    out: list[str] = []
+    i = 0
+    while i < len(argv):
+        tok = argv[i]
+        if tok in _VECTOR_FLAGS and i + 1 < len(argv) and _NEGATIVE_VECTOR.match(argv[i + 1]):
+            out.append(f"{tok}={argv[i + 1]}")
+            i += 2
+            continue
+        out.append(tok)
+        i += 1
+    return out
+
+
 def main(argv: list[str] | None = None) -> int:
     t_start = time.time()
     m0 = time.monotonic()
@@ -4080,7 +4232,8 @@ def main(argv: list[str] | None = None) -> int:
     args = None
     rc = 1
     try:
-        args = build_parser().parse_args(argv)
+        args = build_parser().parse_args(
+            _glue_negative_vectors(list(sys.argv[1:] if argv is None else argv)))
         rc = _run_parsed(args)
         return rc
     except SystemExit as exc:

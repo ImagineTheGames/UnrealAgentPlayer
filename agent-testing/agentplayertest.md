@@ -40,6 +40,8 @@ These are the errors agents make every time. Don't.
    (`uap read-ui` / a state read) and assert on it -- never attach pixels you didn't verify.
    (`report finish pass` with no verified shot auto-downgrades to FAIL. Opt out only for a
    genuinely headless check: `report start --no-require-screenshot`.)
+   With NO PIE running it captures the LEVEL EDITOR viewport (drawn in-engine: no PIE, no focus); aim it in the
+   same call with `--location X,Y,Z --look-at X,Y,Z` (see trap 6).
    A standalone `-game` client is not in the editor viewport: capture it with
    `uap screenshot <abs.png> --window <Context_N | pid:N | title>` (add `--frames N --interval-ms M`
    for a motion burst). It is stamped with the client's process, project and Dev Auth context and
@@ -82,7 +84,7 @@ These are the errors agents make every time. Don't.
    exactly what left PIE running unattended. Never poll with `exec`, and never invent a waiting
    strategy of your own.
 
-## Layer mismatches -- five traps that silently give you a WRONG answer
+## Layer mismatches -- six traps that silently give you a WRONG answer
 
 **Three of these five are the same headline risk: input you injected silently never arrives.**
 Say that once, plainly, rather than leaving a reader to infer it across five entries -- it is the
@@ -276,6 +278,23 @@ wrote it down -- no cleverness involved.")
 - **It refuses loudly now:** a `--user` Slate has no registered user for is rejected with the
   registered indices listed, rather than discarded. A silent discard is worse than a missing
   verb: a missing verb 404s and someone notices.
+
+
+### 6. An editor-viewport operation split across two `uap exec` calls can hit a DIFFERENT pane
+
+- **Failure mode:** you set the level-viewport camera in one call and capture in the next. The editor
+  can have several panes (four-pane layout). `UnrealEditorSubsystem.set_level_viewport_camera_info`
+  moves the FIRST PERSPECTIVE pane; a capture takes the ACTIVE one. Both calls report success and the
+  image looks plausible -- but it is another camera (a "tennis court" shot that was really the plaza:
+  28 per channel of fictitious difference, versus the real 2.5). Reading the camera back does not catch
+  it, because the read-back targets whatever pane that API picks.
+- **Do instead:** pose and capture in ONE call: `uap screenshot <abs.png> --location X,Y,Z --look-at
+  X,Y,Z` (or `--rotation PITCH,YAW,ROLL`). `uap viewport pose` sets/reads the same pane. The result
+  names the pane and warns when it is not the one the Python API moves. With no PIE this needs no focus
+  and no waiting: the plugin draws the pane itself.
+- **Worth knowing:** any other editor-viewport operation (orbit, FOV, pilot, show flags) split across
+  two calls has the same exposure. `unreal.Rotator(a, b, c)` is (roll, pitch, yaw): a wrong order aimed a
+  whole pose set at the sky.
 
 ## One observation is not a property of the system
 

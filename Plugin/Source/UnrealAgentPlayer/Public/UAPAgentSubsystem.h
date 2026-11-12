@@ -256,11 +256,26 @@ public:
     bool NavigateUI(FString Direction);
 
     // Requests a screenshot of the composited game backbuffer INCLUDING the UMG/Slate
-    // overlay (unlike HighResShot, which captures only the 3D scene). The engine writes
-    // the PNG to Filename on the next rendered frame; poll for the file. Filename should
-    // be an absolute path ending in .png. Returns false if no request could be made.
+    // overlay (unlike HighResShot, which captures only the 3D scene). In PIE the PNG exists when
+    // this returns; with no PIE it falls back to CaptureLevelViewport (also synchronous).
+    // Filename should be an absolute path ending in .png. Returns false on failure.
     UFUNCTION(BlueprintCallable, Category="Agent|Capture")
     bool CaptureViewportWithUI(FString Filename);
+
+    // LEVEL EDITOR viewport (no PIE needed, no focus needed, no waiting for a frame). Draws the
+    // pane itself and reads the pixels back, so the PNG exists when this returns. PoseJson is
+    // optional: {"location":[x,y,z], "rotation":[pitch,yaw,roll] | "look_at":[x,y,z],
+    // "fov":deg, "pane":""|"active"|"first-perspective"|<key>, "frames":N}. The pose is applied,
+    // read back and captured on the SAME pane inside this one call. Returns JSON:
+    // {ok, path, width, height, pane, pane_is_active, pane_is_unreal_editor_subsystem_pane, panes[],
+    //  location, rotation_pitch_yaw_roll, fov, pose_applied, warning?} or {ok:false, error}.
+    UFUNCTION(BlueprintCallable, Category="Agent|Capture")
+    FString CaptureLevelViewport(FString Filename, FString PoseJson);
+
+    // Sets (when PoseJson has location/rotation/look_at/fov) and always reads back the level
+    // viewport pose, on the pane the capture would use. Same PoseJson + result as above.
+    UFUNCTION(BlueprintCallable, Category="Agent|Capture")
+    FString LevelViewportPose(FString PoseJson);
 
     // --- Python remote-exec hygiene --------------------------------------------------------
     // Drops every global in the Python remote-exec interpreter that could root a UObject.
