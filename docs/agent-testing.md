@@ -108,6 +108,22 @@ bone delta, log line) settle a question -- never a screenshot alone.
   it is held; `--wait` blocks instead. All four return JSON, so a refusal says why -- and a
   refused call presses nothing. Bare `uap input release` is the RECOVERY hatch: it clears every
   hold AND flushes any key the engine still has down, so a stuck key never needs a PIE restart.
+- `uap input sequence "<script>"` -- **a whole timed script in ONE call, played in-engine against world
+  time. Use it for any timing window under ~1.5 s** (a vanishing platform, an obstacle gap, a jump
+  0.85 s into a run). `hold`/`axis` start counting when the call ARRIVES, and the CLI-to-engine hop adds
+  0.2-0.6 s of jitter to that, so two CLI calls cannot be timed against each other. A sequence parses the
+  script on the CLI side, ships it as JSON, and the plugin plays it from a core ticker (RunInputSequence),
+  so every offset is relative to arrival and the round trip stops mattering. Example:
+  `uap input sequence "hold W 0-2.0s; press SpaceBar at 0.85s"`. Statements split on `;` or a newline:
+  `hold <Key> A-B` | `hold <Key> at A for D` | `hold <Key> from A to B` | `press <Key> at T [for D]`
+  (0.1 s down by default) | `axis <Key> <v> A-B`; times are seconds (`0.85`, `0.85s`) or `850ms`.
+  `--at +1.5` pins the start 1.5 s after arrival (in-engine), `--at 412.7` at that absolute world time,
+  `--wait` blocks and reports `playback.max_error_ms`, `--dry-run` only parses. It returns at once by
+  default. `uap input sequence-status` shows when each step ACTUALLY fired (world time, frame,
+  `start_error_ms`: 0 up to one frame, never early). A step is delivered on the first game-thread tick
+  at or after its time, so the bound is one frame. Steps live in the same hold registry as `input hold`
+  (`input status` shows them; `input release` cancels the rest of the script). One key cannot overlap
+  itself and a key already held is refused; the whole script is validated before anything is pressed.
 - `uap sample start <object> <property> --seconds N` / `uap sample read` -- record a property
   once per frame in-engine and get the series plus `delta_mean`/`delta_max`/`delta_p95`/`hz`.
   This is how you measure anything sub-second (judder, a 0.6s wind-up, a one-frame pop);

@@ -107,6 +107,8 @@ So the plugin holds the input **in-engine**, re-asserting it once per frame on t
 | `HoldAxis` | `uap input axis <AxisKey> <v> --seconds N [--user N]` | `AxisKeyName`, `Value`, `Seconds`, `SlateUser` | **The VR locomotion verb** — e.g. `OculusTouch_Left_Thumbstick_Y 1.0`. |
 | `ReleaseHeldInput` | `uap input release [<Key>]` | `KeyName` (empty = **recovery**) | See below. |
 | `GetHeldInput` | `uap input status` | — | `{"held":[{key, analog, value, remaining_seconds, down, route, user_index}]}` |
+| `RunInputSequence` | `uap input sequence "<script>" [--at WHEN] [--wait] [--dry-run]` | `ScriptJson`, `StartAt`, `Client` | A whole **timed** script in one call, played in-engine against world time (see below). |
+| `GetInputSequenceLog` | `uap input sequence-status` | `Client` | When each step of recent scripts actually fired. |
 
 All four return a JSON envelope so a refusal can say *why*. Key names are exact FKeys resolved against **the engine's own registry** (`FKey::IsValid`) — `W`, `C`, `LeftControl`, `SpaceBar`, `Gamepad_LeftY`, `OculusTouch_Left_Thumbstick_Y` all work; there is no hand-maintained allow-list to drift out of date.
 
@@ -133,6 +135,14 @@ with no error at all, which reads as a broken feature; that cost a live investig
 `InjectAxis` and `InjectGamepad` take the same `SlateUser` parameter. It is a **string** because
 RemoteControl builds the argument struct zero-initialised: an omitted `int32` would arrive as `0`,
 a valid index, and would silently move every existing call onto the Slate route.
+
+**Timed scripts (`uap input sequence`).** `HoldKey`/`HoldAxis` start counting when the call *arrives*, and the CLI-to-engine hop adds 0.2-0.6 s of jitter to that, so anything under ~1.5 s (a vanishing platform, an obstacle gap, a jump 0.85 s into a run) could not be timed from outside. `RunInputSequence` takes the whole script in one call:
+
+```
+uap input sequence "hold W 0-2.0s; press SpaceBar at 0.85s"
+```
+
+`ScriptJson` is `{"steps":[{"kind":"hold"|"axis","key":"W","value":1.0,"start":0.0,"end":2.0}, ...]}` (seconds after the script's 0; the CLI parses the friendlier text grammar for you — `hold <Key> A-B`, `hold <Key> at A for D`, `press <Key> at T [for D]`, `axis <Key> <v> A-B`, times in `s` or `ms`). `StartAt`: `""` = the moment the call lands, `"+1.5"` = 1.5 s after it lands (pinned in-engine), `"412.7"` = an absolute world time of that client (the reply carries `arrival_world_time`). The plugin validates the whole script before pressing anything, then plays it from a core ticker against the client's **world time** (a paused world pauses the script). A step fires on the first game-thread tick at or after its time, so the playback error is 0 up to one frame, never early; `GetInputSequenceLog` records it per step (`start_error_ms`, `start_frame`, `start_frame_ms`, world and real time). Steps use the `HoldKey`/`HoldAxis` registry, so `GetHeldInput` shows them and `ReleaseHeldInput` cancels the rest of the script. Two steps on one key may not overlap; a key already held is refused; at most 64 steps and 300 s.
 
 `uap input hold/axis` returns **immediately** by default — the hold continues in-engine, which is the point: you read game state *while* it is held. Pass `--wait` to block until it expires.
 

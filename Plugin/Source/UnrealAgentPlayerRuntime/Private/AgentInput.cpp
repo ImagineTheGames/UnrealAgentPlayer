@@ -725,6 +725,482 @@ namespace
     }
 }
 
+// --- Timed input sequences [17tm466zqax] -------------------------------------------------
+// `hold` / `axis` start counting when the call ARRIVES, and the CLI-to-engine hop adds 0.2-0.6 s
+// of jitter to that, so nothing under ~1.5 s could be timed from outside (vanishing platforms,
+// obstacle gaps, a jump 0.85 s into a run). A sequence ships the WHOLE script in one call and the
+// engine plays it against the target client's WORLD time from a core ticker, so the round trip
+// stops mattering: every offset is relative to the call's arrival (or to an explicit start time).
+// Steps are played with the same hold machinery as `input hold` (registry entry, IE_Repeat every
+// frame, `input status`, `input release`); only their START and END come from the script clock.
+
+namespace
+{
+    struct FUAPSeqStep
+    {
+        FKey   Key;
+        bool   bAnalog = false;
+        float  Value = 0.f;
+        double Start = 0.0;          // scripted offset from T0, seconds
+        double End = 0.0;
+        bool   bStarted = false;
+        bool   bEnded = false;
+        FString Failure;
+        double StartedRel = 0.0;     // world seconds after T0 when it actually fired
+        double EndedRel = 0.0;
+        double StartedReal = 0.0;    // FPlatformTime::Seconds() when it fired
+        double EndedReal = 0.0;
+        uint64 StartedFrame = 0;
+        uint64 EndedFrame = 0;
+        float  StartedDt = 0.f;      // world delta seconds of that frame (the error's yardstick)
+        float  EndedDt = 0.f;
+    };
+
+    struct FUAPSeqEvent
+    {
+        double Time = 0.0;
+        int32  Step = 0;
+        bool   bStart = false;
+    };
+
+    struct FUAPSequence
+    {
+        int32   Id = 0;
+        FString State;               // running | done | cancelled | aborted
+        FString Note;
+        TWeakObjectPtr<UWorld> World;
+        int32   Client = INDEX_NONE;
+        double  T0World = 0.0;       // world time the script's 0 is pinned to
+        double  ArrivalWorld = 0.0;  // world time the call arrived at
+        double  ArrivalReal = 0.0;
+        uint64  ArrivalFrame = 0;
+        double  TotalSeconds = 0.0;
+        TArray<FUAPSeqStep> Steps;
+        TArray<FUAPSeqEvent> Events;
+        int32   Cursor = 0;
+    };
+
+    constexpr double UAPSeqGraceSeconds = 0.25;   // the registry hold outlives its script end by this
+    constexpr int32  UAPSeqMaxSteps = 64;
+    constexpr double UAPSeqMaxSeconds = 300.0;
+    constexpr int32  UAPSeqHistory = 8;
+
+    TArray<FUAPSequence> GSeqActive;
+    TArray<FUAPSequence> GSeqHistory;
+    int32 GSeqNextId = 1;
+    FTSTicker::FDelegateHandle GSeqTicker;
+    bool GSeqReleasing = false;   // the script itself is releasing a step: that must not cancel the script
+
+    /** Keep the registry's own expiry just ahead of the script end, so `input status` reads true
+        and a paused world (world time stops, real time does not) never lets the hold lapse. */
+    void UAPSeqRefreshHold(const FUAPSeqStep& Step, UWorld* World, double RelNow)
+    {
+        for (FUAPHeldInput& H : GHeldInputs)
+        {
+            if (H.Key == Step.Key && H.World.Get() == World)
+            {
+                H.EndRealTime = FPlatformTime::Seconds() + FMath::Max(0.0, Step.End - RelNow) + UAPSeqGraceSeconds;
+            }
+        }
+    }
+
+    void UAPSeqStartStep(FUAPSequence& Seq, FUAPSeqStep& Step, UWorld* World, double Rel)
+    {
+        Step.bStarted = true;
+        Step.StartedRel = Rel;
+        Step.StartedReal = FPlatformTime::Seconds();
+        Step.StartedFrame = GFrameCounter;
+        Step.StartedDt = World->GetDeltaSeconds();
+        const float HoldSeconds = (float)(FMath::Max(0.0, Step.End - Rel) + UAPSeqGraceSeconds);
+        bool bOk = false;
+        if (!FAgentInput::HasLiveViewport())
+        {
+            Step.Failure = TEXT("no live game viewport is accepting input when this step came due");
+        }
+        else
+        {
+            bOk = Step.bAnalog ? FAgentInput::HoldAxis(Step.Key, Step.Value, HoldSeconds, INDEX_NONE)
+                               : FAgentInput::HoldKey(Step.Key, HoldSeconds);
+            if (!bOk) { Step.Failure = TEXT("the game viewport rejected the input"); }
+        }
+        if (!bOk)
+        {
+            Step.bEnded = true;   // nothing to release, nothing to wait for
+            Step.EndedRel = Rel;
+            Seq.Note = TEXT("a step failed; see its failure field");
+        }
+    }
+
+    void UAPSeqEndStep(FUAPSeqStep& Step, double Rel, UWorld* World)
+    {
+        Step.bEnded = true;
+        Step.EndedRel = Rel;
+        Step.EndedReal = FPlatformTime::Seconds();
+        Step.EndedFrame = GFrameCounter;
+        Step.EndedDt = World->GetDeltaSeconds();
+        GSeqReleasing = true;
+        FAgentInput::ReleaseHeld(Step.Key);   // inside the client scope: only this client's hold
+        GSeqReleasing = false;
+    }
+
+    /** Fire everything that is due. True when the script has played out. */
+    bool UAPSeqPump(FUAPSequence& Seq)
+    {
+        UWorld* World = Seq.World.Get();
+        if (!World)
+        {
+            Seq.State = TEXT("aborted");
+            Seq.Note = TEXT("the client's world went away mid-script");
+            return true;
+        }
+        FAgentWorld::FScope Scope(World);
+        const double Rel = World->GetTimeSeconds() - Seq.T0World;
+        while (Seq.Cursor < Seq.Events.Num() && Seq.Events[Seq.Cursor].Time <= Rel)
+        {
+            const FUAPSeqEvent& E = Seq.Events[Seq.Cursor++];
+            FUAPSeqStep& Step = Seq.Steps[E.Step];
+            if (Step.bEnded && !Step.bStarted) { continue; }   // cancelled before it came due
+            if (E.bStart) { UAPSeqStartStep(Seq, Step, World, Rel); }
+            else if (Step.bStarted && !Step.bEnded) { UAPSeqEndStep(Step, Rel, World); }
+        }
+        for (const FUAPSeqStep& Step : Seq.Steps)
+        {
+            if (Step.bStarted && !Step.bEnded) { UAPSeqRefreshHold(Step, World, Rel); }
+        }
+        if (Seq.Cursor >= Seq.Events.Num())
+        {
+            Seq.State = TEXT("done");
+            return true;
+        }
+        return false;
+    }
+
+    void UAPSeqRetire(int32 ActiveIndex)
+    {
+        GSeqHistory.Add(MoveTemp(GSeqActive[ActiveIndex]));
+        GSeqActive.RemoveAt(ActiveIndex);
+        while (GSeqHistory.Num() > UAPSeqHistory) { GSeqHistory.RemoveAt(0); }
+    }
+
+    bool UAPSeqTick(float /*DeltaTime*/)
+    {
+        for (int32 i = GSeqActive.Num() - 1; i >= 0; --i)
+        {
+            if (UAPSeqPump(GSeqActive[i])) { UAPSeqRetire(i); }
+        }
+        if (GSeqActive.Num() == 0)
+        {
+            GSeqTicker.Reset();
+            return false;   // returning false unregisters this ticker
+        }
+        return true;
+    }
+
+    /** Stop scripted steps: those on Key (invalid Key = all of them), on OnlyWorld (nullptr = every
+        world). A step already down is released by the caller (ReleaseHeld), not here. */
+    int32 UAPSeqCancel(FKey Key, UWorld* OnlyWorld)
+    {
+        int32 Cancelled = 0;
+        for (int32 i = GSeqActive.Num() - 1; i >= 0; --i)
+        {
+            FUAPSequence& Seq = GSeqActive[i];
+            if (OnlyWorld && Seq.World.Get() != OnlyWorld) { continue; }
+            bool bTouched = false;
+            bool bAnyLeft = false;
+            for (FUAPSeqStep& Step : Seq.Steps)
+            {
+                if (!Step.bEnded && (!Key.IsValid() || Step.Key == Key))
+                {
+                    Step.bEnded = true;
+                    if (!Step.bStarted) { Step.Failure = TEXT("cancelled before it came due"); }
+                    bTouched = true;
+                }
+                if (!Step.bEnded) { bAnyLeft = true; }
+            }
+            if (!bTouched) { continue; }
+            ++Cancelled;
+            if (!bAnyLeft)
+            {
+                Seq.State = TEXT("cancelled");
+                Seq.Note = TEXT("cancelled by input release");
+                UAPSeqRetire(i);
+            }
+        }
+        return Cancelled;
+    }
+
+    bool UAPSeqNumber(const TSharedPtr<FJsonObject>& Obj, const TCHAR* Field, double& Out, FString& OutError)
+    {
+        if (!Obj->TryGetNumberField(Field, Out))
+        {
+            OutError = FString::Printf(TEXT("has no numeric '%s'"), Field);
+            return false;
+        }
+        return true;
+    }
+}
+
+FString FAgentInput::RunSequenceJson(const FString& ScriptJson, const FString& StartAt)
+{
+    if (!HasLiveViewport())
+    {
+        return UAPRefuse(TEXT("sequence"), TEXT("no live game viewport is accepting input -- start PIE first "
+                                                "(uap pie start), and check the viewport is not ignoring input"));
+    }
+    TSharedPtr<FJsonObject> Root;
+    {
+        TSharedRef<TJsonReader<>> Reader = TJsonReaderFactory<>::Create(ScriptJson);
+        if (!FJsonSerializer::Deserialize(Reader, Root) || !Root.IsValid())
+        {
+            return UAPRefuse(TEXT("sequence"), TEXT("the script is not a JSON object: {\"steps\":[{\"kind\":"
+                                                    "\"hold\",\"key\":\"W\",\"start\":0,\"end\":2}, ...]}"));
+        }
+    }
+    const TArray<TSharedPtr<FJsonValue>>* Raw = nullptr;
+    if (!Root->TryGetArrayField(TEXT("steps"), Raw) || !Raw || Raw->Num() == 0)
+    {
+        return UAPRefuse(TEXT("sequence"), TEXT("the script has no steps"));
+    }
+    if (Raw->Num() > UAPSeqMaxSteps)
+    {
+        return UAPRefuse(TEXT("sequence"), FString::Printf(TEXT("%d steps; the limit is %d"), Raw->Num(), UAPSeqMaxSteps));
+    }
+
+    // Validate EVERYTHING before pressing anything: a refused script has zero side effects.
+    FUAPSequence Seq;
+    for (int32 i = 0; i < Raw->Num(); ++i)
+    {
+        const TSharedPtr<FJsonObject>* StepObj = nullptr;
+        if (!(*Raw)[i]->TryGetObject(StepObj) || !StepObj)
+        {
+            return UAPRefuse(TEXT("sequence"), FString::Printf(TEXT("step %d is not an object"), i));
+        }
+        FUAPSeqStep Step;
+        FString KeyName, Kind;
+        (*StepObj)->TryGetStringField(TEXT("key"), KeyName);
+        (*StepObj)->TryGetStringField(TEXT("kind"), Kind);
+        Step.Key = FKey(*KeyName);
+        if (KeyName.IsEmpty() || !Step.Key.IsValid())
+        {
+            return UAPRefuse(KeyName, FString::Printf(
+                TEXT("step %d: no key named '%s' in this engine's FKey registry. Use the exact FKey "
+                     "name (W, SpaceBar, LeftControl, Gamepad_LeftY, OculusTouch_Left_Thumbstick_Y)."),
+                i, *KeyName));
+        }
+        Step.bAnalog = Kind.Equals(TEXT("axis"), ESearchCase::IgnoreCase);
+        if (!Step.bAnalog && !Kind.Equals(TEXT("hold"), ESearchCase::IgnoreCase))
+        {
+            return UAPRefuse(KeyName, FString::Printf(TEXT("step %d: kind must be 'hold' or 'axis' (got '%s')"), i, *Kind));
+        }
+        if (Step.bAnalog && !Step.Key.IsAnalog())
+        {
+            return UAPRefuse(KeyName, FString::Printf(TEXT("step %d: '%s' is a digital key, not an analog axis"), i, *KeyName));
+        }
+        double Value = 1.0;
+        (*StepObj)->TryGetNumberField(TEXT("value"), Value);
+        Step.Value = (float)Value;
+        FString NumError;
+        if (!UAPSeqNumber(*StepObj, TEXT("start"), Step.Start, NumError) ||
+            !UAPSeqNumber(*StepObj, TEXT("end"), Step.End, NumError))
+        {
+            return UAPRefuse(KeyName, FString::Printf(TEXT("step %d %s"), i, *NumError));
+        }
+        if (Step.Start < 0.0 || Step.End <= Step.Start)
+        {
+            return UAPRefuse(KeyName, FString::Printf(TEXT("step %d: needs 0 <= start < end (got %f..%f)"), i, Step.Start, Step.End));
+        }
+        if (Step.End > UAPSeqMaxSeconds)
+        {
+            return UAPRefuse(KeyName, FString::Printf(TEXT("step %d ends at %f s; the limit is %f"), i, Step.End, UAPSeqMaxSeconds));
+        }
+        Seq.TotalSeconds = FMath::Max(Seq.TotalSeconds, Step.End);
+        Seq.Steps.Add(Step);
+    }
+    // The registry keeps ONE hold per key, so two steps on one key must not overlap in time:
+    // the first one's release would cut the second. Touching (end == start) is fine.
+    for (int32 a = 0; a < Seq.Steps.Num(); ++a)
+    {
+        for (int32 b = a + 1; b < Seq.Steps.Num(); ++b)
+        {
+            const FUAPSeqStep& A = Seq.Steps[a];
+            const FUAPSeqStep& B = Seq.Steps[b];
+            if (A.Key == B.Key && A.Start < B.End && B.Start < A.End)
+            {
+                return UAPRefuse(A.Key.ToString(), FString::Printf(
+                    TEXT("steps %d and %d both drive %s over %f..%f s and %f..%f s; one key can be held "
+                         "once at a time"), a, b, *A.Key.ToString(), A.Start, A.End, B.Start, B.End));
+            }
+        }
+    }
+    // A hold the caller already has running on one of these keys would be cut by the script.
+    {
+        TArray<FAgentHeldInputInfo> Held;
+        GetHeld(Held);
+        for (const FUAPSeqStep& Step : Seq.Steps)
+        {
+            for (const FAgentHeldInputInfo& H : Held)
+            {
+                if (H.Key == Step.Key.ToString() && H.RemainingSeconds > 0.f)
+                {
+                    return UAPRefuse(H.Key, FString::Printf(
+                        TEXT("%s is already held (%.2f s left); end it with `input release %s` or wait"),
+                        *H.Key, H.RemainingSeconds, *H.Key));
+                }
+            }
+        }
+    }
+
+    UWorld* World = FAgentWorld::GetActiveGameWorld();
+    if (!World) { return UAPRefuse(TEXT("sequence"), TEXT("no game world")); }
+
+    Seq.World = World;
+    Seq.Client = FAgentWorld::GetClientIndex(World);
+    Seq.ArrivalWorld = World->GetTimeSeconds();
+    Seq.ArrivalReal = FPlatformTime::Seconds();
+    Seq.ArrivalFrame = GFrameCounter;
+    Seq.T0World = Seq.ArrivalWorld;
+    // StartAt: "" = the moment this call lands; "+x" = x seconds after it lands (world time,
+    // pinned in-engine); "x" = absolute WORLD seconds of that client (read from a prior answer).
+    const FString At = StartAt.TrimStartAndEnd();
+    if (!At.IsEmpty())
+    {
+        const bool bRelative = At.StartsWith(TEXT("+"));
+        if (!(bRelative ? At.Mid(1) : At).IsNumeric())
+        {
+            return UAPRefuse(TEXT("sequence"), FString::Printf(TEXT("bad start '%s': use \"\" (now), \"+1.5\" "
+                             "(1.5 s after arrival) or an absolute world time like \"412.7\""), *At));
+        }
+        const double V = FCString::Atod(*At);
+        Seq.T0World = bRelative ? Seq.ArrivalWorld + V : V;
+    }
+
+    for (int32 i = 0; i < Seq.Steps.Num(); ++i)
+    {
+        FUAPSeqEvent Begin;
+        Begin.Time = Seq.Steps[i].Start;
+        Begin.Step = i;
+        Begin.bStart = true;
+        FUAPSeqEvent Finish;
+        Finish.Time = Seq.Steps[i].End;
+        Finish.Step = i;
+        Finish.bStart = false;
+        Seq.Events.Add(Begin);
+        Seq.Events.Add(Finish);
+    }
+    // Time order; at a tie an END comes before a START so a touching pair on one key hands over.
+    Seq.Events.StableSort([](const FUAPSeqEvent& L, const FUAPSeqEvent& R)
+    {
+        if (L.Time != R.Time) { return L.Time < R.Time; }
+        return !L.bStart && R.bStart;
+    });
+    Seq.Id = GSeqNextId++;
+    Seq.State = TEXT("running");
+
+    // Pump once NOW: a step at 0 goes out inside this call, on the frame it arrived, instead of
+    // waiting for the next tick. The ticker takes over for everything later.
+    const bool bFinishedAtOnce = UAPSeqPump(Seq);
+    TSharedRef<FJsonObject> O = MakeShared<FJsonObject>();
+    O->SetBoolField(TEXT("ok"), true);
+    O->SetNumberField(TEXT("sequence"), Seq.Id);
+    O->SetNumberField(TEXT("steps"), Seq.Steps.Num());
+    O->SetNumberField(TEXT("total_seconds"), Seq.TotalSeconds);
+    O->SetNumberField(TEXT("client"), Seq.Client);
+    O->SetNumberField(TEXT("arrival_world_time"), Seq.ArrivalWorld);
+    O->SetNumberField(TEXT("t0_world_time"), Seq.T0World);
+    O->SetNumberField(TEXT("starts_in_seconds"), FMath::Max(0.0, Seq.T0World - Seq.ArrivalWorld));
+    O->SetNumberField(TEXT("frame"), (double)Seq.ArrivalFrame);
+    O->SetStringField(TEXT("clock"), TEXT("world"));
+    O->SetStringField(TEXT("route"), TEXT("viewport"));
+    O->SetStringField(TEXT("note"), TEXT("scripted in-engine against world time from here on; the CLI round "
+                                          "trip no longer matters. `input sequence-status` reads when each "
+                                          "step actually fired."));
+
+    if (bFinishedAtOnce)
+    {
+        GSeqHistory.Add(MoveTemp(Seq));
+        while (GSeqHistory.Num() > UAPSeqHistory) { GSeqHistory.RemoveAt(0); }
+    }
+    else
+    {
+        GSeqActive.Add(MoveTemp(Seq));
+        if (!GSeqTicker.IsValid())
+        {
+            GSeqTicker = FTSTicker::GetCoreTicker().AddTicker(FTickerDelegate::CreateStatic(&UAPSeqTick), 0.f);
+        }
+    }
+    return UAPJson(O);
+}
+
+FString FAgentInput::GetSequenceLogJson()
+{
+    UWorld* Only = FAgentWorld::GetOverrideWorld();
+    auto Describe = [](const FUAPSequence& S) -> TSharedPtr<FJsonValue>
+    {
+        TSharedRef<FJsonObject> O = MakeShared<FJsonObject>();
+        O->SetNumberField(TEXT("sequence"), S.Id);
+        O->SetStringField(TEXT("state"), S.State);
+        if (!S.Note.IsEmpty()) { O->SetStringField(TEXT("note"), S.Note); }
+        O->SetNumberField(TEXT("client"), S.Client);
+        O->SetNumberField(TEXT("arrival_world_time"), S.ArrivalWorld);
+        O->SetNumberField(TEXT("t0_world_time"), S.T0World);
+        O->SetNumberField(TEXT("arrival_frame"), (double)S.ArrivalFrame);
+        TArray<TSharedPtr<FJsonValue>> Steps;
+        double MaxErr = 0.0;
+        for (int32 i = 0; i < S.Steps.Num(); ++i)
+        {
+            const FUAPSeqStep& St = S.Steps[i];
+            TSharedRef<FJsonObject> J = MakeShared<FJsonObject>();
+            J->SetNumberField(TEXT("step"), i);
+            J->SetStringField(TEXT("key"), St.Key.ToString());
+            J->SetStringField(TEXT("kind"), St.bAnalog ? TEXT("axis") : TEXT("hold"));
+            if (St.bAnalog) { J->SetNumberField(TEXT("value"), St.Value); }
+            J->SetNumberField(TEXT("start"), St.Start);
+            J->SetNumberField(TEXT("end"), St.End);
+            if (!St.Failure.IsEmpty()) { J->SetStringField(TEXT("failure"), St.Failure); }
+            if (St.bStarted)
+            {
+                // error = how far past the scripted time the engine actually fired it. It cannot be
+                // negative (a step never fires early) and is bounded by one frame (the next tick).
+                const double StartErr = (St.StartedRel - St.Start) * 1000.0;
+                J->SetNumberField(TEXT("started_at"), St.StartedRel);
+                J->SetNumberField(TEXT("start_error_ms"), StartErr);
+                J->SetNumberField(TEXT("start_frame"), (double)St.StartedFrame);
+                J->SetNumberField(TEXT("start_frame_ms"), St.StartedDt * 1000.0);
+                J->SetNumberField(TEXT("start_real"), St.StartedReal);
+                MaxErr = FMath::Max(MaxErr, StartErr);
+            }
+            if (St.bStarted && St.EndedFrame > 0)
+            {
+                const double EndErr = (St.EndedRel - St.End) * 1000.0;
+                J->SetNumberField(TEXT("ended_at"), St.EndedRel);
+                J->SetNumberField(TEXT("end_error_ms"), EndErr);
+                J->SetNumberField(TEXT("end_frame"), (double)St.EndedFrame);
+                J->SetNumberField(TEXT("end_real"), St.EndedReal);
+                MaxErr = FMath::Max(MaxErr, EndErr);
+            }
+            Steps.Add(MakeShared<FJsonValueObject>(J));
+        }
+        O->SetNumberField(TEXT("max_error_ms"), MaxErr);
+        O->SetArrayField(TEXT("steps"), Steps);
+        return MakeShared<FJsonValueObject>(O);
+    };
+
+    TArray<TSharedPtr<FJsonValue>> Out;
+    for (const FUAPSequence& S : GSeqHistory)
+    {
+        if (!Only || S.World.Get() == Only) { Out.Add(Describe(S)); }
+    }
+    for (const FUAPSequence& S : GSeqActive)
+    {
+        if (!Only || S.World.Get() == Only) { Out.Add(Describe(S)); }
+    }
+    TSharedRef<FJsonObject> Root = MakeShared<FJsonObject>();
+    Root->SetBoolField(TEXT("ok"), true);
+    Root->SetStringField(TEXT("clock"), TEXT("world"));
+    Root->SetArrayField(TEXT("sequences"), Out);
+    return UAPJson(Root);
+}
+
 bool FAgentInput::HoldKey(FKey Key, float Seconds)
 {
     if (!Key.IsValid() || Seconds <= 0.f || !HasLiveViewport()) { return false; }
@@ -845,6 +1321,8 @@ int32 FAgentInput::ReleaseHeld(FKey Key)
     // Inside a client scope, release only that client's holds. With no scope, release them all:
     // the recovery path must be able to clear every client without naming each one.
     UWorld* Only = FAgentWorld::GetOverrideWorld();
+    // A scripted step that has not come due yet would press the key again after this release.
+    if (!GSeqReleasing) { UAPSeqCancel(Key, Only); }
     int32 Count = 0;
     for (int32 i = GHeldInputs.Num() - 1; i >= 0; --i)
     {
@@ -981,6 +1459,13 @@ FString FAgentInput::GetHeldJson()
 
 void FAgentInput::ShutdownHolds()
 {
+    GSeqActive.Reset();
+    GSeqHistory.Reset();
+    if (GSeqTicker.IsValid())
+    {
+        FTSTicker::RemoveTicker(GSeqTicker);
+        GSeqTicker.Reset();
+    }
     GHeldInputs.Reset();
     if (GHoldTicker.IsValid())
     {
