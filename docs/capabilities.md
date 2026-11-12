@@ -321,6 +321,39 @@ involved, and it does not wait on the editor lease or machine lock.
 - **Burst:** `--frames N --interval-ms M` (N <= 60) writes `<stem>_f01.png`...; the result reports
   `changed_from_previous` per frame and warns when every frame is identical.
 
+### `uap screenshot <abs.png>` with NO PIE: the LEVEL EDITOR viewport [17tm466fv84 / 17tm466ft2k]
+With no PIE running, `uap screenshot` captures the **level editor viewport**. The plugin
+(`CaptureLevelViewport`) draws the pane itself (`FViewport::Draw`, the call the editor's own tick makes
+for every viewport) and reads the pixels back in the same call, so nothing waits for a frame an idle
+or unfocused editor never renders. It needs no PIE, no focus, no realtime viewport and no throttle
+change; the PNG exists when the call returns. (Before this it queued an `FScreenshotRequest` for the
+next frame and failed with *"an idle editor viewport never renders one"*.)
+
+- **Which pane:** `--pane` omitted/`auto` = the **active** pane when it is perspective, else the first
+  perspective pane; `active`; `first-perspective` (the pane Python's `set_level_viewport_camera_info`
+  moves); or a pane key / unique suffix (`Viewport1`). The result always names the pane
+  (`pane`, `pane_chosen_because`, `panes[]`) and its pose, so a shot of the wrong pane is visible.
+- **Aim it in the SAME call:** `uap screenshot shot.png --location X,Y,Z --look-at X,Y,Z` or
+  `--location X,Y,Z --rotation PITCH,YAW,ROLL [--fov F]`. The pose is applied, read back and captured
+  on one pane inside one engine call. `--rotation` is **pitch,yaw,roll** (NOT `unreal.Rotator(a,b,c)`,
+  whose positional order is roll,pitch,yaw). A value that starts with a minus (`-12,90,0`) is fine.
+- **`uap viewport pose [--pane ..] [--location ..] [--rotation .. | --look-at ..] [--fov ..]`** sets
+  (when a flag is given) and always reads back the pose on that same pane, with the pane list.
+- **Never** set the pose with Python `set_level_viewport_camera_info` and shoot in a second call:
+  `UnrealEditorSubsystem` moves the FIRST PERSPECTIVE pane, a capture takes the ACTIVE one, and in a
+  multi-pane layout they differ -- same success return, different camera. When the capture pane is not
+  the one that API moves, the result carries `pane_is_unreal_editor_subsystem_pane:false` and a `warning`.
+- `--editor` forces the level viewport even while PIE runs; `--draw-frames N` (default 3) sets how many
+  frames are drawn before the readback.
+- **Refused, never faked:** a minimised window / zero-size pane, an orthographic pane given a pose, and
+  an all-one-colour frame all return `ok:false` with the reason and write nothing. A pose on a pane that
+  is piloting an actor returns a `pose_warnings` entry (the editor re-applies the pilot's camera).
+- The path is made absolute by the CLI first: the engine resolves a relative path against ITS working
+  directory, which used to read as "no frame rendered".
+- PowerShell splits an unquoted `--location=-900,-1300,900` into separate arguments; the CLI re-joins them (quoting is still the safest spelling).
+- Needs a plugin build with `CaptureLevelViewport` / `LevelViewportPose`; an older copy is named as
+  skew (sync + rebuild), never answered by the old next-frame verb.
+
 ### `screenshot_viewport`
 **Inputs:** `resolution` (e.g. `1920x1080`), filename, flags.
 **Captures** the game viewport via `HighResShot`.
@@ -401,7 +434,7 @@ Everything it was for is done in-engine instead:
 
 - **Input** is injected inside the engine (viewport route / Slate route), so it needs no focus. With several PIE clients, `--client N` / `--client all` picks the client (see "Multi-client PIE" below).
 - **The 3 fps not-foreground throttle** is turned off by the plugin for the whole PIE session (`UEditorPerformanceSettings::bThrottleCPUWhenNotForeground`, in memory only) and put back when PIE ends.
-- **Screenshots** use the game backbuffer (`CaptureViewportWithUI`) or a passive `PrintWindow` of a standalone client; neither needs the window in front.
+- **Screenshots** use the game backbuffer (`CaptureViewportWithUI`), an in-engine draw + readback of the level viewport when no PIE runs (`CaptureLevelViewport`), or a passive `PrintWindow` of a standalone client; none needs the window in front.
 - `uap report finish` no longer opens a browser window by default (a new window takes the foreground); pass `--open` or set `UAP_REPORT_OPEN=1`.
 
 ## Multi-client PIE (`--client`)
@@ -433,7 +466,7 @@ Launch and drive standalone `-game` processes independently from the editor, eac
 
 The C++ functions on `UAPAgentSubsystem`, callable directly over Remote Control:
 
-`GetPluginVersion` · `ExecuteConsoleCommand` · `GetRemoteControlPort` · `GetPIEPhase` · `GetPIEElapsedSeconds` · `StartPIE` · `StartPIEMode` · `StopPIE` · `StopPIEEx` · `IsInPIE` · `IsPIEInProgress` · `GetLogCursor` · `GetLogsSince` · `InjectKey` · `InjectMouseMove` · `InjectMouseButton` · `InjectAxis` · `InjectGamepad` · `InjectXRButton` · `InjectXRControllerPose` · `ClearXRControllerOverride` · `SetXRAimEmulation` · `GetXRControllerState` · `HoldKey` · `HoldAxis` · `ReleaseHeldInput` · `GetHeldInput` · `ListTestHelpers` · `ListTestHelpersJson` · `CallTestHelper` · `StartPropertySample` · `ReadPropertySample` · `StopPropertySample` · `GetStatGroupText` · `DumpViewportUI` · `SelectTab` · `NavigateUI` · `CaptureViewportWithUI`
+`GetPluginVersion` · `ExecuteConsoleCommand` · `GetRemoteControlPort` · `GetPIEPhase` · `GetPIEElapsedSeconds` · `StartPIE` · `StartPIEMode` · `StopPIE` · `StopPIEEx` · `IsInPIE` · `IsPIEInProgress` · `GetLogCursor` · `GetLogsSince` · `InjectKey` · `InjectMouseMove` · `InjectMouseButton` · `InjectAxis` · `InjectGamepad` · `InjectXRButton` · `InjectXRControllerPose` · `ClearXRControllerOverride` · `SetXRAimEmulation` · `GetXRControllerState` · `HoldKey` · `HoldAxis` · `ReleaseHeldInput` · `GetHeldInput` · `ListTestHelpers` · `ListTestHelpersJson` · `CallTestHelper` · `StartPropertySample` · `ReadPropertySample` · `StopPropertySample` · `GetStatGroupText` · `DumpViewportUI` · `SelectTab` · `NavigateUI` · `CaptureViewportWithUI` · `CaptureLevelViewport` · `LevelViewportPose`
 
 The same surface (minus the editor-only PIE verbs) exists on `UAPAgentRuntimeSubsystem` for standalone `-game` processes.
 

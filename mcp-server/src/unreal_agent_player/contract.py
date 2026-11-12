@@ -91,6 +91,9 @@ PURPOSE = {
     "SelectTab": "`tab` -- selecting a CommonUI tab",
     "NavigateUI": "`nav` -- Slate focus navigation",
     "CaptureViewportWithUI": "`screenshot` -- capturing the composited game+UMG frame",
+    "CaptureLevelViewport": "`screenshot` / `screenshot --pose` with no PIE -- draws the LEVEL "
+                            "EDITOR viewport itself (an idle editor never renders a frame to wait for)",
+    "LevelViewportPose": "`viewport pose` -- sets/reads the pose on the SAME pane the capture uses",
 }
 
 # Argument-level purposes: a verb can be present while the PARAMETER the CLI wants is not.

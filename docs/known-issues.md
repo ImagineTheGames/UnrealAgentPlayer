@@ -65,6 +65,7 @@ Fixed: after the ~8s poll, a missing file is now a hard `ok:false` with a concre
 ("screenshot not written: CaptureViewportWithUI renders on the next game frame, but an idle
 editor viewport never renders one. Requires active PIE (uap pie start) / a renderable frame.")
 and a non-zero exit, so it can no longer be mistaken for a transient or a pass.
+(The no-PIE case itself is now solved: see #42.)
 
 ## 5. Screenshot examples imply they work anytime -- FIXED (docs)
 
@@ -1361,3 +1362,49 @@ faked jumps with in-engine `ACharacter::Jump` calls. [ClickUp 17tm466zqax]
 * Not covered: aligning the script's 0 to a GAME event (a platform that starts vanishing at an unknown moment). Start
   the script from an in-engine trigger instead, or read `arrival_world_time` and use `--at` against a world time you
   derived from game state.
+
+
+## 42. `uap screenshot` could not capture the level editor viewport, and a pose set elsewhere hit another pane -- FIXED
+
+`uap screenshot` with no PIE failed with *"CaptureViewportWithUI renders on the next game frame, but an idle
+editor viewport never renders one"* (and `HighResShot` did nothing on an unfocused editor), so any non-gameplay
+visual check (lighting, materials, placement, map building) either started PIE or fell back to a `SceneCapture2D`
+hack. Separately, a pose set with `UnrealEditorSubsystem.set_level_viewport_camera_info` and a capture taken in a
+second call hit DIFFERENT panes in a multi-pane layout, with both calls reporting success (one "regression" of 28
+per channel was entirely fictitious; the real figure was 2.5). [ClickUp 17tm466fv84, 17tm466ft2k]
+
+* **Root cause 1:** the no-PIE fallback was `FScreenshotRequest::RequestScreenshot`, which is serviced when a LATER
+  frame renders. An idle, non-realtime or unfocused editor does not render one. It was never a focus problem and
+  never needed the 3 fps throttle changed.
+* **Root cause 2 (not what the ticket guessed):** the active pane does not "drift" between calls. The two APIs
+  simply choose differently: `UUnrealEditorSubsystem::GetViewportClient` returns the first PERSPECTIVE client in
+  `GEditor->GetLevelViewportClients()`, a capture takes the ACTIVE viewport.
+* **Fix (plugin):** `CaptureLevelViewport(Filename, PoseJson)` and `LevelViewportPose(PoseJson)` on the editor
+  subsystem. One resolver (`ResolveLevelPane`) picks the pane for the pose, the read-back and the capture. The
+  capture calls `FViewport::Draw()` itself (what `UEditorEngine::UpdateSingleViewportClient` does for a realtime
+  viewport) and `ReadPixels` synchronously, so the PNG exists when the call returns. `CaptureViewportWithUI` now
+  falls back to it when there is no PIE viewport.
+* **Fix (CLI):** `uap screenshot` with no PIE (or `--editor` / any pose flag) calls it; `--location`, `--rotation`
+  (pitch,yaw,roll), `--look-at`, `--fov`, `--pane`, `--draw-frames`; new `uap viewport pose`. Relative output paths
+  are made absolute (the engine resolved them against its own cwd, which read as "no frame"). Negative vector
+  values (`--rotation -12,90,0`) are accepted. A plugin without the verb is named as skew; nothing falls back to
+  the old next-frame verb.
+* Refused rather than faked: zero-size pane (minimised window), orthographic pane given a pose, one-flat-colour
+  frame.
+* **Verified live (2026-11-12, School's Out editor, `Map_MarbleRace`, NO PIE, four-pane layout, editor not the
+  foreground window - `SteamVR Settings` was):** six captures of a known actor (`MR_Shell`, bounds centre
+  396,-600,150) from poses set in the same call. Each image matched its pose: `--location -900,-1300,900
+  --look-at 0,0,0` = a three-quarter view with the room's corner at screen centre; `--location 396,-600,1400
+  --rotation -90,0,0 --fov 70` = a top-down plan with the room centred; `--location 396,-1900,700 --look-at
+  396,-600,150` = the room centred from the south; `--location 400,-1500,120 --rotation 5,90,0` = the exterior
+  south brick wall. Each result read back the pose that was captured. Refusals: an orthographic pane with a pose
+  and an unknown pane name were `ok:false` with the reason; a hidden pane (maximised layout) reported
+  `0x0 viewport`. Relative paths landed at the absolute path. The editor was at 60 fps in-engine, so the
+  throttle was not involved. Not exercised: a layout whose active pane is NOT the first perspective one (this
+  layout has a single perspective pane); that branch is covered by the `pane_is_unreal_editor_subsystem_pane`
+  warning and read from the engine source only.
+* **PowerShell:** an unquoted `--location=-900,-1300,900` arrives as three separate arguments; the CLI re-joins
+  them, so quoting is optional (`'--location=-900,-1300,900'` is still the safest spelling).
+* **Not a defect, still true:** `editor_set_viewport_realtime(True)` logs a handled ensure
+  (`!bCheckMissingOverride || bRemoved`). It is the engine's, harmless, and `CaptureLevelViewport` does not need
+  realtime at all.

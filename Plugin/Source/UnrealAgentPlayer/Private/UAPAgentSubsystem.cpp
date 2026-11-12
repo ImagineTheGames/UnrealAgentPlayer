@@ -4,6 +4,13 @@
 #include "UnrealAgentPlayerRuntimeModule.h"
 #include "AgentRemoteControlBootstrap.h"
 #include "Editor.h"
+#include "LevelEditor.h"
+#include "ILevelEditor.h"
+#include "SLevelViewport.h"
+#include "LevelEditorViewport.h"
+#include "UnrealEngine.h"
+#include "HAL/FileManager.h"
+#include "Modules/ModuleManager.h"
 #include "LevelEditorSubsystem.h"
 #include "PlayInEditorDataTypes.h"
 #include "HAL/PlatformTime.h"
@@ -715,11 +722,451 @@ bool UUAPAgentSubsystem::CaptureViewportWithUI(FString Filename)
         // Fall through to the legacy path on any failure above.
     }
 
-    // Fallback (no live PIE game viewport -- e.g. an idle editor showing only the level
-    // view): the foreground-window composited backbuffer. bShowUI=true keeps UMG/Slate,
-    // unlike HighResShot. The PNG lands on the next rendered frame; the caller polls for it.
-    FScreenshotRequest::RequestScreenshot(Filename, /*bShowUI=*/true, /*bAddUniqueSuffix=*/false);
-    return true;
+    // No live PIE game viewport -- an idle editor showing only the level view. This used to
+    // queue an FScreenshotRequest for the NEXT rendered frame, which an idle or unfocused
+    // editor never produces (17tm466fv84 / 17tm466ft2k). Draw the level viewport ourselves
+    // and read it back synchronously instead; the PNG exists when this returns.
+    const FString Result = CaptureLevelViewport(Filename, FString());
+    TSharedPtr<FJsonObject> Parsed;
+    TSharedRef<TJsonReader<>> Reader = TJsonReaderFactory<>::Create(Result);
+    bool bOk = false;
+    if (FJsonSerializer::Deserialize(Reader, Parsed) && Parsed.IsValid())
+    {
+        Parsed->TryGetBoolField(TEXT("ok"), bOk);
+    }
+    if (!bOk)
+    {
+        UE_LOG(LogUAP, Warning, TEXT("CaptureViewportWithUI: level viewport capture failed: %s"), *Result);
+    }
+    return bOk;
+}
+
+// ---------------------------------------------------------------------------------------------
+// LEVEL EDITOR VIEWPORT: pose + capture (ClickUp 17tm466fv84 / 17tm466ft2k)
+//
+// Two defects lived here. (1) `CaptureViewportWithUI` with no PIE fell through to
+// FScreenshotRequest, which waits for a NEXT rendered frame -- and an idle or unfocused editor
+// never renders one, so the file never appeared. (2) `UnrealEditorSubsystem.set_level_viewport_
+// camera_info` moves the FIRST PERSPECTIVE viewport client, while a capture grabs the ACTIVE one;
+// in a multi-pane layout those are different panes, so a pose set and a screenshot taken a moment
+// later silently disagreed (a 28 per channel "regression" that was not real).
+//
+// The fix is ONE resolver (`ResolveLevelPane`) used by both the pose and the capture, and a
+// capture that DRAWS the viewport itself (`FViewport::Draw`, the call the editor's own tick makes
+// for every viewport) and reads the pixels back synchronously. Nothing waits for a frame, so
+// focus and realtime do not matter.
+// ---------------------------------------------------------------------------------------------
+namespace
+{
+    struct FUAPLevelPane
+    {
+        FLevelEditorViewportClient* Client = nullptr;
+        FString Key;
+        bool bActive = false;
+    };
+
+    // Every level editor viewport pane that currently has a client + a viewport.
+    TArray<FUAPLevelPane> ListLevelPanes()
+    {
+        TArray<FUAPLevelPane> Out;
+        if (!FModuleManager::Get().IsModuleLoaded(TEXT("LevelEditor")))
+        {
+            return Out;
+        }
+        FLevelEditorModule& Module = FModuleManager::GetModuleChecked<FLevelEditorModule>(TEXT("LevelEditor"));
+        const TSharedPtr<ILevelEditor> Editor = Module.GetFirstLevelEditor();
+        if (!Editor.IsValid())
+        {
+            return Out;
+        }
+        const TSharedPtr<SLevelViewport> Active = Editor->GetActiveViewportInterface();
+        for (const TSharedPtr<SLevelViewport>& Pane : Editor->GetViewports())
+        {
+            if (!Pane.IsValid())
+            {
+                continue;
+            }
+            FUAPLevelPane Entry;
+            Entry.Client = &Pane->GetLevelViewportClient();
+            Entry.Key = Pane->GetConfigKey().ToString();
+            Entry.bActive = Active.IsValid() && Active == Pane;
+            if (Entry.Client && Entry.Client->Viewport)
+            {
+                Out.Add(Entry);
+            }
+        }
+        return Out;
+    }
+
+    // The pane `UnrealEditorSubsystem.set_level_viewport_camera_info` moves: the first
+    // perspective client in GEditor's list (UnrealEditorSubsystem.cpp GetViewportClient).
+    FLevelEditorViewportClient* UnrealEditorSubsystemClient()
+    {
+        if (GEditor)
+        {
+            for (FLevelEditorViewportClient* VC : GEditor->GetLevelViewportClients())
+            {
+                if (VC && VC->IsPerspective())
+                {
+                    return VC;
+                }
+            }
+        }
+        return nullptr;
+    }
+
+    // ONE resolution for the pose set, the read-back and the capture, so they cannot land on
+    // different panes. Selector: "" / "auto" = the ACTIVE pane when it is perspective, else the
+    // first perspective pane; "active" = the active pane whatever it is; "first-perspective" =
+    // the pane UnrealEditorSubsystem moves; otherwise a pane config key, or a unique suffix of
+    // one ("Viewport1"). Returns false with Error set when nothing matches.
+    bool ResolveLevelPane(const FString& Selector, const TArray<FUAPLevelPane>& Panes,
+                          FUAPLevelPane& Out, FString& Why, FString& Error)
+    {
+        if (Panes.Num() == 0)
+        {
+            Error = TEXT("no level editor viewport pane found (is a level editor open and is its window visible?)");
+            return false;
+        }
+        const FString Sel = Selector.TrimStartAndEnd();
+        const FUAPLevelPane* Active = Panes.FindByPredicate([](const FUAPLevelPane& P) { return P.bActive; });
+        const FLevelEditorViewportClient* FirstPersp = UnrealEditorSubsystemClient();
+        const FUAPLevelPane* FirstPerspPane = Panes.FindByPredicate(
+            [FirstPersp](const FUAPLevelPane& P) { return P.Client == FirstPersp; });
+
+        if (Sel.IsEmpty() || Sel.Equals(TEXT("auto"), ESearchCase::IgnoreCase))
+        {
+            if (Active && Active->Client->IsPerspective())
+            {
+                Out = *Active;
+                Why = TEXT("active pane (perspective)");
+                return true;
+            }
+            const FUAPLevelPane* Persp = FirstPerspPane
+                ? FirstPerspPane
+                : Panes.FindByPredicate([](const FUAPLevelPane& P) { return P.Client->IsPerspective(); });
+            if (Persp)
+            {
+                Out = *Persp;
+                Why = Active ? TEXT("first perspective pane (the active pane is orthographic)")
+                             : TEXT("first perspective pane (no pane is active)");
+                return true;
+            }
+            Out = Active ? *Active : Panes[0];
+            Why = TEXT("no perspective pane exists");
+            return true;
+        }
+        if (Sel.Equals(TEXT("active"), ESearchCase::IgnoreCase))
+        {
+            if (!Active) { Error = TEXT("no pane is active"); return false; }
+            Out = *Active;
+            Why = TEXT("active pane");
+            return true;
+        }
+        if (Sel.Equals(TEXT("first-perspective"), ESearchCase::IgnoreCase))
+        {
+            if (!FirstPerspPane) { Error = TEXT("no perspective pane exists"); return false; }
+            Out = *FirstPerspPane;
+            Why = TEXT("first perspective pane (the one UnrealEditorSubsystem moves)");
+            return true;
+        }
+        TArray<const FUAPLevelPane*> Hits;
+        for (const FUAPLevelPane& P : Panes)
+        {
+            if (P.Key.Equals(Sel, ESearchCase::IgnoreCase)) { Hits.Empty(); Hits.Add(&P); break; }
+            if (P.Key.EndsWith(Sel, ESearchCase::IgnoreCase)) { Hits.Add(&P); }
+        }
+        if (Hits.Num() == 1)
+        {
+            Out = *Hits[0];
+            Why = TEXT("named pane");
+            return true;
+        }
+        TArray<FString> Keys;
+        for (const FUAPLevelPane& P : Panes) { Keys.Add(P.Key); }
+        Error = FString::Printf(TEXT("pane '%s' %s; panes: %s"), *Sel,
+                                Hits.Num() == 0 ? TEXT("matches nothing") : TEXT("is ambiguous"),
+                                *FString::Join(Keys, TEXT(", ")));
+        return false;
+    }
+
+    TSharedRef<FJsonValueArray> UAPVec3Json(double A, double B, double C)
+    {
+        TArray<TSharedPtr<FJsonValue>> V;
+        V.Add(MakeShared<FJsonValueNumber>(A));
+        V.Add(MakeShared<FJsonValueNumber>(B));
+        V.Add(MakeShared<FJsonValueNumber>(C));
+        return MakeShared<FJsonValueArray>(V);
+    }
+
+    bool UAPReadVec3(const TSharedPtr<FJsonObject>& Obj, const TCHAR* Field, FVector& Out)
+    {
+        const TArray<TSharedPtr<FJsonValue>>* Arr = nullptr;
+        if (!Obj->TryGetArrayField(Field, Arr) || !Arr || Arr->Num() != 3)
+        {
+            return false;
+        }
+        Out = FVector((*Arr)[0]->AsNumber(), (*Arr)[1]->AsNumber(), (*Arr)[2]->AsNumber());
+        return true;
+    }
+
+    FString UAPLevelViewportJson(const TSharedRef<FJsonObject>& Obj)
+    {
+        FString Out;
+        TSharedRef<TJsonWriter<>> W = TJsonWriterFactory<>::Create(&Out);
+        FJsonSerializer::Serialize(Obj, W);
+        return Out;
+    }
+
+    FString UAPLevelViewportError(const FString& Error)
+    {
+        TSharedRef<FJsonObject> Obj = MakeShared<FJsonObject>();
+        Obj->SetBoolField(TEXT("ok"), false);
+        Obj->SetStringField(TEXT("error"), Error);
+        return UAPLevelViewportJson(Obj);
+    }
+
+    // Describes the resolved pane + its pose + the layout, so a caller can SEE which pane it hit.
+    void UAPDescribePane(const FUAPLevelPane& Pane, const FString& Why,
+                         const TArray<FUAPLevelPane>& Panes, const TSharedRef<FJsonObject>& Obj)
+    {
+        FLevelEditorViewportClient* VC = Pane.Client;
+        Obj->SetStringField(TEXT("pane"), Pane.Key);
+        Obj->SetStringField(TEXT("pane_chosen_because"), Why);
+        Obj->SetBoolField(TEXT("pane_is_active"), Pane.bActive);
+        Obj->SetBoolField(TEXT("pane_is_perspective"), VC->IsPerspective());
+        const bool bSameAsSubsystem = (VC == UnrealEditorSubsystemClient());
+        Obj->SetBoolField(TEXT("pane_is_unreal_editor_subsystem_pane"), bSameAsSubsystem);
+        TArray<TSharedPtr<FJsonValue>> Keys;
+        for (const FUAPLevelPane& P : Panes)
+        {
+            Keys.Add(MakeShared<FJsonValueString>(
+                P.Key + (P.bActive ? TEXT(" (active)") : TEXT("")) + (P.Client->IsPerspective() ? TEXT("") : TEXT(" (ortho)"))));
+        }
+        Obj->SetArrayField(TEXT("panes"), Keys);
+        const FVector Loc = VC->GetViewLocation();
+        const FRotator Rot = VC->GetViewRotation();
+        Obj->SetField(TEXT("location"), UAPVec3Json(Loc.X, Loc.Y, Loc.Z));
+        Obj->SetField(TEXT("rotation_pitch_yaw_roll"), UAPVec3Json(Rot.Pitch, Rot.Yaw, Rot.Roll));
+        Obj->SetNumberField(TEXT("fov"), VC->ViewFOV);
+        if (!bSameAsSubsystem)
+        {
+            Obj->SetStringField(TEXT("warning"),
+                TEXT("this is NOT the pane that unreal.get_editor_subsystem(UnrealEditorSubsystem)."
+                     "set_level_viewport_camera_info moves (the first perspective pane). A pose set "
+                     "that way and this capture are different cameras. Set the pose with "
+                     "`uap viewport pose` / `uap screenshot --pose` instead, or pass "
+                     "--pane first-perspective."));
+        }
+    }
+
+    // Applies the pose fields present in Req to the pane. Returns false + Error on a bad
+    // request. Sets bApplied when at least one field was applied.
+    bool UAPApplyPose(const FUAPLevelPane& Pane, const TSharedPtr<FJsonObject>& Req,
+                      bool& bApplied, TArray<FString>& Warnings, FString& Error)
+    {
+        bApplied = false;
+        FLevelEditorViewportClient* VC = Pane.Client;
+        FVector Loc = VC->GetViewLocation();
+        FRotator Rot = VC->GetViewRotation();
+        FVector V;
+        bool bHaveLoc = false;
+        bool bHaveRot = false;
+
+        if (Req->HasField(TEXT("location")))
+        {
+            if (!UAPReadVec3(Req, TEXT("location"), V)) { Error = TEXT("location must be [x,y,z]"); return false; }
+            Loc = V;
+            bHaveLoc = true;
+        }
+        if (Req->HasField(TEXT("rotation")))
+        {
+            if (!UAPReadVec3(Req, TEXT("rotation"), V)) { Error = TEXT("rotation must be [pitch,yaw,roll]"); return false; }
+            Rot = FRotator(V.X, V.Y, V.Z);   // FRotator(Pitch, Yaw, Roll) -- NOT unreal.Rotator(roll, pitch, yaw)
+            bHaveRot = true;
+        }
+        if (Req->HasField(TEXT("look_at")))
+        {
+            if (!UAPReadVec3(Req, TEXT("look_at"), V)) { Error = TEXT("look_at must be [x,y,z]"); return false; }
+            if ((V - Loc).IsNearlyZero()) { Error = TEXT("look_at is the camera location; no direction"); return false; }
+            Rot = (V - Loc).Rotation();
+            Rot.Roll = 0.f;
+            bHaveRot = true;
+        }
+        double Fov = 0.0;
+        const bool bHaveFov = Req->TryGetNumberField(TEXT("fov"), Fov);
+        if (!(bHaveLoc || bHaveRot || bHaveFov))
+        {
+            return true;   // read-only request
+        }
+        if (!VC->IsPerspective())
+        {
+            Error = FString::Printf(TEXT("pane '%s' is orthographic; a pose can only be set on a perspective pane"), *Pane.Key);
+            return false;
+        }
+        if (VC->GetActiveActorLock().IsValid() || VC->GetCinematicActorLock().HasValidLockedActor())
+        {
+            Warnings.Add(TEXT("the pane is piloting an actor / locked to a cinematic actor: the editor overwrites "
+                              "the free camera pose from that actor, so the requested pose may not show. "
+                              "Eject the pilot first."));
+        }
+        if (bHaveLoc || bHaveRot)
+        {
+            VC->SetViewLocationForOrbiting(Loc);
+            VC->SetViewLocation(Loc);
+            VC->SetViewRotation(Rot);
+        }
+        if (bHaveFov)
+        {
+            VC->ViewFOV = FMath::Clamp((float)Fov, 5.f, 170.f);
+        }
+        VC->Invalidate();
+        bApplied = true;
+        return true;
+    }
+
+    // Shared by both verbs: parse the request, resolve the pane, apply the pose.
+    bool UAPPrepareLevelPane(const FString& PoseJson, TSharedPtr<FJsonObject>& Req,
+                             TArray<FUAPLevelPane>& Panes, FUAPLevelPane& Pane, FString& Why,
+                             bool& bApplied, TArray<FString>& Warnings, FString& Error)
+    {
+        Req = MakeShared<FJsonObject>();
+        if (!PoseJson.TrimStartAndEnd().IsEmpty())
+        {
+            TSharedRef<TJsonReader<>> Reader = TJsonReaderFactory<>::Create(PoseJson);
+            if (!FJsonSerializer::Deserialize(Reader, Req) || !Req.IsValid())
+            {
+                Error = TEXT("PoseJson is not a JSON object");
+                return false;
+            }
+        }
+        FString Selector;
+        Req->TryGetStringField(TEXT("pane"), Selector);
+        Panes = ListLevelPanes();
+        if (!ResolveLevelPane(Selector, Panes, Pane, Why, Error))
+        {
+            return false;
+        }
+        return UAPApplyPose(Pane, Req, bApplied, Warnings, Error);
+    }
+
+    void UAPAddPoseWarnings(const TArray<FString>& Warnings, const TSharedRef<FJsonObject>& Obj)
+    {
+        if (Warnings.Num() == 0) { return; }
+        TArray<TSharedPtr<FJsonValue>> W;
+        for (const FString& S : Warnings) { W.Add(MakeShared<FJsonValueString>(S)); }
+        Obj->SetArrayField(TEXT("pose_warnings"), W);
+    }
+}
+
+FString UUAPAgentSubsystem::LevelViewportPose(FString PoseJson)
+{
+    UAP_ACTIVITY(TEXT("viewport pose"), FString());
+    TSharedPtr<FJsonObject> Req;
+    TArray<FUAPLevelPane> Panes;
+    FUAPLevelPane Pane;
+    FString Why, Error;
+    bool bApplied = false;
+    TArray<FString> Warnings;
+    if (!UAPPrepareLevelPane(PoseJson, Req, Panes, Pane, Why, bApplied, Warnings, Error))
+    {
+        return UAPLevelViewportError(Error);
+    }
+    // The read-back is taken from the SAME client the pose was applied to, in the same call.
+    TSharedRef<FJsonObject> Obj = MakeShared<FJsonObject>();
+    Obj->SetBoolField(TEXT("ok"), true);
+    Obj->SetBoolField(TEXT("pose_applied"), bApplied);
+    UAPDescribePane(Pane, Why, Panes, Obj);
+    UAPAddPoseWarnings(Warnings, Obj);
+    return UAPLevelViewportJson(Obj);
+}
+
+FString UUAPAgentSubsystem::CaptureLevelViewport(FString Filename, FString PoseJson)
+{
+    UAP_ACTIVITY(TEXT("screenshot"), FPaths::GetCleanFilename(Filename));
+    if (Filename.IsEmpty())
+    {
+        return UAPLevelViewportError(TEXT("Filename is empty"));
+    }
+    TSharedPtr<FJsonObject> Req;
+    TArray<FUAPLevelPane> Panes;
+    FUAPLevelPane Pane;
+    FString Why, Error;
+    bool bApplied = false;
+    TArray<FString> Warnings;
+    // Pose, read-back and capture all use `Pane.Client`, in this ONE call: nothing can move the
+    // active pane in between.
+    if (!UAPPrepareLevelPane(PoseJson, Req, Panes, Pane, Why, bApplied, Warnings, Error))
+    {
+        return UAPLevelViewportError(Error);
+    }
+    double DrawFrames = 3.0;   // the first frame after a pose change can still be streaming / TAA-cold
+    Req->TryGetNumberField(TEXT("frames"), DrawFrames);
+    const int32 Frames = FMath::Clamp((int32)DrawFrames, 1, 30);
+
+    FLevelEditorViewportClient* VC = Pane.Client;
+    FViewport* Viewport = VC->Viewport;
+    const FIntPoint Size = Viewport ? Viewport->GetSizeXY() : FIntPoint::ZeroValue;
+    if (!Viewport || Size.X <= 0 || Size.Y <= 0)
+    {
+        return UAPLevelViewportError(FString::Printf(
+            TEXT("pane '%s' has a %dx%d viewport (the editor window is minimised or the pane is not "
+                 "on screen), so there is nothing to draw. Restore the window without taking focus "
+                 "or use another pane."), *Pane.Key, Size.X, Size.Y));
+    }
+
+    // Draw the viewport OURSELVES, the same call UEditorEngine::UpdateSingleViewportClient makes
+    // for a realtime viewport. This is the whole fix: nothing waits for the editor to decide to
+    // render a frame, so an idle, non-realtime or unfocused editor still produces one.
+    TArray<FColor> Bitmap;
+    {
+        FScopedConditionalWorldSwitcher WorldSwitcher(VC);
+        for (int32 i = 0; i < Frames; ++i)
+        {
+            VC->Invalidate();
+            Viewport->Draw();
+        }
+        FReadSurfaceDataFlags ReadFlags(RCM_UNorm);
+        ReadFlags.SetLinearToGamma(false);
+        if (!Viewport->ReadPixels(Bitmap, ReadFlags, FIntRect(0, 0, Size.X, Size.Y))
+            || Bitmap.Num() < Size.X * Size.Y)
+        {
+            return UAPLevelViewportError(TEXT("viewport pixel read-back returned no data"));
+        }
+    }
+    for (FColor& Px : Bitmap) { Px.A = 255; }
+
+    // Refuse an all-black / one-flat-colour frame: a "proof" screenshot of nothing is worse than none.
+    bool bFlat = true;
+    for (int32 i = 1; i < Bitmap.Num() && bFlat; ++i)
+    {
+        bFlat = (Bitmap[i].DWColor() == Bitmap[0].DWColor());
+    }
+    if (bFlat)
+    {
+        return UAPLevelViewportError(FString::Printf(
+            TEXT("pane '%s' came back as one flat colour (0x%08X). The scene did not render: shaders or the "
+                 "level may still be loading, or the pose looks at the sky or inside a mesh. Nothing was saved."),
+            *Pane.Key, Bitmap[0].DWColor()));
+    }
+
+    IFileManager::Get().MakeDirectory(*FPaths::GetPath(Filename), /*Tree=*/true);
+    const FImageView Img(Bitmap.GetData(), Size.X, Size.Y);
+    if (!FImageUtils::SaveImageByExtension(*Filename, Img))
+    {
+        return UAPLevelViewportError(FString::Printf(TEXT("could not write %s"), *Filename));
+    }
+
+    TSharedRef<FJsonObject> Obj = MakeShared<FJsonObject>();
+    Obj->SetBoolField(TEXT("ok"), true);
+    Obj->SetStringField(TEXT("path"), Filename);
+    Obj->SetNumberField(TEXT("width"), Size.X);
+    Obj->SetNumberField(TEXT("height"), Size.Y);
+    Obj->SetNumberField(TEXT("frames_drawn"), Frames);
+    Obj->SetBoolField(TEXT("pose_applied"), bApplied);
+    UAPDescribePane(Pane, Why, Panes, Obj);
+    UAPAddPoseWarnings(Warnings, Obj);
+    return UAPLevelViewportJson(Obj);
 }
 
 void UUAPAgentSubsystem::RefreshHelperCache()
