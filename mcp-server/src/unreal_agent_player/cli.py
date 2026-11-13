@@ -1049,6 +1049,17 @@ def _exec(args) -> int:
     code = args.code
     t0 = time.monotonic()
     body: dict = {"ok": True}
+    refusal = None if getattr(args, "unsafe_level_load", False) else _exec_level_load_refusal(code)
+    level_warning = None
+    if refusal and getattr(args, "level_guard", "refuse") == "warn":
+        # exec-file: the map-builder scripts open their own map first, so it is a warning there.
+        level_warning = refusal.replace("refusing: ", "WARNING (ran anyway, exec-file): ")                                .replace(" The script was NOT run.", "")
+        refusal = None
+    if refusal:
+        body = {"ok": False, "error": refusal}
+        _capture("exec", {"code": code[:200]}, body, int((time.monotonic() - t0) * 1000))
+        _emit(body)
+        return 1
     client = PythonRemoteExecClient(node_project_substr=args.project,
                                     node_instance=getattr(args, "instance", None))
     try:
@@ -1091,6 +1102,8 @@ def _exec(args) -> int:
     # subsystem; the reader had no way to tell that from a real editor answering `None`.
     if _target_of(client) is not None:
         body["target"] = _target_of(client)
+    if level_warning:
+        body["warning"] = level_warning
     _capture("exec", {"code": code[:200]}, body, int((time.monotonic() - t0) * 1000))
     _emit(body)
     return 0 if body["ok"] else 1
@@ -1152,7 +1165,9 @@ def _exec_file(args) -> int:
     from unreal_agent_player.transport import guard_py_path_trigger
     code = guard_py_path_trigger(code)
     return _exec(argparse.Namespace(code=code, project=args.project,
-                                    instance=getattr(args, "instance", None)))
+                                    instance=getattr(args, "instance", None),
+                                    unsafe_level_load=getattr(args, "unsafe_level_load", False),
+                                    level_guard="warn"))
 
 
 def _pie_start(mode: str, project: str | None) -> dict:
@@ -2939,6 +2954,131 @@ def _viewport(args) -> int:
     return 0 if body.get("ok") else 1
 
 
+# --- level: the SAFE way to change the open level --------------------------------------------
+#
+# `ULevelEditorSubsystem.load_level` (and load_map / new_level ...) called from editor Python runs the
+# whole map load, GC included, NESTED INSIDE a live Python frame. Whatever that frame holds -- locals,
+# temporaries, wrappers of the outgoing world -- is rooted by FPyReferenceCollector while the old world
+# is torn down. It has killed the SHARED editor repeatedly: "World Memory Leaks: 1 leaks objects and
+# packages" (EditorServer.cpp:1938) and, 2026-11-13, "Assertion failed: IsValidLowLevel()
+# [Obj.cpp:1312]" from the GC inside Map_Load with python311 frames on the stack. [ClickUp 86akezbrp]
+# `uap level open` hands the load to the plugin, which runs it from the editor's own ticker, outside any
+# Python frame, after sweeping the remote-exec globals and Python's garbage.
+
+_NEEDS_LEVEL = ("changing the open level SAFELY (the alternative, load_level from Python, has "
+                "killed the shared editor)")
+
+# The Python spellings of "swap the open level". Matched on the code an `exec` / `exec-file` is about
+# to run; `--unsafe-level-load` is the deliberate override.
+_EXEC_LEVEL_LOAD_RE = re.compile(
+    r"\b(load_level|load_map|open_level|new_level|new_level_from_template|new_blank_map|"
+    r"new_map_from_template|LoadLevel|LoadMap|OpenLevel|NewLevel|NewBlankMap)\b")
+
+
+def _exec_level_load_refusal(code: str) -> str | None:
+    """The refusal for Python that swaps the editor level, or None. A level swap from Python is the
+    crash this verb exists to end, so it is refused BY DEFAULT -- a doc agents may not read does not
+    stop the next one."""
+    m = _EXEC_LEVEL_LOAD_RE.search(code or "")
+    if not m:
+        return None
+    return (f"refusing: this Python calls `{m.group(1)}`. Swapping the open level from editor "
+            "Python runs the map load nested inside a Python frame and has killed the SHARED editor "
+            "(World Memory Leaks / IsValidLowLevel, ClickUp 86akezbrp). Use `uap level open <map>` "
+            "instead -- it loads outside Python, refuses during PIE and on a dirty map, and reads "
+            "the result back. Override only on a throwaway editor with --unsafe-level-load. "
+            "The script was NOT run.")
+
+
+_LEVEL_OPEN_TIMEOUT = 180.0
+_LEVEL_POLL_PROBE_TIMEOUT = 3.0
+
+
+def _level_open(args) -> dict:
+    """Queue a safe level change, wait for it, read the open map back."""
+    project = args.project
+    t0 = time.monotonic()
+    queued = _rc_json("OpenLevel", {"Map": args.map, "bDiscard": bool(args.discard)}, project,
+                      needs=_NEEDS_LEVEL)
+    if not queued.get("ok"):
+        return queued
+    request = queued.get("request")
+    timeout = float(getattr(args, "timeout", None) or _LEVEL_OPEN_TIMEOUT)
+    deadline = t0 + timeout
+    status: dict | None = None
+    silent = 0
+    # The editor's game thread is busy for the whole load, so RemoteControl does not answer: a
+    # short probe timeout keeps each poll cheap and a timeout is "still loading", not a failure.
+    _RC_PROBE_TIMEOUT[0] = _LEVEL_POLL_PROBE_TIMEOUT
+    try:
+        time.sleep(0.5)
+        while time.monotonic() < deadline:
+            try:
+                st = _rc_json("GetLevelOpenStatus", {}, project, needs=_NEEDS_LEVEL)
+                silent = 0
+            except AgentError as exc:
+                if _is_timeout(exc):
+                    time.sleep(0.5)
+                    continue
+                silent += 1
+                if silent >= 6:
+                    return {"ok": False, "request": request, "map": queued.get("map"),
+                            "error": f"the editor stopped answering during the level open ({exc}). "
+                                     "It may have crashed: check Saved/Logs and Saved/Crashes. "
+                                     "Do not retry blindly."}
+                time.sleep(1.0)
+                continue
+            if st.get("request") == request and st.get("state") in ("done", "failed"):
+                status = st
+                break
+            time.sleep(0.5)
+    finally:
+        _RC_PROBE_TIMEOUT[0] = None
+    if status is None:
+        return {"ok": False, "request": request, "map": queued.get("map"), "pending": True,
+                "waited_seconds": round(time.monotonic() - t0, 1),
+                "error": f"the level load did not finish within {timeout:.0f}s. It may still "
+                         "complete: run `uap level current` before doing anything else."}
+
+    out: dict = {"ok": bool(status.get("ok")), "map": status.get("map"),
+                 "map_before": status.get("map_before"), "map_after": status.get("map_after"),
+                 "load_seconds": status.get("load_seconds"), "discard": bool(args.discard),
+                 "waited_seconds": round(time.monotonic() - t0, 1)}
+    if queued.get("mounted_plugin"):
+        out["mounted_plugin"] = queued["mounted_plugin"]
+    if status.get("cleared_globals"):
+        out["cleared_globals"] = status["cleared_globals"]
+    if status.get("error"):
+        out["error"] = status["error"]
+    # Read it back from the live editor rather than trusting the load's own report.
+    try:
+        cur = _rc_json("GetCurrentLevel", {}, project, needs=_NEEDS_LEVEL)
+    except AgentError as exc:
+        cur = {"ok": False, "error": str(exc)}
+    out["readback"] = cur
+    if out["ok"] and not (cur.get("ok") and str(cur.get("map", "")).lower() == str(out["map"]).lower()):
+        out["ok"] = False
+        out["error"] = (f"load reported success but the editor reads back "
+                        f"{cur.get('map')!r}, not {out['map']!r}")
+    return out
+
+
+def _level(args) -> int:
+    """`uap level open <map> [--discard]` / `uap level current`."""
+    t0 = time.monotonic()
+    try:
+        if args.level_cmd == "open":
+            body = _level_open(args)
+        else:
+            body = _rc_json("GetCurrentLevel", {}, args.project, needs=_NEEDS_LEVEL)
+    except AgentError as exc:
+        body = _err(exc)
+    _capture("level", {k: v for k, v in vars(args).items() if k not in ("func",)}, body,
+             int((time.monotonic() - t0) * 1000))
+    _emit(body)
+    return 0 if body.get("ok") else 1
+
+
 _HELP_CATALOG = r"""uap -- drive the Unreal editor for agent testing. Commands target the
 editor named by --project (default $UAP_PROJECT, pinned by this project's uap.ps1 launcher).
 
@@ -3106,6 +3246,22 @@ DRIVE + OBSERVE
                                   unfocused/paused), stamped with its process/project/context;
                                   blank frames refused; counts as pass proof for its project
   uap helpers [--grep RE] [--names]   list the project's test helpers with their arg schemas
+
+LEVEL (change the open map SAFELY -- never load_level from `uap exec`)
+  uap level current                    the open map, dirty state, PIE state, read from the editor
+  uap level open <map> [--discard]     open a map and WAIT; ok:true means the editor reads the map back.
+                                       <map> = /Game/Maps/L_X | /Game/Maps/L_X.L_X | a unique bare name |
+                                       a Dream map /<Plugin>/Maps/<Map> (its content-only plugin is
+                                       mounted for you). Refuses during PIE, while another open is
+                                       pending, and on a DIRTY map unless --discard. It NEVER saves.
+  WHY: load_level / load_map from editor Python runs the map load (and its GC) nested inside a live
+  Python frame; whatever that frame references is rooted while the old world is destroyed, and the
+  SHARED editor dies ("World Memory Leaks", "Assertion failed: IsValidLowLevel()" -- ClickUp 86akezbrp).
+  `level open` queues the load in the plugin, which runs it from the editor ticker OUTSIDE any Python
+  frame after dropping the exec globals and collecting Python garbage. `uap exec` / `exec-file` now
+  REFUSE code that calls load_level / load_map / new_level (--unsafe-level-load overrides, throwaway
+  editors only). Hold the lease (`uap lease acquire exclusive --reason pie`) if others share the editor:
+  a level change takes the editor away from whatever they were doing.
 
 SUSTAINED INPUT (a single injected event CANNOT drive locomotion -- see below)
   uap input hold <Key> --seconds N     hold a digital key; returns at once, held in-engine
@@ -3354,6 +3510,7 @@ VERBS (uap help <verb>)
   exec "<py>" | exec-file <p>    Python in the editor (read state; never drive RPCs from it)
                                   --client N runs it against client N's PIE world (UAP_WORLD, UAP_CLIENT;
                                   get_game_world() too); a missing client is REFUSED, never the host
+  level open <map> | level current   change/read the open level; never load_level via exec
   rc <Func> k=v ...              a plugin UFUNCTION over Remote Control
   read-ui | click <text> | tab <id> | nav <dir>     on-screen UMG / CommonUI
   screenshot <abs.png> [--window <client>]          3D + UI composite; standalone clients
@@ -3404,6 +3561,7 @@ _HELP_SECTIONS = {
     "click": ("DRIVE + OBSERVE",), "tab": ("DRIVE + OBSERVE",), "nav": ("DRIVE + OBSERVE",),
     "screenshot": ("DRIVE + OBSERVE",), "helpers": ("DRIVE + OBSERVE",),
     "viewport": ("DRIVE + OBSERVE",),
+    "level": ("LEVEL (",),
     "instances": ("DRIVE + OBSERVE", "FLAGS:"),
     "input": ("SUSTAINED INPUT", "MOUSE"),
     "mouse": ("MOUSE",),
@@ -3414,7 +3572,7 @@ _HELP_SECTIONS = {
     "output": ("NEW:",), "brief": ("NEW:",), "timing": ("NEW:",), "wait": ("NEW:",),
 }
 _HELP_HEADS = ("COMMON MISTAKES", "PREFLIGHT", "REPORT", "PLAY-IN-EDITOR",
-               "MULTI-AGENT COORDINATION", "TWO PROJECTS", "DRIVE + OBSERVE", "SUSTAINED INPUT",
+               "MULTI-AGENT COORDINATION", "TWO PROJECTS", "DRIVE + OBSERVE", "LEVEL (", "SUSTAINED INPUT",
                "MOUSE", "SAMPLING + LOGS", "RECIPES", "SPEED:", "FLAGS:", "MORE:", "NEW:")
 
 
@@ -3453,7 +3611,7 @@ def _help(args) -> int:
 
 
 # Editor-touching verbs auto-wait while another agent is rebuilding this editor (see main()).
-_REBUILD_GUARDED = {"status", "rc", "exec", "exec-file", "pie",
+_REBUILD_GUARDED = {"status", "rc", "exec", "exec-file", "pie", "level",
                     "read-ui", "click", "tab", "nav", "screenshot", "viewport",
                     "input", "xr", "sample", "log", "helpers"}
 
@@ -3795,10 +3953,32 @@ def build_parser() -> argparse.ArgumentParser:
     inst.set_defaults(func=_instances)
     ex = sub.add_parser("exec", parents=[proj])
     ex.add_argument("code")
+    ex.add_argument("--unsafe-level-load", action="store_true", default=False,
+                    help="run Python that swaps the editor level (load_level / load_map ...). "
+                         "Refused by default: it has killed the shared editor. Use `uap level open`.")
     ex.set_defaults(func=_exec)
     exf = sub.add_parser("exec-file", parents=[proj])
     exf.add_argument("path")
+    exf.add_argument("--unsafe-level-load", action="store_true", default=False,
+                     help="accepted for symmetry with `exec`; exec-file only WARNS about level "
+                          "swaps (builder scripts open their own map). Prefer `uap level open`.")
     exf.set_defaults(func=_exec_file)
+    lv = sub.add_parser("level", help="open / read the editor level SAFELY (never load_level from Python)")
+    lvs = lv.add_subparsers(dest="level_cmd", required=True)
+    lvo = lvs.add_parser("open", parents=[proj],
+                         help="open a map outside Python; refuses during PIE and on a dirty map")
+    lvo.add_argument("map", help="/Game/Maps/L_X, /Game/Maps/L_X.L_X, a unique bare map name, or a "
+                                 "Dream map (/MarbleRace/Maps/Map_MarbleRace: its content-only "
+                                 "plugin is mounted if needed)")
+    lvo.add_argument("--discard", action="store_true", default=False,
+                     help="open even if the current map has unsaved changes (they are LOST; "
+                          "nothing is ever saved)")
+    lvo.add_argument("--timeout", type=float, default=_LEVEL_OPEN_TIMEOUT, metavar="S",
+                     help=f"seconds to wait for the load (default {_LEVEL_OPEN_TIMEOUT:.0f})")
+    lvo.set_defaults(func=_level)
+    lvc = lvs.add_parser("current", parents=[proj],
+                         help="the open map, dirty state and PIE state, read from the live editor")
+    lvc.set_defaults(func=_level)
     pie = sub.add_parser("pie").add_subparsers(dest="pie_cmd", required=True)
     ps = pie.add_parser("start", parents=[proj])
     ps.add_argument("--mode", choices=["flat", "vr"], default="flat",
