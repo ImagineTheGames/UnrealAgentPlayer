@@ -40,6 +40,7 @@ Three injectable surfaces for desktop-mode VR testing (no headset required):
    answers every source with the grip pose, so aim == grip; `SetXRAimEmulation` / `uap xr aim on`
    makes `<Hand>Aim` answer grip_to_aim * grip so lasers and "where does the player point" checks
    see a real delta. Off by default so nothing changes for a project that does not ask.
+   **Per client:** `FAgentMotionController` is one modular feature shared by every PIE world, and every pawn polls it with ControllerIndex 0, so it keeps one set of hands PER PIE INSTANCE and attributes a poll to a client by `UE::GetPlayInEditorID()` (set by the editor for the whole of that world's tick). `Client` selects the slot on the four pose verbs (empty = client 0). The render thread's late-update poll answers `false` (it cannot name its client); the game-thread poll already placed the component.
 3. **HMD pose — DEFERRED.** There is no `IMotionController`-equivalent injection hook for the
    head pose; overriding it requires a fake `IXRTrackingSystem`/stereo render device, which is
    invasive and risks destabilizing the Meta XR runtime path. Revisit only when a concrete test

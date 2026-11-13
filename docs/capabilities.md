@@ -173,6 +173,7 @@ CLI verbs for the same surface (`uap xr ...`):
 | `uap xr grip\|trigger left\|right [v] --seconds N` | `HoldAxis` on `OculusTouch_<Hand>_Grip_Axis` / `_Trigger_Axis` | An `input axis` hold: same ledger, overlap refusal, `--wait`. |
 | `uap xr aim on\|off\|status [--loc X Y Z --rot P Y R]` | `SetXRAimEmulation` / `GetXRControllerState` | **Opt-in, OFF by default.** With it OFF the `<Hand>Aim` source answers the GRIP pose (aim == grip). ON: `<Hand>Aim` = grip_to_aim * grip, default delta = Quest (pitch -60, loc 7.35 0 -6.73), given for the right hand and mirrored for the left. A zero delta means "use the Quest default". |
 | `uap xr state` | `GetXRControllerState` | Grip pose, the aim pose this controller answers, and whether aim is emulated, per hand. |
+| `--client N|all` on any `uap xr` verb | `Client` on all four pose verbs | **The injected hands are PER PIE CLIENT** [17tm466zwx5]. Default (no flag) = client 0 ONLY; `--client 1` = that client; `all` = every client (the pre-fix behaviour, now explicit). `grip` / `trigger` already honoured `--client`; pose, aim, state and clear now do too. A plugin copy without the `Client` parameter is refused as skew. |
 
 `InjectXRButton` now REFUSES a key that names the other hand (`Hand=Right`, `OculusTouch_Left_X_Click`); it used to ignore `Hand` and press whatever the key said.
 

@@ -1408,3 +1408,34 @@ per channel was entirely fictitious; the real figure was 2.5). [ClickUp 17tm466f
 * **Not a defect, still true:** `editor_set_viewport_realtime(True)` logs a handled ensure
   (`!bCheckMissingOverride || bRemoved`). It is the engine's, harmless, and `CaptureLevelViewport` does not need
   realtime at all.
+
+## 43. `uap xr` pose reached EVERY PIE client, not the one asked for -- FIXED (17tm466zwx5)
+
+* **Symptom (Marble Race T5, 2026-11-12):** with 2 PIE clients, `uap xr pose|grip|trigger` moved the hand on BOTH
+  players; the client player's own hand took and magnetised a piece. `--client` was honoured for the grip/trigger
+  keys (they ride `input axis`) but not for the pose.
+* **Cause:** `FAgentMotionController` is ONE `IMotionController` modular feature with ONE `Hands[2]` state. Every
+  PIE pawn's `UMotionControllerComponent` polls it with `ControllerIndex` 0, and `InjectXRControllerPose` /
+  `ClearXRControllerOverride` / `SetXRAimEmulation` / `GetXRControllerState` took no `Client`, so a pose was a
+  global fact about the process.
+* **Fix (plugin):** state is kept per PIE instance. A poll is attributed to a client by
+  `UE::GetPlayInEditorID()`, which `UEditorEngine::Tick` sets (`SetPlayInEditorWorld`) for the whole tick of the
+  world being ticked, so `TickComponent` -> `PollControllerState_GameThread` lands on the right slot. The four verbs
+  take `Client`: empty = the default client (client 0), `N`, `all`. A poll off the game thread (the render thread's
+  late update) answers false - it cannot name its client and the game-thread poll already placed the component.
+  A missing client is refused and logged, nothing is changed on any client.
+* **Fix (CLI):** the four verbs joined `_CLIENT_VERBS`, so `--client` rides them and an older plugin without the
+  parameter is refused as skew (it would otherwise move every client). Default is client 0, never "all".
+* **Verified live (2026-11-12, School's Out editor, `Map_GripStudio`, 2 PIE clients = ListenServer + Client, both
+  possessing `BP_SO_VRcharacter`, read from each pawn's `GripMotionControllerComponent` relative location):**
+  baseline both hands (0,0,0) on both pawns. `xr pose right 32 14 135 --client 1`: client 1's right hand
+  (40,14,135), client 0 unchanged. `xr pose left ... ` (no flag): client 0's left hand moved, client 1's untouched.
+  `xr pose right 30 20 120 --client 0`: client 0's right hand moved, client 1's right stayed. `xr state --client N`
+  showed each client's own pose. `xr clear right --client 1` cleared client 1 only. `--client all` moved both
+  (what every call did before the fix). `xr grip --client 1` then `--client 0`: `input status` held each only on
+  its own client. `--client 7` is refused.
+* **BREAKING (plugin):** `InjectXRControllerPose`, `ClearXRControllerOverride`, `SetXRAimEmulation` and
+  `GetXRControllerState` gained a trailing `FString Client` parameter (editor and runtime subsystems). C++ callers on
+  the old arity stop compiling and BlueprintCallable callers break when the asset is next compiled; the only callers
+  in School's Out are `uap` itself (the CLI sends the parameter only with `--client`; RemoteControl zero-fills an
+  omitted one to "", the default client). Every project needs a plugin re-sync + rebuild (`Restart-Editor.ps1`).

@@ -188,11 +188,14 @@ public:
     UFUNCTION(BlueprintCallable, Category="Agent|Input")
     FString ReleaseSlatePointerCapture();
 
+    // PER CLIENT [17tm466zwx5]: the injected hands are kept per PIE client, so a pose reaches exactly
+    // one pawn. Client "" = the default client (client 0), "N" = that PIE instance, "all" = every
+    // client. Before this the pose was ONE global state and moved the hand on every PIE player.
     UFUNCTION(BlueprintCallable, Category="Agent|Input")
-    bool InjectXRControllerPose(EAgentXRHand Hand, FVector Position, FRotator Orientation, bool bTracked);
+    bool InjectXRControllerPose(EAgentXRHand Hand, FVector Position, FRotator Orientation, bool bTracked, FString Client);
 
     UFUNCTION(BlueprintCallable, Category="Agent|Input")
-    bool ClearXRControllerOverride(EAgentXRHand Hand);
+    bool ClearXRControllerOverride(EAgentXRHand Hand, FString Client);
 
     // Opt-in aim-pose emulation for the injected controllers (OFF by default). With it ON the
     // "<Hand>Aim" motion source answers GripToAim * grip instead of the grip pose itself, so a
@@ -201,12 +204,12 @@ public:
     // default. Delta is for the RIGHT hand; the left uses its mirror. See AgentMotionController.h.
     // {"ok":true,"aim_emulation":bool,"delta_source":"quest_default"|"caller",...}
     UFUNCTION(BlueprintCallable, Category="Agent|Input")
-    FString SetXRAimEmulation(bool bEnabled, FVector GripToAimLocation, FRotator GripToAimRotation);
+    FString SetXRAimEmulation(bool bEnabled, FVector GripToAimLocation, FRotator GripToAimRotation, FString Client);
 
     // What the injected controllers answer right now: per hand active/tracked, the grip pose and
     // the aim pose this controller reports for "<Hand>Aim", plus the emulation state.
     UFUNCTION(BlueprintCallable, Category="Agent|Input")
-    FString GetXRControllerState();
+    FString GetXRControllerState(FString Client);
 
     UFUNCTION(BlueprintCallable, Category="Agent|Helpers")
     TArray<FAgentHelperDescriptor> ListTestHelpers();

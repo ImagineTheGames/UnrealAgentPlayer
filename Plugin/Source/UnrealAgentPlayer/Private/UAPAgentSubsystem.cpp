@@ -559,7 +559,7 @@ bool UUAPAgentSubsystem::StopPropertySample()
     return true;
 }
 
-bool UUAPAgentSubsystem::InjectXRControllerPose(EAgentXRHand Hand, FVector Position, FRotator Orientation, bool bTracked)
+bool UUAPAgentSubsystem::InjectXRControllerPose(EAgentXRHand Hand, FVector Position, FRotator Orientation, bool bTracked, FString Client)
 {
     UAP_ACTIVITY(TEXT("input xr-pose"), FString());
     FUnrealAgentPlayerRuntimeModule* Rtm = FUnrealAgentPlayerRuntimeModule::Get();
@@ -569,35 +569,33 @@ bool UUAPAgentSubsystem::InjectXRControllerPose(EAgentXRHand Hand, FVector Posit
     Pose.Position = Position;
     Pose.Orientation = Orientation;
     Pose.bTracked = bTracked;
-    MC->SetPose(Hand, Pose);
-    return true;
+    return MC->SetPose(Client, Hand, Pose);
 }
 
-bool UUAPAgentSubsystem::ClearXRControllerOverride(EAgentXRHand Hand)
+bool UUAPAgentSubsystem::ClearXRControllerOverride(EAgentXRHand Hand, FString Client)
 {
     UAP_ACTIVITY(TEXT("input xr-clear"), FString());
     FUnrealAgentPlayerRuntimeModule* Rtm = FUnrealAgentPlayerRuntimeModule::Get();
     FAgentMotionController* MC = Rtm ? Rtm->GetMotionController() : nullptr;
     if (!MC) { return false; }
-    MC->ClearPose(Hand);
-    return true;
+    return MC->ClearPose(Client, Hand);
 }
 
-FString UUAPAgentSubsystem::SetXRAimEmulation(bool bEnabled, FVector GripToAimLocation, FRotator GripToAimRotation)
+FString UUAPAgentSubsystem::SetXRAimEmulation(bool bEnabled, FVector GripToAimLocation, FRotator GripToAimRotation, FString Client)
 {
     UAP_ACTIVITY(TEXT("input xr-aim"), bEnabled ? TEXT("on") : TEXT("off"));
     FUnrealAgentPlayerRuntimeModule* Rtm = FUnrealAgentPlayerRuntimeModule::Get();
     FAgentMotionController* MC = Rtm ? Rtm->GetMotionController() : nullptr;
     if (!MC) { return TEXT("{\"ok\":false,\"error\":\"agent motion controller not registered\"}"); }
-    return MC->SetAimEmulationJson(bEnabled, GripToAimLocation, GripToAimRotation);
+    return MC->SetAimEmulationJson(Client, bEnabled, GripToAimLocation, GripToAimRotation);
 }
 
-FString UUAPAgentSubsystem::GetXRControllerState()
+FString UUAPAgentSubsystem::GetXRControllerState(FString Client)
 {
     FUnrealAgentPlayerRuntimeModule* Rtm = FUnrealAgentPlayerRuntimeModule::Get();
     FAgentMotionController* MC = Rtm ? Rtm->GetMotionController() : nullptr;
     if (!MC) { return TEXT("{\"ok\":false,\"error\":\"agent motion controller not registered\"}"); }
-    return MC->StateJson();
+    return MC->StateJson(Client);
 }
 
 FString UUAPAgentSubsystem::DumpViewportUI(FString Client)
