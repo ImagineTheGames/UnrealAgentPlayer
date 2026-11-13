@@ -229,7 +229,7 @@ class _FakeEditor:
 
 @pytest.mark.skipif(not _multicast_available(), reason="multicast port unavailable")
 def test_full_handshake_with_fake_editor():
-    client = _new_client(discovery_timeout=4.0, exec_timeout=4.0)
+    client = _new_client(discovery_timeout=4.0, exec_timeout=4.0, node_project_substr="Fake")
     with _FakeEditor("fake-ue-node", {client._node_id}):
         result = client.exec_python("print('hello')")
     assert result["success"] is True

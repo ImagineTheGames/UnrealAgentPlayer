@@ -1528,3 +1528,19 @@ per channel was entirely fictitious; the real figure was 2.5). [ClickUp 17tm466f
   camera moves); it needs a VRExpansion `ReplicatedVRCameraComponent` on the pawn (a flat pawn reports `head.note`).
   The injected head is VRE's own input, so VRE's placement applies: with `bRetainRoomscale` false the camera's XY
   is zeroed (capsule follows) and only Z / rotation carry, exactly as with a headset.
+
+
+## 48. `--instance pid:<editor pid>` refused by input/read-ui/rc/...; a second process answered `exec` as "the editor" -- FIXED (17tm466zy8h)
+
+* **Cause 1:** `_resolve_instance_target` only knew standalone `-game` clients (it needs `-UAPRCPort=<n>` in the command
+  line). An EDITOR pinned by pid has no such flag, so `uap input clients --instance pid:<editor>` answered
+  `INSTANCE_NOT_FOUND ... was not started with -UAPRCPort`, while `exec-file --instance pid:<editor>` worked. Pinning by
+  pid is the safe way to avoid cross-targeting, so it has to work for every verb.
+* **Fix 1:** an editor pid is resolved by asking THAT process (remote-exec addressed by pid) which RC port it bound, then
+  driving it on the editor preset on that port. It still goes through the lease / rebuild / machine guards (it is an
+  editor). `screenshot` now honours `--instance` too (it used to ignore it silently).
+* **Cause 2:** `_select_node` returned the FIRST node matching project + instance. When a second short-lived process of
+  the same project answered as role `editor` (pid 89952, MarbleRace output), "first answer wins" handed back that other
+  process's output as the editor's.
+* **Fix 2:** two or more live nodes matching the selector are now refused (`UE_WRONG_INSTANCE`), naming every pid; pin one
+  with `--instance pid:<n>` or retry if one is transient. A pid selector always matches exactly one.
