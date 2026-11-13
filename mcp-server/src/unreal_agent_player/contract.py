@@ -103,6 +103,8 @@ ARG_PURPOSE = {
     ("InjectAxis", "SlateUser"): "`rc InjectAxis SlateUser=N` -- the Slate route",
     ("InjectGamepad", "SlateUser"): "`rc InjectGamepad SlateUser=N` -- the Slate route",
     ("StartPropertySample", "SeriesName"): "`sample start --name` -- several concurrent series",
+    ("StartPropertySample", "Client"): "`sample start --client N` -- resolves an actor name in that "
+                                       "PIE client's world, not the host's",
     ("ReadPropertySample", "SeriesName"): "`sample read --name`",
     ("StopPropertySample", "SeriesName"): "`sample stop --name|--all`",
 }

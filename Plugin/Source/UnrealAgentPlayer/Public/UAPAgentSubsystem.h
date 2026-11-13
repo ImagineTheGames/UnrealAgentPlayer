@@ -227,7 +227,7 @@ public:
     // Records a property once per frame in-engine, so an agent can measure sub-second behaviour
     // (judder, a 0.6s wind-up, a one-frame pop) that a ~1s exec round-trip cannot see.
     UFUNCTION(BlueprintCallable, Category="Agent|Sample")
-    FString StartPropertySample(FString ObjectPath, FString PropertyPath, float Seconds, int32 MaxSamples, FString SeriesName);
+    FString StartPropertySample(FString ObjectPath, FString PropertyPath, float Seconds, int32 MaxSamples, FString SeriesName, FString Client);
 
     UFUNCTION(BlueprintCallable, Category="Agent|Sample")
     FString ReadPropertySample(FString SeriesName);

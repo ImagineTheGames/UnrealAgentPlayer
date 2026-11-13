@@ -1577,3 +1577,14 @@ auto-capture never looked at the caller's token at all, so the Marble agent's fi
 
 Tests: `mcp-server/tests/test_report_slot_ownership.py`. **Still open:** the overlay shows only the
 newest open report, not all of them.
+
+## 50. `uap sample start --client N <actor name>` ignored N and read the HOST world's actor -- FIXED (17tm466zz8x)
+
+* **Symptom:** in a 2-client PIE, sampling a same-named actor with `--client 1` returned the host's values; only a
+  full `/Game/...` object path (not world-scoped) was right. Found 2026-11-13 by a Marble Race agent.
+* **Cause:** `StartPropertySample` had no `Client` parameter, so `FAgentSampler` looked the name (and the
+  `PlayerPawn` / `PlayerController` / `PlayerCameraManager` shortcuts) up in the FIRST game world.
+* **Fix:** `Client` is the last parameter of `StartPropertySample` on both subsystems; the object is resolved inside
+  `FAgentWorld::FScope` for that client; `all` is refused (a series watches one object); the reply carries `world`
+  (e.g. `UEDPIE_1_L_DevTest`). The CLI sends it via `_CLIENT_VERBS`; a plugin copy without `Client` is refused as
+  skew. BREAKING(plugin): the UFUNCTION gained a parameter, so re-sync the plugin and `Restart-Editor.ps1`.

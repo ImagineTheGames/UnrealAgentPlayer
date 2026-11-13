@@ -441,3 +441,18 @@ def test_an_editor_pid_target_is_not_treated_as_a_standalone(monkeypatch):
     args = type("A", (), {"instance": "pid:10", "project": "SchoolsOut"})()
     assert cli._standalone_instance_selected(
         args, {"port": 30011, "preset": "UAP_Preset", "pid": 10, "role": "editor"}) is False
+
+
+def test_sample_start_is_per_client_so_an_actor_name_resolves_in_that_clients_world(monkeypatch):
+    """`sample start --client 1 <actor name>` used to read the HOST's actor: StartPropertySample
+    carried no Client, so the plugin looked the name up in the first game world."""
+    monkeypatch.setattr(cli, "_live_contract", lambda project=None: None)
+    cli._CLIENT[0] = "1"
+    assert "StartPropertySample" in cli._CLIENT_VERBS
+    sent = cli._with_client("StartPropertySample", {"ObjectPath": "Cube", "PropertyPath": "WorldLocation"}, None)
+    assert sent["Client"] == "1"
+    # an older plugin that lacks the parameter is refused, not silently sampled on client 0
+    monkeypatch.setattr(cli, "_live_contract", lambda project=None: {
+        "StartPropertySample": {"ObjectPath": "FString", "PropertyPath": "FString"}})
+    with pytest.raises(cli.AgentError):
+        cli._with_client("StartPropertySample", {"ObjectPath": "Cube"}, "SchoolsOut")

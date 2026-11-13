@@ -20,6 +20,10 @@ public:
      * Begin sampling. Returns a JSON status string: {"ok":true,"object":"...","property":"..."}
      * or {"ok":false,"error":"..."}.
      *
+     * Client ("" / "N", see FAgentWorld) picks the PIE world an actor NAME or a PlayerPawn-style
+     * shortcut is resolved in. "" = the first game world. "all" is refused: a series watches ONE
+     * object. A full object path is not world-scoped and ignores Client.
+     *
      * ObjectPath accepts a full object path (/Game/...), an actor name/substring in the live
      * game world, or one of the shortcuts PlayerPawn / PlayerController / PlayerCameraManager.
      *
@@ -29,7 +33,8 @@ public:
      * WorldScale, WorldTransform, ForwardVector or Velocity.
      */
     static FString Start(const FString& ObjectPath, const FString& PropertyPath,
-                         float Seconds, int32 MaxSamples, const FString& SeriesName = FString());
+                         float Seconds, int32 MaxSamples, const FString& SeriesName = FString(),
+                         const FString& Client = FString());
 
     /** JSON: {"ok":true,"active":bool,"object":..,"property":..,"count":N,"samples":[{"t":sec,"v":..}]} */
     static FString Read(const FString& SeriesName = FString());

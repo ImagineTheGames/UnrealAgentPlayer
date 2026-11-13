@@ -213,7 +213,7 @@ The finest granularity reachable from outside the editor is one exec round-trip 
 
 | UFUNCTION | CLI | Purpose |
 | --- | --- | --- |
-| `StartPropertySample` | `uap sample start <object> <property> --seconds N [--name ID]` | Begin a series. Takes `SeriesName`: several named series run at once (max 16); a start replaces only the same name. Returns `{ok, name, replaced, series_held}` or `{ok:false, error}`. |
+| `StartPropertySample` | `uap sample start <object> <property> --seconds N [--name ID]` | Begin a series. Takes `SeriesName`: several named series run at once (max 16); a start replaces only the same name. `Client` (`--client N`) resolves an actor NAME / `PlayerPawn` in that PIE client's world (it used to always be the host's); the reply carries `world`. Returns `{ok, name, replaced, world, series_held}` or `{ok:false, error}`. |
 | `ReadPropertySample` | `uap sample read [--name ID]` | `{name, active, object, property, count, samples:[{t, v}]}`; an unknown name answers `ok:false` + `series:[...]` held. |
 | `StopPropertySample` | `uap sample stop [--name ID \| --all]` | Stop early, keeping what was collected (`SeriesName` `*` = every series). |
 
@@ -441,7 +441,7 @@ Everything it was for is done in-engine instead:
 
 ## Multi-client PIE (`--client`)
 
-With `PlayNumberOfClients > 1` the editor runs several game worlds in one process. Every input / hold / release / click / read-ui verb takes `--client <N|all>` (or `$UAP_CLIENT`): the PIE instance index, or every client. `uap input clients` lists them (index, net mode, window title, pawn). Without `--client` the first game world is used, as before. **`screenshot --client N` captures that client's own game viewport** [17tm466zx5y] (`CaptureViewportWithUI` has a `Client` parameter; it used to always return the first client's, the host's, view). A client that does not exist, or `--client all`, is refused; no flag = first PIE viewport as before. A hold belongs to the client it started on (the same key held on two clients is two holds). An older plugin copy that lacks the parameter is refused (it would silently drive client 0), never ignored.
+With `PlayNumberOfClients > 1` the editor runs several game worlds in one process. Every input / hold / release / click / read-ui verb, and `sample start` (actor names resolve in that client's world), takes `--client <N|all>` (or `$UAP_CLIENT`): the PIE instance index, or every client. `uap input clients` lists them (index, net mode, window title, pawn). Without `--client` the first game world is used, as before. **`screenshot --client N` captures that client's own game viewport** [17tm466zx5y] (`CaptureViewportWithUI` has a `Client` parameter; it used to always return the first client's, the host's, view). A client that does not exist, or `--client all`, is refused; no flag = first PIE viewport as before. A hold belongs to the client it started on (the same key held on two clients is two holds). An older plugin copy that lacks the parameter is refused (it would silently drive client 0), never ignored.
 
 ---
 

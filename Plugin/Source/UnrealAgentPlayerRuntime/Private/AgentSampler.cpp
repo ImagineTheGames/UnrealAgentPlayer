@@ -23,6 +23,7 @@ namespace
     {
         TWeakObjectPtr<UObject> Object;
         FString ObjectLabel;
+        FString World;   // world the object lives in (proves which client was sampled)
         FString PropertyPath;
         double  StartRealTime = 0.0;
         double  EndRealTime = 0.0;
@@ -291,7 +292,8 @@ namespace
 }
 
 FString FAgentSampler::Start(const FString& ObjectPath, const FString& PropertyPath,
-                             float Seconds, int32 MaxSamples, const FString& SeriesName)
+                             float Seconds, int32 MaxSamples, const FString& SeriesName,
+                             const FString& Client)
 {
     if (Seconds <= 0.f) { return UAPError(TEXT("Seconds must be > 0")); }
     // Bounded on purpose: this holds every sample in memory and is meant for short windows.
@@ -299,7 +301,24 @@ FString FAgentSampler::Start(const FString& ObjectPath, const FString& PropertyP
     const int32 ClampedMax = FMath::Clamp(MaxSamples <= 0 ? 5000 : MaxSamples, 1, 20000);
 
     FString Error;
-    UObject* Obj = UAPResolveObject(ObjectPath, Error);
+    // Resolve the object in the CLIENT'S world: an actor name used to be looked up in the first
+    // game world whatever --client said, so client 1 silently sampled the host's actor.
+    TArray<UWorld*> ClientWorlds;
+    if (!FAgentWorld::ResolveClients(Client, ClientWorlds, Error)) { return UAPError(Error); }
+    if (ClientWorlds.Num() > 1)
+    {
+        return UAPError(TEXT("a sample series watches one object: name one client, not \"all\""));
+    }
+    UObject* Obj = nullptr;
+    if (ClientWorlds.Num() == 1)
+    {
+        FAgentWorld::FScope Scope(ClientWorlds[0]);
+        Obj = UAPResolveObject(ObjectPath, Error);
+    }
+    else
+    {
+        Obj = UAPResolveObject(ObjectPath, Error);
+    }
     if (!Obj) { return UAPError(Error); }
 
     TSharedPtr<FJsonValue> Probe;
@@ -318,6 +337,7 @@ FString FAgentSampler::Start(const FString& ObjectPath, const FString& PropertyP
     Series = FUAPSeries();
     Series.Object = Obj;
     Series.ObjectLabel = Obj->GetName();
+    Series.World = Obj->GetWorld() ? Obj->GetWorld()->GetName() : FString();
     Series.PropertyPath = PropertyPath;
     Series.StartRealTime = FPlatformTime::Seconds();
     Series.EndRealTime = Series.StartRealTime + ClampedSeconds;
@@ -335,6 +355,7 @@ FString FAgentSampler::Start(const FString& ObjectPath, const FString& PropertyP
     O->SetStringField(TEXT("name"), SeriesName);
     O->SetBoolField(TEXT("replaced"), bReplaced);
     O->SetStringField(TEXT("object"), Series.ObjectLabel);
+    O->SetStringField(TEXT("world"), Series.World);
     O->SetStringField(TEXT("property"), Series.PropertyPath);
     O->SetNumberField(TEXT("seconds"), ClampedSeconds);
     O->SetNumberField(TEXT("max_samples"), ClampedMax);
