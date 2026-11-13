@@ -3510,8 +3510,7 @@ VERBS (uap help <verb>)
   exec "<py>" | exec-file <p>    Python in the editor (read state; never drive RPCs from it)
                                   --client N runs it against client N's PIE world (UAP_WORLD, UAP_CLIENT;
                                   get_game_world() too); a missing client is REFUSED, never the host
-  level open <map> [--discard] | level current    change / read the open level SAFELY
-                                  NEVER load_level from exec (it killed the shared editor)
+  level open <map> | level current   change/read the open level; never load_level via exec
   rc <Func> k=v ...              a plugin UFUNCTION over Remote Control
   read-ui | click <text> | tab <id> | nav <dir>     on-screen UMG / CommonUI
   screenshot <abs.png> [--window <client>]          3D + UI composite; standalone clients
