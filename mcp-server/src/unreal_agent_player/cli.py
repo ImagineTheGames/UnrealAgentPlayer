@@ -1073,6 +1073,10 @@ def _instances(args) -> int:
 def _exec_file(args) -> int:
     with open(args.path, encoding="utf-8") as f:
         code = f.read()
+    # UE's ExecuteFile mode reads the FIRST ".py" in the text as a script path, so a `# foo.py`
+    # comment line made the whole file "not found" [17tm466zx66].
+    from unreal_agent_player.transport import guard_py_path_trigger
+    code = guard_py_path_trigger(code)
     return _exec(argparse.Namespace(code=code, project=args.project,
                                     instance=getattr(args, "instance", None)))
 
