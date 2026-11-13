@@ -284,25 +284,34 @@ def image_stats(width: int, height: int, bgra: bytes) -> dict[str, Any]:
     dark = 0
     luma_sum = 0.0
     colors: set[tuple[int, int, int]] = set()
+    lit_pts: list[tuple[int, int]] = []
     for o in offs:
         b, g, r = bgra[o], bgra[o + 1], bgra[o + 2]
         if r <= _BLACK_MAX and g <= _BLACK_MAX and b <= _BLACK_MAX:
             dark += 1
+        else:
+            p = o // 4
+            lit_pts.append((p % width, p // width))
         luma_sum += 0.2126 * r + 0.7152 * g + 0.0722 * b
         if len(colors) < 64:
             colors.add((r, g, b))
     n = len(offs)
+    from unreal_agent_player.png_stats import LIVE_CELL_FRACTION_MIN, live_cell_fraction
+    live = live_cell_fraction(width, height, lit_pts,
+                              (((o // 4) % width, (o // 4) // width) for o in offs))
     stats: dict[str, Any] = {
+        "live_cell_fraction": round(live, 3),
         "dark_fraction": round(dark / n, 4),
         "distinct_colors": len(colors),          # capped at 64 -- only "1" matters
         "mean_luma": round(luma_sum / n, 1),
         "sampled": n,
         "blank": False,
     }
-    if stats["dark_fraction"] >= _BLACK_FRACTION:
+    if stats["dark_fraction"] >= _BLACK_FRACTION or live < LIVE_CELL_FRACTION_MIN:
         stats["blank"] = True
-        stats["reason"] = (f"image is black ({stats['dark_fraction']:.1%} of sampled pixels "
-                           f"<= {_BLACK_MAX} in every channel)")
+        stats["reason"] = (f"image is black: only {live:.0%} of the frame has any content "
+                           f"(pixels > {_BLACK_MAX}); {stats['dark_fraction']:.1%} of sampled "
+                           "pixels are black")
     elif len(colors) == 1:
         stats["blank"] = True
         stats["reason"] = f"image is a single flat colour rgb{next(iter(colors))}"
