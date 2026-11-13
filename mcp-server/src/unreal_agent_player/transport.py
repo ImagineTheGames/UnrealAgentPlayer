@@ -213,6 +213,28 @@ class RemoteControlClient:
         return str(result if isinstance(result, str) else "")
 
 
+_PY_EXT_RE = re.compile(r"\.(p)(y)", re.IGNORECASE)
+
+
+def guard_py_path_trigger(code: str) -> str:
+    """Make literal CODE safe to send in remote-exec `ExecuteFile` mode.
+
+    UE's `ExecuteFile` runs literal code OR a `.py` path, and tells them apart by finding the
+    FIRST ".py" anywhere in the command: everything before it is taken as the script PATH and
+    the rest as its arguments (PythonScriptPlugin::ExecPythonCommand). So a script whose first
+    line is `# builder.py - does X` (or any text with ".py" followed by a blank) fails with a
+    file-not-found on "# builder.py" instead of running [17tm466zx66].
+
+    Code with no ".py" in it is returned UNCHANGED. Otherwise it is wrapped as
+    `exec(compile(<literal>, ...))`, the literal spelling every ".py" as ".p" + backslash-x79 so the engine
+    never sees the trigger. The wrapper runs in the same globals, and tracebacks keep their line
+    numbers."""
+    if not _PY_EXT_RE.search(code):
+        return code
+    lit = _PY_EXT_RE.sub(lambda m: f".{m.group(1)}\\x{ord(m.group(2)):02x}", repr(code))
+    return f"exec(compile({lit}, '<uap exec-file>', 'exec'))"
+
+
 class PythonRemoteExecClient:
     """Client for UE's Python Remote Execution wire protocol.
 

@@ -1439,3 +1439,16 @@ per channel was entirely fictitious; the real figure was 2.5). [ClickUp 17tm466f
   the old arity stop compiling and BlueprintCallable callers break when the asset is next compiled; the only callers
   in School's Out are `uap` itself (the CLI sends the parameter only with `--client`; RemoteControl zero-fills an
   omitted one to "", the default client). Every project needs a plugin re-sync + rebuild (`Restart-Editor.ps1`).
+
+## 45. `uap exec-file` failed when the script mentioned `.py` (e.g. a `# foo.py` first line) -- FIXED (17tm466zx66)
+
+* **Symptom:** `uap exec-file t9.py` whose first line was `# t9_check.py - ...` failed with a file-not-found on
+  `# t9_check.py` instead of running. Found by a Marble Race T9 agent.
+* **Cause:** remote-exec `ExecuteFile` mode runs literal code OR a `.py` path, and UE tells them apart by finding the
+  FIRST `.py` anywhere in the command (`PythonScriptPlugin::ExecPythonCommand`): everything before it is the path,
+  the rest its arguments. Any script text with `.py` followed by a blank (comment, string, docstring) trips it.
+* **Fix:** `exec-file` sends code with no `.py` in it unchanged; otherwise it wraps it as
+  `exec(compile(<literal>, '<uap exec-file>', 'exec'))` with every `.py` spelled `.p` + backslash-x79 inside the
+  literal, so the engine never sees the trigger. Same globals, same line numbers in tracebacks. `uap exec "<code>"`
+  is NOT wrapped (a bare `.py` path is a feature there); keep `.py` out of one-liners or use `exec-file`.
+
