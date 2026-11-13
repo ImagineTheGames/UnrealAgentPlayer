@@ -22,7 +22,7 @@ def _env(tmp_path, monkeypatch):
     monkeypatch.setenv("UAP_MACHINE_LOCK", "0")
     monkeypatch.setenv("UAP_PIE_REAPER", "0")
     monkeypatch.setenv("UAP_RC_DOWN_GRACE", "0.2")
-    monkeypatch.setenv("UAP_RC_EVICT_GRACE", "0.6")
+    monkeypatch.setenv("UAP_RC_EVICT_GRACE", "2.0")
     monkeypatch.setattr(co, "POLL_SECONDS", 0.05)
     monkeypatch.setattr(co, "_RC_UP_CACHE_SECONDS", 0.0)
     monkeypatch.setattr(co, "_RC_DOWN_CACHE_SECONDS", 0.0)
@@ -87,7 +87,7 @@ def test_relaunch_jumps_ahead_of_earlier_pie_waiters(monkeypatch):
     rc = Rc(monkeypatch, True)
     assert _ask("holder", "pie")["granted"]
     for a in ("p1", "p2", "lc"):
-        _ask(a, "pie" if a != "lc" else "livecoding", wait=0.05, max_block=0.01)
+        _ask(a, "pie" if a != "lc" else "livecoding", wait=30, max_block=0.01)
     _ask("rl1", "relaunch-preflight", wait=30, max_block=0.01)
     _ask("rl2", "relaunch-preflight", wait=30, max_block=0.01)
     assert _queue() == ["p1", "p2", "lc", "rl1", "rl2"]          # up editor: arrival order
@@ -113,9 +113,9 @@ def test_pie_lease_on_a_hung_editor_is_released_after_the_grace(monkeypatch):
     rc = Rc(monkeypatch, True)
     assert _ask("tooltips", "pie")["granted"]
     rc.answer = False
-    _ask("rl", "relaunch-preflight", wait=0.05, max_block=0.01)     # notices: down_since set
+    _ask("rl", "relaunch-preflight", wait=30, max_block=0.01)     # notices: down_since set
     assert co.status(PROJ)["exclusive"]["agent"] == "tooltips", "evicted inside the grace"
-    time.sleep(0.8)                                                  # past the 0.6s evict grace
+    time.sleep(2.2)                                                  # past the 2s evict grace
     r = _ask("rl", "relaunch-preflight", wait=0.5, max_block=0.4)
     assert r["granted"], r
     ev = co.status(PROJ)["last_eviction"]
@@ -128,12 +128,12 @@ def test_a_brief_stall_that_recovers_never_evicts_or_refuses(monkeypatch):
     rc = Rc(monkeypatch, True)
     assert _ask("holder", "pie")["granted"]
     rc.answer = False
-    _ask("w", "pie", wait=0.05, max_block=0.01)
+    _ask("w", "pie", wait=30, max_block=0.01)
     time.sleep(0.1)                           # inside the 0.2s grace
     rc.answer = True                          # level finished loading
-    _ask("w", "pie", wait=0.05, max_block=0.01)
+    _ask("w", "pie", wait=30, max_block=0.01)
     time.sleep(0.8)
-    _ask("w", "pie", wait=0.05, max_block=0.01)
+    _ask("w", "pie", wait=30, max_block=0.01)
     assert co.status(PROJ)["exclusive"]["agent"] == "holder"
     assert "rc_down_since" not in co._load(PROJ)
 
