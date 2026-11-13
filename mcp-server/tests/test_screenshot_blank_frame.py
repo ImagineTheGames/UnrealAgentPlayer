@@ -99,3 +99,73 @@ def test_screenshot_flag_exists():
         return
     args = parser.parse_args(["screenshot", "x.png", "--allow-blank"])
     assert args.allow_blank is True
+
+
+# --- the uap overlay / toasts must not keep a black frame alive [17tm46700ke] -------------------
+
+def _overlay(x, y, w=640, h=480):
+    """Black scene + what uap draws into the frame: a text block top-right (sparse bright pixels
+    in a ~25% x 20% region) and, optionally via _toast, a white bar near the bottom."""
+    in_block = x > w * 0.5 and y < h * 0.20
+    if in_block and (x % 7 < 3) and (y % 5 < 2):
+        return (240, 240, 230)
+    return None
+
+
+def _black_with_overlay(x, y):
+    return _overlay(x, y) or (0, 0, 0)
+
+
+def _black_with_overlay_and_toast(x, y):
+    if 640 * 0.07 < x < 640 * 0.93 and 480 * 0.86 < y < 480 * 0.92:
+        return (255, 255, 255)
+    return _overlay(x, y) or (0, 0, 0)
+
+
+def test_black_frame_with_overlay_text_is_blank_via_cli(tmp_path):
+    """The measured failure: 0.9947 black pixels, under the old 0.995 cut-off."""
+    p = _write(tmp_path, "ov.png", 640, 480, _black_with_overlay)
+    st = png_blank_stats(p)
+    assert st["blank"] is True and st["dark_fraction"] < 0.995, st
+    body = cli._refuse_blank_frame({"ok": True, "exists": True, "path": p}, p, False)
+    assert body["ok"] is False and body["blank"] is True
+
+
+def test_black_frame_with_overlay_and_toast_is_blank(tmp_path):
+    p = _write(tmp_path, "ovt.png", 640, 480, _black_with_overlay_and_toast)
+    st = png_blank_stats(p)
+    assert st["blank"] is True and st["dark_fraction"] < 0.95, st
+
+
+def test_black_frame_with_overlay_is_blank_in_window_capture_too():
+    buf = bytearray()
+    for y in range(480):
+        for x in range(640):
+            r, g, b = _black_with_overlay_and_toast(x, y)
+            buf += bytes((b, g, r, 255))
+    st = wc.image_stats(640, 480, bytes(buf))
+    assert st["blank"] is True, st
+
+
+def test_dark_but_real_night_scene_is_not_blank(tmp_path):
+    """Dim ambient gradient + the same overlay: content everywhere, so ok."""
+
+    def night(x, y):
+        ov = _overlay(x, y)
+        if ov:
+            return ov
+        v = 12 + int(30 * y / 480) + (x // 80)
+        return (v // 2, v // 2, v)
+    p = _write(tmp_path, "night.png", 640, 480, night)
+    st = png_blank_stats(p)
+    assert st["blank"] is False and st["live_cell_fraction"] > 0.9, st
+    body = cli._refuse_blank_frame({"ok": True, "exists": True, "path": p}, p, False)
+    assert body["ok"] is True and body["exists"] is True and body["blank"] is False
+
+
+def test_dark_scene_with_a_black_half_is_not_blank(tmp_path):
+    """A dim room: left half genuinely unlit, right half dim furniture. Still a real frame."""
+    rnd = random.Random(5)
+    p = _write(tmp_path, "half.png", 640, 480,
+               lambda x, y: (0, 0, 0) if x < 320 else (20 + rnd.randrange(30),) * 3)
+    assert png_blank_stats(p)["blank"] is False

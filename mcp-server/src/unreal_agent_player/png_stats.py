@@ -22,6 +22,35 @@ BLACK_FRACTION = 0.995
 # costs ~0.02. Anything above this is not worth decoding.
 MAYBE_BLANK_BYTES_PER_PIXEL = 0.08
 
+# Spatial-extent test [17tm46700ke]. The uap overlay (top-right text block) and game toasts are
+# drawn INTO the captured frame, so a black scene still has ~0.5-6% non-black pixels and a
+# fraction-of-black-pixels threshold (0.995) misses it (0.9947 measured). Counting pixels asks the
+# wrong question. Ask instead how much of the frame has ANY content: split it into a coarse grid;
+# a cell is "live" when >= LIVE_CELL_MIN of its samples are non-black. UI chrome is a few compact
+# rectangles (overlay ~9% of cells, a toast bar ~11%, both together ~20%); a lit or dark-but-real
+# scene lights up most
+# of the frame. Frame is blank when too few cells are live, however bright the UI inside them is.
+GRID = 16
+LIVE_CELL_MIN = 0.02
+LIVE_CELL_FRACTION_MIN = 0.35
+
+
+def live_cell_fraction(width: int, height: int, nonblack_points, total_points) -> float:
+    """Fraction of GRID x GRID cells holding content. `nonblack_points` yields (x, y) of each
+    sampled non-black pixel; `total_points` yields (x, y) of every sampled pixel."""
+    tot = [0] * (GRID * GRID)
+    live = [0] * (GRID * GRID)
+    for x, y in total_points:
+        tot[(y * GRID // height) * GRID + (x * GRID // width)] += 1
+    for x, y in nonblack_points:
+        live[(y * GRID // height) * GRID + (x * GRID // width)] += 1
+    cells = [i for i in range(GRID * GRID) if tot[i]]
+    if not cells:
+        return 0.0
+    n_live = sum(1 for i in cells if live[i] / tot[i] >= LIVE_CELL_MIN)
+    return n_live / len(cells)
+
+
 _PNG_SIG = b"\x89PNG\r\n\x1a\n"
 _CHANNELS = {0: 1, 2: 3, 4: 2, 6: 4}
 
@@ -116,23 +145,31 @@ def png_blank_stats(path: str) -> dict[str, Any]:
     step_x = max(1, width // 200)
     total = dark = 0
     colors: set[tuple[int, ...]] = set()
+    all_pts: list[tuple[int, int]] = []
+    lit_pts: list[tuple[int, int]] = []
     for y in range(0, height, step_y):
         row = rows[y]
         for x in range(0, width, step_x):
             o = x * bpp
             px = tuple(row[o:o + (bpp if bpp in (1, 3) else bpp - 1)])
             total += 1
+            all_pts.append((x, y))
             if all(v <= BLACK_MAX for v in px):
                 dark += 1
+            else:
+                lit_pts.append((x, y))
             if len(colors) < 64:
                 colors.add(px)
     frac = dark / total
+    live = live_cell_fraction(width, height, lit_pts, all_pts)
     out: dict[str, Any] = {"blank": False, "decoded": True, "dark_fraction": round(frac, 4),
+                           "live_cell_fraction": round(live, 3),
                            "distinct_colors": len(colors), "sampled": total}
-    if frac >= BLACK_FRACTION:
+    if frac >= BLACK_FRACTION or live < LIVE_CELL_FRACTION_MIN:
         out["blank"] = True
-        out["reason"] = (f"image is black ({frac:.1%} of sampled pixels <= {BLACK_MAX} in every "
-                         "channel)")
+        out["reason"] = (f"image is black: only {live:.0%} of the frame has any content "
+                         f"(pixels > {BLACK_MAX}); {frac:.1%} of sampled pixels are black. What "
+                         "little is drawn is UI (uap overlay / toast), not the scene")
     elif len(colors) == 1:
         out["blank"] = True
         out["reason"] = f"image is a single flat colour {next(iter(colors))}"
