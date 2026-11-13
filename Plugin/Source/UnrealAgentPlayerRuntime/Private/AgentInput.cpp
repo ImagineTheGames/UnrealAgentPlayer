@@ -81,6 +81,34 @@ namespace
         }
         return FSlateApplication::Get().GetInteractiveTopLevelWindows();
     }
+
+    /**
+     * A click on a client whose app is NOT the foreground app never clicked anything. Slate itself
+     * drops the pointer capture a reply asks for while the application is inactive
+     * (FSlateApplication::ProcessReply: "Setting mouse capture, mouse position, and locking the
+     * mouse are all operations that we shouldn't do if our application isn't Active"). SButton
+     * captures on the down and, with the default DownAndUp click method, fires OnClicked on the up
+     * ONLY if it still holds that capture - so the button pressed (OnPressed, press SFX), released,
+     * and OnClicked never ran, while the call said clicked/down_handled/up_handled. uap never
+     * focuses a window (owner rule 2026-11-11), so an agent's -game standalone clients and an
+     * unfocused editor are ALWAYS in the background: every menu button was inert there.
+     *
+     * Grant the capture the reply asked for, the Slate-side half only. A reply that also asks to
+     * lock the cursor or switch to high-precision mouse (the game viewport's own click capture)
+     * is left alone: those are OS calls on the human's real mouse pointer. Virtual windows
+     * (widget components) are exempt from the activation gate already.
+     */
+    void UAPGrantCaptureWhileInactive(FSlateApplication& App, const FReply& Reply, const FWidgetPath& Path,
+                                      const FPointerEvent& Evt)
+    {
+        if (App.IsActive() || App.GetHandleDeviceInputWhenApplicationNotActive()) { return; }
+        const TSharedPtr<SWidget> Captor = Reply.GetMouseCaptor();
+        if (!Captor.IsValid() || Reply.GetMouseLockWidget().IsValid() || Reply.ShouldUseHighPrecisionMouse()) { return; }
+        if (!Path.IsValid() || Path.GetWindow()->IsVirtualWindow()) { return; }
+        const TSharedPtr<FSlateUser> SlateUser = App.GetUser(Evt.GetUserIndex());
+        if (!SlateUser.IsValid() || SlateUser->HasCapture(Evt.GetPointerIndex())) { return; }
+        SlateUser->SetPointerCaptor(Evt.GetPointerIndex(), Captor.ToSharedRef(), Path);
+    }
 }
 
 namespace
@@ -468,7 +496,26 @@ bool FAgentInput::InjectMouseButtonAt(EAgentMouseButton Btn, bool bPressed, FVec
     {
         const FReply Reply = bPressed ? App.RoutePointerDownEvent(Redirected, Evt)
                                       : App.RoutePointerUpEvent(Redirected, Evt);
+        if (bPressed) { UAPGrantCaptureWhileInactive(App, Reply, Redirected, Evt); }
         return Reply.IsEventHandled();
+    }
+    // Background app (see UAPGrantCaptureWhileInactive): route the down along the same path
+    // ProcessMouseButtonDownEvent would hit-test, so the reply - and the capture it asks for -
+    // is visible here. With a captor already held, keep the engine route (it goes to the captor).
+    if (bPressed && !App.IsActive() && !App.GetHandleDeviceInputWhenApplicationNotActive())
+    {
+        const TSharedPtr<FSlateUser> SlateUser = App.GetUser(User);
+        if (SlateUser.IsValid() && !SlateUser->HasCapture(Evt.GetPointerIndex()))
+        {
+            const FWidgetPath Path = App.LocateWindowUnderMouse(
+                ScreenPos, App.GetInteractiveTopLevelWindows(), /*bIgnoreEnabledStatus*/ false, User);
+            if (Path.IsValid())
+            {
+                const FReply Reply = App.RoutePointerDownEvent(Path, Evt);
+                UAPGrantCaptureWhileInactive(App, Reply, Path, Evt);
+                return Reply.IsEventHandled();
+            }
+        }
     }
     if (bPressed) { return App.ProcessMouseButtonDownEvent(nullptr, Evt); }
     return App.ProcessMouseButtonUpEvent(Evt);
