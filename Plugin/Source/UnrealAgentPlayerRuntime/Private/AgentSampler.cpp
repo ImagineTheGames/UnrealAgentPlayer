@@ -6,6 +6,7 @@
 #include "Dom/JsonObject.h"
 #include "Dom/JsonValue.h"
 #include "Engine/World.h"
+#include "Engine/Engine.h"
 #include "EngineUtils.h"
 #include "GameFramework/Actor.h"
 #include "GameFramework/PlayerController.h"
@@ -24,6 +25,8 @@ namespace
         TWeakObjectPtr<UObject> Object;
         FString ObjectLabel;
         FString World;   // world the object lives in (proves which client was sampled)
+        TWeakObjectPtr<UWorld> WorldPtr;
+        bool    bWorldEnded = false;   // its PIE world has been torn down; samples are kept for a read
         FString PropertyPath;
         double  StartRealTime = 0.0;
         double  EndRealTime = 0.0;
@@ -285,6 +288,32 @@ namespace
         return true;
     }
 
+    FDelegateHandle GTearDownHandle;
+
+    /** A finished PIE session must not leave live slots behind: stop the series that watched the
+     *  world being torn down (samples stay readable), and let the next Start free them. */
+    void UAPOnWorldTearDown(UWorld* World)
+    {
+        for (TPair<FString, FUAPSeries>& Pair : GSeries)
+        {
+            FUAPSeries& S = Pair.Value;
+            if (S.WorldPtr.Get() == World)
+            {
+                S.bActive = false;
+                S.bWorldEnded = true;
+            }
+        }
+    }
+
+    /** Drop every series whose world is gone, so a new session starts with all 16 slots free. */
+    void UAPPurgeEndedWorldSeries()
+    {
+        for (auto It = GSeries.CreateIterator(); It; ++It)
+        {
+            if (It.Value().bWorldEnded) { It.RemoveCurrent(); }
+        }
+    }
+
     FString UAPNameLabel(const FString& SeriesName)
     {
         return SeriesName.IsEmpty() ? TEXT("(default)") : SeriesName;
@@ -324,6 +353,13 @@ FString FAgentSampler::Start(const FString& ObjectPath, const FString& PropertyP
     TSharedPtr<FJsonValue> Probe;
     if (!UAPReadPath(Obj, PropertyPath, Probe, Error)) { return UAPError(Error); }
 
+    // Series left by a finished PIE session are freed now, so a new session starts clean.
+    UAPPurgeEndedWorldSeries();
+    if (!GTearDownHandle.IsValid())
+    {
+        GTearDownHandle = FWorldDelegates::OnWorldBeginTearDown.AddStatic(&UAPOnWorldTearDown);
+    }
+
     // Only a series of the SAME name is replaced; any other named series keeps recording.
     const bool bReplaced = GSeries.Contains(SeriesName);
     if (!bReplaced && GSeries.Num() >= GMaxSeries)
@@ -338,6 +374,8 @@ FString FAgentSampler::Start(const FString& ObjectPath, const FString& PropertyP
     Series.Object = Obj;
     Series.ObjectLabel = Obj->GetName();
     Series.World = Obj->GetWorld() ? Obj->GetWorld()->GetName() : FString();
+    // Only a game/PIE world's end retires a series; a /Game path object (editor world) lives on.
+    if (Obj->GetWorld() && Obj->GetWorld()->IsGameWorld()) { Series.WorldPtr = Obj->GetWorld(); }
     Series.PropertyPath = PropertyPath;
     Series.StartRealTime = FPlatformTime::Seconds();
     Series.EndRealTime = Series.StartRealTime + ClampedSeconds;
@@ -387,6 +425,7 @@ FString FAgentSampler::Read(const FString& SeriesName)
     O->SetBoolField(TEXT("ok"), true);
     O->SetStringField(TEXT("name"), SeriesName);
     O->SetBoolField(TEXT("active"), Series.bActive);
+    if (Series.bWorldEnded) { O->SetBoolField(TEXT("world_ended"), true); }
     O->SetStringField(TEXT("object"), Series.ObjectLabel);
     O->SetStringField(TEXT("property"), Series.PropertyPath);
     O->SetNumberField(TEXT("count"), Series.Values.Num());
@@ -421,6 +460,11 @@ void FAgentSampler::Stop(const FString& SeriesName)
 
 void FAgentSampler::Shutdown()
 {
+    if (GTearDownHandle.IsValid())
+    {
+        FWorldDelegates::OnWorldBeginTearDown.Remove(GTearDownHandle);
+        GTearDownHandle.Reset();
+    }
     if (GSampleTicker.IsValid())
     {
         FTSTicker::RemoveTicker(GSampleTicker);
