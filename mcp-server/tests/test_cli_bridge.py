@@ -61,3 +61,55 @@ def test_parse_rc_params_keyvalue_and_json():
     import pytest as _pt
     with _pt.raises(ValueError):
         _parse_rc_params(["notakeyvalue"])
+
+
+# --- exec-file: a ".py" in the text must not make UE read the code as a script path ---------
+# UE's ExecuteFile mode takes everything before the FIRST ".py" as the file path, so a script
+# opening with `# builder.py - ...` failed with "file not found" [17tm466zx66].
+
+import re
+
+from unreal_agent_player.transport import guard_py_path_trigger
+
+_UE_TRIGGER = re.compile(r"\.py", re.IGNORECASE)
+
+
+def test_guard_leaves_code_without_py_untouched():
+    code = "import unreal\nprint('hi')\n"
+    assert guard_py_path_trigger(code) == code
+
+
+def test_guard_hides_every_py_from_the_engine_and_keeps_the_code_meaning():
+    code = ("# builder.py - build the track\n"
+            "x = 'a.PY b.py'\n"
+            "y = r'C:\\scripts\\t.py'\n"
+            "z = x + y + 'tail'\n")
+    wrapped = guard_py_path_trigger(code)
+    assert not _UE_TRIGGER.search(wrapped)
+    g: dict = {}
+    exec(wrapped, g)  # noqa: S102
+    ref: dict = {}
+    exec(code, ref)  # noqa: S102
+    assert g["x"] == ref["x"] == "a.PY b.py"
+    assert g["y"] == ref["y"]
+    assert g["z"] == ref["z"]
+
+
+def test_exec_file_with_py_comment_first_line_sends_no_path_trigger(tmp_path, monkeypatch):
+    captured = {}
+
+    class _FakeExec:
+        def __init__(self, **kw):
+            pass
+        def exec_python(self, code):
+            captured["code"] = code
+            return {"success": True, "result": "ok", "output": []}
+
+    monkeypatch.setattr(cli, "PythonRemoteExecClient", _FakeExec)
+    f = tmp_path / "t9.py"
+    f.write_text("# t9_check.py - drive the marble\nanswer = 6 * 7\n", encoding="utf-8")
+    assert cli.main(["exec-file", str(f)]) == 0
+    assert not _UE_TRIGGER.search(captured["code"])
+    g: dict = {}
+    exec(captured["code"], g)  # noqa: S102
+    assert g["answer"] == 42
