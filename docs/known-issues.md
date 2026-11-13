@@ -1577,3 +1577,57 @@ auto-capture never looked at the caller's token at all, so the Marble agent's fi
 
 Tests: `mcp-server/tests/test_report_slot_ownership.py`. **Still open:** the overlay shows only the
 newest open report, not all of them.
+
+## 50. `uap exec --client N` ran in the HOST world, and a PIE screenshot of an all-black frame came back `ok:true` -- FIXED (17tm466zztw)
+
+Found 2026-11-13 verifying spray paint in a 2-client PIE.
+
+**1. `exec` / `exec-file` ignored `--client`.** A script reading a wall actor's `get_local_role()` returned
+`ROLE_AUTHORITY` for client 0 AND client 1: the 2-client "client reads" test passed by reading the host twice. The
+flag was accepted (it is on every verb) and dropped: `_exec` never looked at it, and the editor's Python has no
+"current client", so `get_game_world()` always answers the editor's play world (the FIRST PIE world).
+
+* **Fix (CLI only, no plugin change, any plugin copy):** `exec --client N` wraps the script in a preamble
+  (`mcp-server/src/unreal_agent_player/exec_client.py`) that finds client N's world by PIE instance index (the
+  `UEDPIE_<N>_` package prefix, the index `uap input clients` lists), defines `UAP_CLIENT` and `UAP_WORLD`, runs the script,
+  and drops every world reference it made (a `UWorld` wrapper left in the persistent exec globals roots the world and
+  crashes the editor with "World Memory Leaks" at PIE end). The result carries `client: {index, world}`.
+* **Refused, never the host:** a client that does not exist (the message lists the clients that do, with full world
+  names, since every client's `UWorld` is called the same), no PIE at all, `--client all` (one script, one world), and a
+  script that calls `get_game_world()` when that would answer a different world than client N's. The last one is
+  forced by the engine: unreal's wrapped classes are IMMUTABLE (`cannot set 'get_game_world' attribute of immutable
+  type 'EditorLevelLibrary'`, measured), so the getter cannot be pointed at client N. **Use `UAP_WORLD`**:
+  `unreal.GameplayStatics.get_all_actors_of_class(UAP_WORLD, X)`, `unreal.GameplayStatics.get_player_controller(UAP_WORLD, 0)`.
+  Console commands for one client: `unreal.SystemLibrary.execute_console_command(UAP_WORLD, "...")`.
+* If the preamble's marker never comes back, the answer is `ok:false` ("could not be honoured"), not the script's output.
+* `--client 0` against a `-game` standalone (`--instance`) is a no-op: that process has one world.
+* **Verified** in a 3-client PIE (host + client 1 + late-joined client 2) on `L_SprayPaintTest`: `UAP_WORLD`
+  outer `UEDPIE_0/1/2_L_SprayPaintTest`, `is_server` True/False/False, pawn x 160 / 294.9 / -352.4 (moved with
+  `uap input hold A|D --client N`). `--client 9`, `--client all` and `get_game_world()` under `--client 1|2` refused.
+* Tests: `mcp-server/tests/test_exec_client.py` (the real preamble runs against a fake `unreal` with one world per client).
+
+**2. Black screenshots.** Two cases, a freshly late-joined client and the flat debug pawn, came back as an all-black
+PNG with `ok:true, exists:true`.
+
+* **Cause (what is and is not it):** the game view really rendered black. An OS `PrintWindow` of the same window is
+  black too, so it is not the capture path. It is NOT a missing camera (view target and POV valid, world ticking
+  ~48 fps, 0 widgets) and NOT a late-join viewport index (`--client N` resolves by PIE instance; a late-joined client
+  rendered fine in some states and the host went black in others). It happens only with 2+ PIE game windows in one
+  editor process: a fresh 2-client PIE on `L_SprayPaintTest` returns black for client 0 AND client 1 every time, a
+  1-client PIE never does. `viewmode unlit` renders (213..232), so geometry draws and the LIT pass is black.
+  `ShowFlag.DynamicShadows 0` brings every window back (it is a global cvar-style flag), but toggling it later left
+  some windows black and others fine (host + late-joined client black, client 1 fine, then the reverse), so it is not a
+  clean on/off. Movable lights, a skylight recapture and `r.Shadow.CSM.MaxCascades 4` did not help. **Not root-caused
+  in the renderer**; the lights on that map are Stationary with a captured-scene SkyLight. Follow-up needed in the game.
+* **Why uap lied:** the blank-frame refusal existed only for `--window` captures and the no-PIE level-viewport path.
+  The PIE path (`CaptureViewportWithUI`) wrote whatever `TakeScreenshot` read back.
+* **Fix (CLI only, any plugin copy):** after the PIE capture the CLI judges the PNG (`png_stats.py`, stdlib; a
+  blank frame is ~40 KB against ~0.3-2 MB for a real one, so it only decodes implausibly small files, <1 s). All black
+  (>= 99.5 % of sampled pixels <= 8) or one flat colour is NOT returned: `ok:false, exists:false, blank:true`, the
+  picture is moved to `<name>.BLANK.png` (`blank_file`) so the requested path never holds an untrustworthy image,
+  and nothing is attached to the report. `--allow-blank` keeps it, flagged `blank:true` + `warning`. A frame that
+  cannot be decoded is `blank:null`, not "fine". A frame with a black ceiling band over a lit wall is not blank.
+* **Verified live:** fresh 2-client PIE, `screenshot --client 0|1` refused with `BLANK frame refused: image is black`;
+  with the render state recovered the same clients returned 800 KB frames (host flat pawn at a wall, concrete block and
+  spray can with its cloud; late-joined client 2 hands against a cream wall) that were opened and described.
+* Tests: `mcp-server/tests/test_screenshot_blank_frame.py`.
