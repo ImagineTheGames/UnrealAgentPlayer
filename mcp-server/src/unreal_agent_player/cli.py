@@ -483,6 +483,19 @@ def _exec_rc_port(project: str) -> int:
     return port if isinstance(port, int) and not isinstance(port, bool) else 0
 
 
+def _exec_rc_port_of(pid, project: str | None) -> int:
+    """RC HTTP port bound by the editor with this exact pid (0 if unreachable)."""
+    code = ("import unreal\n"
+            "_uap_out = int("
+            "unreal.get_editor_subsystem(unreal.UAPAgentSubsystem).get_remote_control_port())\n")
+    try:
+        port = PythonRemoteExecClient(node_project_substr=project or "",
+                                      node_instance=f"pid:{pid}").eval_quiet(code)
+    except AgentError:
+        return 0
+    return port if isinstance(port, int) and not isinstance(port, bool) else 0
+
+
 def _exec_project_name(project: str | None) -> str | None:
     """The project name of the editor matching `project` (via exec). Used to stamp a
     screenshot's provenance so a pass can't be proven with a shot of another editor."""
@@ -575,7 +588,7 @@ _INSTANCE_TARGET: list = [None]
 _RUNTIME_PRESET = "UAP_RuntimePreset"
 _UAPRCPORT_RE = re.compile(r"-UAPRCPort=(\d+)", re.IGNORECASE)
 # The verbs the runtime subsystem serves, i.e. the ones a standalone client can be driven with.
-_INSTANCE_RC_CMDS = frozenset({"input", "xr", "click", "tab", "nav", "read-ui", "rc", "sample", "log"})
+_INSTANCE_RC_CMDS = frozenset({"input", "xr", "click", "tab", "nav", "read-ui", "rc", "sample", "log", "screenshot"})
 
 
 def _resolve_instance_target(instance: str | None, project: str | None) -> dict | None:
@@ -601,6 +614,19 @@ def _resolve_instance_target(instance: str | None, project: str | None) -> dict 
                          f"--instance {sel!r} matches {len(nodes)} processes "
                          f"({', '.join(str(n.get('pid')) for n in nodes)}); use pid:<n>.")
     node = nodes[0]
+    if node.get("role") == "editor":
+        # An EDITOR pinned by pid. It is not started with -UAPRCPort (it advertises its own
+        # per-project port), so ask THAT process over remote-exec, addressed by pid, for the
+        # port it bound. Same editor preset as the no-flag path, but pinned to this process.
+        # [17tm466zy8h]
+        port = _exec_rc_port_of(node.get("pid"), project)
+        if not port:
+            raise AgentError(
+                ErrorCode.INSTANCE_NOT_FOUND,
+                f"editor pid {node.get('pid')} did not report its RemoteControl port over "
+                f"remote-exec, so uap cannot reach it by pid.", recoverable=False)
+        return {"port": port, "preset": _contract.DEFAULT_PRESET, "pid": node.get("pid"),
+                "role": "editor"}
     m = _UAPRCPORT_RE.search(str(node.get("cmdline") or ""))
     if not m:
         raise AgentError(

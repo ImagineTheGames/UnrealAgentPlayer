@@ -417,3 +417,27 @@ def test_an_instance_that_is_the_editor_still_goes_through_the_guards(monkeypatc
     assert cli._standalone_instance_selected(args, None) is False
     assert cli._standalone_instance_selected(_args("exec", "editor", []), None) is False
     assert cli._standalone_instance_selected(_args("exec", None, []), None) is False
+
+
+# --- [17tm466zy8h] --instance pid:<editor pid> works for every verb, pinned to THAT process ---
+
+def test_pid_of_an_editor_resolves_to_the_editor_preset_on_its_own_port(monkeypatch):
+    _nodes(monkeypatch, _EDITOR, _CLIENT2)
+    asked = []
+    monkeypatch.setattr(cli, "_exec_rc_port_of", lambda pid, project: asked.append(pid) or 30011)
+    t = cli._resolve_instance_target("pid:10", "SchoolsOut")
+    assert asked == [10]
+    assert t == {"port": 30011, "preset": "UAP_Preset", "pid": 10, "role": "editor"}
+
+
+def test_pid_of_an_editor_that_reports_no_port_is_refused(monkeypatch):
+    _nodes(monkeypatch, _EDITOR)
+    monkeypatch.setattr(cli, "_exec_rc_port_of", lambda pid, project: 0)
+    with pytest.raises(cli.AgentError):
+        cli._resolve_instance_target("pid:10", "SchoolsOut")
+
+
+def test_an_editor_pid_target_is_not_treated_as_a_standalone(monkeypatch):
+    args = type("A", (), {"instance": "pid:10", "project": "SchoolsOut"})()
+    assert cli._standalone_instance_selected(
+        args, {"port": 30011, "preset": "UAP_Preset", "pid": 10, "role": "editor"}) is False

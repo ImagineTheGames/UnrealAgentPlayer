@@ -635,13 +635,24 @@ _uap_out = json.dumps({'project': unreal.Paths.get_project_file_path(),
                 info = {"node": n, "project": None, "role": "unknown", "pid": None,
                         "cmdline": "", "probe_failed": True}
             self._last_candidates.append(info)
-        for info in self._last_candidates:
-            if info.get("probe_failed"):
-                continue
-            if not self._matches_project(info) or not self._matches_instance(info):
-                continue
-            self.last_target = info
-            return str(info["node"])
+        matches = [i for i in self._last_candidates
+                   if not i.get("probe_failed")
+                   and self._matches_project(i) and self._matches_instance(i)]
+        if len(matches) > 1:
+            # Two live processes both fit the selector (e.g. a transient second editor of the
+            # same project). "First answer wins" returned another process's output as the
+            # editor's [17tm466zy8h]. Refuse and name them; `--instance pid:<n>` pins one.
+            raise AgentError(
+                ErrorCode.UE_WRONG_INSTANCE,
+                f"{len(matches)} processes match this target ({self._node_instance!r}, project "
+                f"{self._node_project_substr or 'any'!r}): "
+                f"{'; '.join(self.describe_node(i) for i in matches)}. Refusing to guess which "
+                f"one is meant. Pin one with --instance pid:<n>, or retry if one is transient.",
+                recoverable=False,
+            )
+        if matches:
+            self.last_target = matches[0]
+            return str(matches[0]["node"])
         return None
 
     def _probe_node(self, mcast: socket.socket, dest: tuple[str, int],

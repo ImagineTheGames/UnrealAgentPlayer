@@ -143,3 +143,20 @@ def test_a_target_that_dies_mid_exec_is_reported_as_gone(monkeypatch):
     assert "has gone" in msg
     assert "53164" in msg
     assert "not evidence" in msg
+
+
+def test_two_processes_matching_the_selector_are_refused_not_first_wins(monkeypatch):
+    # A transient second editor of the same project answered "as the editor" [17tm466zy8h].
+    second = dict(EDITOR, node="n-editor2", pid=89952)
+    client = _client(monkeypatch, [second, EDITOR], node_project_substr="SchoolsOut")
+    with pytest.raises(AgentError) as exc:
+        client._select_node(None, None, [second["node"], EDITOR["node"]])
+    assert exc.value.code == ErrorCode.UE_WRONG_INSTANCE
+    assert "89952" in str(exc.value) and "88836" in str(exc.value)
+
+
+def test_pid_selector_pins_one_of_two_editors(monkeypatch):
+    second = dict(EDITOR, node="n-editor2", pid=89952)
+    client = _client(monkeypatch, [second, EDITOR], node_project_substr="SchoolsOut",
+                     node_instance="pid:88836")
+    assert client._select_node(None, None, [second["node"], EDITOR["node"]]) == "n-editor"
