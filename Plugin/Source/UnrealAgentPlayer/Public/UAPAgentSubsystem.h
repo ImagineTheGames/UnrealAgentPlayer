@@ -262,8 +262,10 @@ public:
     // overlay (unlike HighResShot, which captures only the 3D scene). In PIE the PNG exists when
     // this returns; with no PIE it falls back to CaptureLevelViewport (also synchronous).
     // Filename should be an absolute path ending in .png. Returns false on failure.
+    // Client: "" = the first PIE viewport (historical); "N" = that PIE instance's own viewport
+    // (multi-client PIE). A client that does not exist, or "all", returns false, never another view.
     UFUNCTION(BlueprintCallable, Category="Agent|Capture")
-    bool CaptureViewportWithUI(FString Filename);
+    bool CaptureViewportWithUI(FString Filename, FString Client);
 
     // LEVEL EDITOR viewport (no PIE needed, no focus needed, no waiting for a frame). Draws the
     // pane itself and reads the pixels back, so the PNG exists when this returns. PoseJson is

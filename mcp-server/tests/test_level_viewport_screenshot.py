@@ -202,3 +202,63 @@ def test_powershell_split_vector_reaches_the_plugin_intact(monkeypatch, tmp_path
     pose = json.loads(seen[0][1]["PoseJson"])
     assert pose["location"] == [-900, -1300, 900] and pose["look_at"] == [0, 0, 0]
     _out(capsys)
+
+
+# --- --client N: the shot is THAT client's own viewport (17tm466zx5y) -------------------------
+
+def _client_plugin(monkeypatch, tmp_path, *, capture_result=True):
+    """RC stub that applies the real _with_client, as _rc_call does, so the wire params show."""
+    seen = []
+
+    def fake_call(func, params, project=None):
+        params = cli._with_client(func, params, project)
+        seen.append((func, dict(params)))
+        if func == "IsInPIE":
+            return True
+        if func == "CaptureViewportWithUI":
+            return capture_result
+        raise AssertionError(func)
+
+    monkeypatch.setattr(cli, "_rc_call", fake_call)
+    monkeypatch.setattr(cli, "_live_contract", lambda project=None: None)
+    monkeypatch.setattr(cli, "_CLIENT", [None])
+    return seen
+
+
+def test_client_flag_reaches_the_plugin_capture(monkeypatch, tmp_path, capsys):
+    seen = _client_plugin(monkeypatch, tmp_path)
+    shot = str(tmp_path / "c1.png")
+    pathlib.Path(shot).write_bytes(b"png")
+    assert cli.main(["screenshot", shot, "--client", "1"]) == 0
+    assert dict(seen)["CaptureViewportWithUI"]["Client"] == "1"
+
+
+def test_no_client_flag_sends_no_client_to_the_capture(monkeypatch, tmp_path, capsys):
+    seen = _client_plugin(monkeypatch, tmp_path)
+    shot = str(tmp_path / "c.png")
+    pathlib.Path(shot).write_bytes(b"png")
+    assert cli.main(["screenshot", shot]) == 0
+    assert "Client" not in dict(seen)["CaptureViewportWithUI"]
+
+
+def test_plugin_refusal_of_a_client_is_reported_not_a_stale_file(monkeypatch, tmp_path, capsys):
+    _client_plugin(monkeypatch, tmp_path, capture_result=False)
+    shot = str(tmp_path / "gone.png")
+    assert cli.main(["screenshot", shot, "--client", "7"]) == 1
+    body = _out(capsys)
+    assert not body["ok"] and "client '7'" in body["error"]
+
+
+def test_client_all_is_refused_for_a_screenshot(monkeypatch, tmp_path, capsys):
+    seen = _client_plugin(monkeypatch, tmp_path)
+    assert cli.main(["screenshot", str(tmp_path / "a.png"), "--client", "all"]) == 1
+    assert "CaptureViewportWithUI" not in [f for f, _ in seen]
+    assert "one image" in _out(capsys)["error"]
+
+
+def test_older_plugin_without_client_param_is_refused_not_answered_with_client_0(monkeypatch, tmp_path, capsys):
+    seen = _client_plugin(monkeypatch, tmp_path)
+    monkeypatch.setattr(cli, "_live_contract",
+                        lambda project=None: {"CaptureViewportWithUI": ["Filename"]})
+    assert cli.main(["screenshot", str(tmp_path / "o.png"), "--client", "1"]) == 1
+    assert "CaptureViewportWithUI" not in [f for f, _ in seen]

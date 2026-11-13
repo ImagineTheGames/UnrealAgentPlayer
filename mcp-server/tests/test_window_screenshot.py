@@ -349,3 +349,31 @@ def test_tokenless_capture_does_not_attach_to_an_owned_report(capsys, tmp_path, 
     rc, body = _run(capsys, ["screenshot", str(tmp_path / "t.png"), "--window", "Context_2"])
     assert rc == 0 and "no --agent token" in body["report"]
     assert (tmp_path / "t.png").exists()
+
+
+# --- several PIE clients in ONE editor process (17tm466zx5y) -------------------------------------
+# The windows are the same size and stacked at one rect. EnumWindows lists the topmost first, so
+# collapsing to one window per pid kept only the newest: after a late join, "Client 1" vanished.
+
+def _pie_desktop(clients=(2, 1, 0)):       # topmost first, like EnumWindows after a late join
+    cmd = f'"{EDITOR_EXE}" "{UPROJ}"'
+    wins = []
+    for i, n in enumerate(clients):
+        mode = "Server" if n == 0 else "Client"
+        wins.append(_cand(900, f"School's Out Preview [NetMode: {mode} {n}]  (64-bit/PC D3D SM5)",
+                          cmd, w=1536, h=1392, hwnd=9000 + n))
+    wins.append(_cand(900, "SchoolsOut - Unreal Editor", cmd, w=2560, h=1400, hwnd=9100))
+    return wins
+
+
+@pytest.mark.parametrize("sel,hwnd", [("Client 1", 9001), ("Client 2", 9002), ("Server 0", 9000)])
+def test_select_finds_each_pie_client_window_after_a_late_join(sel, hwnd):
+    c, how = wc.select(_pie_desktop(), sel)
+    assert (c.hwnd, how) == (hwnd, "title")
+
+
+def test_select_refuses_a_title_that_names_several_pie_windows_of_one_process():
+    with pytest.raises(wc.SelectError) as ei:
+        wc.select(_pie_desktop(), "NetMode")
+    assert "ambiguous" in str(ei.value)
+    assert {c.hwnd for c in ei.value.candidates} == {9000, 9001, 9002}

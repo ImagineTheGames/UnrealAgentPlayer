@@ -301,7 +301,7 @@ FString UUAPAgentRuntimeSubsystem::DumpViewportUI(FString Client)
     return FAgentInput::ForEachClientJson(Client, []() { return FAgentUIReader::DumpViewportUI(); });
 }
 
-bool UUAPAgentRuntimeSubsystem::CaptureViewportWithUI(FString Filename)
+bool UUAPAgentRuntimeSubsystem::CaptureViewportWithUI(FString Filename, FString Client)
 {
     UAP_ACTIVITY(TEXT("screenshot"), FPaths::GetCleanFilename(Filename));
     if (Filename.IsEmpty())

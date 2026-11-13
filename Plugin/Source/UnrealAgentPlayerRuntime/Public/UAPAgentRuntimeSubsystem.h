@@ -77,7 +77,7 @@ public:
     UFUNCTION(BlueprintCallable, Category="Agent|Input") FString SetXRAimEmulation(bool bEnabled, FVector GripToAimLocation, FRotator GripToAimRotation, FString Client);
     UFUNCTION(BlueprintCallable, Category="Agent|Input") FString GetXRControllerState(FString Client);
     UFUNCTION(BlueprintCallable, Category="Agent|UI") FString DumpViewportUI(FString Client);
-    UFUNCTION(BlueprintCallable, Category="Agent|Capture") bool CaptureViewportWithUI(FString Filename);
+    UFUNCTION(BlueprintCallable, Category="Agent|Capture") bool CaptureViewportWithUI(FString Filename, FString Client);
     UFUNCTION(BlueprintCallable, Category="Agent|Log") int64 GetLogCursor() const;
     UFUNCTION(BlueprintCallable, Category="Agent|Log") FString GetLogsSince(int64 AfterCursor, int32 MaxLines, FString CategoryFilter, EAgentLogVerbosity MinVerbosity) const;
     UFUNCTION(BlueprintCallable, Category="Agent|Helpers") TArray<FAgentHelperDescriptor> ListTestHelpers();

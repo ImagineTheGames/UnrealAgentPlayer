@@ -1440,6 +1440,30 @@ per channel was entirely fictitious; the real figure was 2.5). [ClickUp 17tm466f
   in School's Out are `uap` itself (the CLI sends the parameter only with `--client`; RemoteControl zero-fills an
   omitted one to "", the default client). Every project needs a plugin re-sync + rebuild (`Restart-Editor.ps1`).
 
+## 44. `uap screenshot --client N` returned the HOST's view -- FIXED (17tm466zx5y)
+
+* **Symptom:** in a 2-client PIE, `uap screenshot <png> --client 1` wrote client 0's view; `--window "Client 1"`
+  was right. Found in Marble Race T6 testing.
+* **Cause:** `screenshot` never sent `Client` (`CaptureViewportWithUI` had no such parameter), and the plugin
+  captured the FIRST PIE world's game viewport, whatever was asked.
+* **Fix:** `CaptureViewportWithUI(Filename, Client)` resolves the client with `FAgentWorld::ResolveClients` and draws
+  THAT client's own game viewport. A client that does not exist or has no viewport returns false (the CLI reports
+  it); `--client all` is refused (one image); no flag keeps the first-viewport behaviour. A plugin copy without the
+  parameter is refused as skew.
+* **Late join:** `--client N` is resolved by PIE instance index, so a client added by `so.painttest.latejoin` (client 2)
+  is captured like any other. `screenshot --window "Client 1"` lost its window after a late join: every PIE window
+  belongs to ONE editor process, same size and stacked, and `window_capture._one_per_pid` kept only the topmost (the
+  newest). Title selectors now search every window; a title naming several windows of one process (`NetMode`) is
+  refused as ambiguous, with the windows listed.
+* **Verified live** (2-client PIE, then a late join; pawn 0 on the floor, pawn 1 teleported off the map): the old CLI
+  returned the same floor view for both clients; the fixed one returned the floor for client 0, a black void for
+  client 1 (its pawn read z=-60438) and client 2's own spawn view.
+* **BREAKING (plugin):** `CaptureViewportWithUI` gained a trailing `FString Client` parameter (editor and runtime
+  subsystems). C++ callers on the old arity stop compiling and BlueprintCallable callers break when the asset is
+  next compiled; the only caller in School's Out is `uap` itself (it sends the parameter only with `--client`;
+  RemoteControl zero-fills an omitted one to "", the default). Every project needs a plugin re-sync + rebuild
+  (`Restart-Editor.ps1`).
+
 ## 45. `uap exec-file` failed when the script mentioned `.py` (e.g. a `# foo.py` first line) -- FIXED (17tm466zx66)
 
 * **Symptom:** `uap exec-file t9.py` whose first line was `# t9_check.py - ...` failed with a file-not-found on
