@@ -1588,3 +1588,7 @@ newest open report, not all of them.
   `FAgentWorld::FScope` for that client; `all` is refused (a series watches one object); the reply carries `world`
   (e.g. `UEDPIE_1_L_DevTest`). The CLI sends it via `_CLIENT_VERBS`; a plugin copy without `Client` is refused as
   skew. BREAKING(plugin): the UFUNCTION gained a parameter, so re-sync the plugin and `Restart-Editor.ps1`.
+* **Also (Detention Express, same ticket):** sample series from a finished PIE session were never freed, so their
+  slots (max 16) hung around into the next session. A series that watched a game world is now retired on
+  `FWorldDelegates::OnWorldBeginTearDown` (samples stay readable, `world_ended:true`) and the next `sample start`
+  purges them, so a new session starts with every slot free.
