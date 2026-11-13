@@ -10,7 +10,8 @@
  * one-frame pop. This records a value IN-ENGINE once per frame for a bounded window, then
  * hands the whole series back in one call so the agent can compute deltas / jitter.
  *
- * One series at a time (a test measures one thing); starting a new one replaces the old.
+ * Several NAMED series may run at once (up to 16). The empty name is the legacy single series;
+ * starting a series replaces only the series of the same name, never another.
  */
 class UNREALAGENTPLAYERRUNTIME_API FAgentSampler
 {
@@ -28,13 +29,13 @@ public:
      * WorldScale, WorldTransform, ForwardVector or Velocity.
      */
     static FString Start(const FString& ObjectPath, const FString& PropertyPath,
-                         float Seconds, int32 MaxSamples);
+                         float Seconds, int32 MaxSamples, const FString& SeriesName = FString());
 
     /** JSON: {"ok":true,"active":bool,"object":..,"property":..,"count":N,"samples":[{"t":sec,"v":..}]} */
-    static FString Read();
+    static FString Read(const FString& SeriesName = FString());
 
-    /** Stop early, keeping whatever was collected. */
-    static void Stop();
+    /** Stop early, keeping whatever was collected. SeriesName "*" stops every series. */
+    static void Stop(const FString& SeriesName = FString());
 
     /** Module shutdown: drop the ticker and the series. */
     static void Shutdown();

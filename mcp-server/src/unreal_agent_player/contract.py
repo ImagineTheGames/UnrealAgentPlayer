@@ -102,6 +102,9 @@ ARG_PURPOSE = {
                                "analog/virtual cursor or input pre-processor can see",
     ("InjectAxis", "SlateUser"): "`rc InjectAxis SlateUser=N` -- the Slate route",
     ("InjectGamepad", "SlateUser"): "`rc InjectGamepad SlateUser=N` -- the Slate route",
+    ("StartPropertySample", "SeriesName"): "`sample start --name` -- several concurrent series",
+    ("ReadPropertySample", "SeriesName"): "`sample read --name`",
+    ("StopPropertySample", "SeriesName"): "`sample stop --name|--all`",
 }
 
 # UHT type name -> how a `key=value` string should be encoded on the wire. RemoteControl binds

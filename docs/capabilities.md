@@ -212,9 +212,9 @@ The finest granularity reachable from outside the editor is one exec round-trip 
 
 | UFUNCTION | CLI | Purpose |
 | --- | --- | --- |
-| `StartPropertySample` | `uap sample start <object> <property> --seconds N` | Begin a series. Returns `{ok}` or `{ok:false, error}`. |
-| `ReadPropertySample` | `uap sample read` | `{active, object, property, count, samples:[{t, v}]}` |
-| `StopPropertySample` | — | Stop early, keeping what was collected. |
+| `StartPropertySample` | `uap sample start <object> <property> --seconds N [--name ID]` | Begin a series. Takes `SeriesName`: several named series run at once (max 16); a start replaces only the same name. Returns `{ok, name, replaced, series_held}` or `{ok:false, error}`. |
+| `ReadPropertySample` | `uap sample read [--name ID]` | `{name, active, object, property, count, samples:[{t, v}]}`; an unknown name answers `ok:false` + `series:[...]` held. |
+| `StopPropertySample` | `uap sample stop [--name ID \| --all]` | Stop early, keeping what was collected (`SeriesName` `*` = every series). |
 
 **`<object>`** — a full object path (`/Game/...`), an actor name (exact, else substring) in the live game world, or one of `PlayerPawn` / `PlayerController` / `PlayerCameraManager`.
 

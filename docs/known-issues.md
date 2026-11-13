@@ -1476,3 +1476,14 @@ per channel was entirely fictitious; the real figure was 2.5). [ClickUp 17tm466f
   literal, so the engine never sees the trigger. Same globals, same line numbers in tracebacks. `uap exec "<code>"`
   is NOT wrapped (a bare `.py` path is a feature there); keep `.py` out of one-liners or use `exec-file`.
 
+## 46. `uap sample start` REPLACED the running series, so two concurrent samples lost the first trace -- FIXED (17tm466zxfm)
+
+* **Symptom:** an agent sampling two things at once (pawn location and FPS) got only the second trace; the first
+  vanished with no error. Hit twice by the Marble Race T9 agents on 2026-11-12.
+* **Cause:** `FAgentSampler` held ONE global series and `Start` began with `Stop()` + a fresh series.
+* **Fix:** series are keyed by name (`TMap`, max 16, one shared ticker). `StartPropertySample` /
+  `ReadPropertySample` / `StopPropertySample` take `SeriesName`; CLI `sample start|read|stop --name ID`,
+  `sample stop --all` (`*`). A start replaces only the series of the SAME name (`replaced:true` + warning). No name
+  = the old single unnamed series, byte-for-byte (the CLI sends no `SeriesName`). A named call on a plugin copy
+  without `SeriesName` is refused as skew (`contract.ARG_PURPOSE`): RemoteControl would drop the argument and run
+  the unnamed series, replacing the one you meant to keep.

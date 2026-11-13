@@ -231,6 +231,77 @@ def test_sample_stats_ignores_a_single_sample():
     assert cli._sample_stats([{"t": 0.0, "v": 1.0}]) == {}
 
 
+# --- named concurrent sample series -----------------------------------------------------
+
+def _live_with_series(monkeypatch, has_arg=True):
+    args = {"SeriesName": "FString"} if has_arg else {}
+    monkeypatch.setattr(cli, "_live_contract", lambda project: {
+        "StartPropertySample": args, "ReadPropertySample": args, "StopPropertySample": args})
+
+
+def test_sample_unnamed_sends_no_series_name(monkeypatch, capsys):
+    """Backward compat: a call with no --name is byte-for-byte what it always was."""
+    seen = _stub_rc(monkeypatch, {"StartPropertySample": json.dumps({"ok": True}),
+                                  "ReadPropertySample": json.dumps({"ok": True, "samples": []})})
+    monkeypatch.setattr(cli.time, "sleep", lambda s: None)
+    assert cli.main(["sample", "start", "PlayerPawn", "WorldLocation"]) == 0
+    assert all("SeriesName" not in p for _, p, _ in seen)
+
+
+def test_two_named_series_stay_independent(monkeypatch, capsys):
+    _live_with_series(monkeypatch)
+    seen = _stub_rc(monkeypatch, {
+        "StartPropertySample": json.dumps({"ok": True, "replaced": False}),
+        "ReadPropertySample": lambda p: json.dumps(
+            {"ok": True, "name": p["SeriesName"], "count": 2,
+             "samples": [{"t": 0.0, "v": 1.0}, {"t": 0.01, "v": 2.0}]}),
+        "StopPropertySample": "true"})
+    for n in ("pawn", "fps"):
+        assert cli.main(["sample", "start", "PlayerPawn", "WorldLocation", "--name", n,
+                         "--no-wait"]) == 0
+        assert _out(capsys)["name"] == n
+    starts = [p["SeriesName"] for f, p, _ in seen if f == "StartPropertySample"]
+    assert starts == ["pawn", "fps"]
+    for n in ("pawn", "fps"):
+        assert cli.main(["sample", "read", "--name", n]) == 0
+        assert _out(capsys)["name"] == n
+    assert cli.main(["sample", "stop", "--name", "pawn"]) == 0
+    assert seen[-1] == ("StopPropertySample", {"SeriesName": "pawn"}, seen[-1][2])
+    assert cli.main(["sample", "stop", "--all"]) == 0
+    assert seen[-1][1] == {"SeriesName": "*"}
+
+
+def test_sample_restart_of_same_name_warns_it_replaced(monkeypatch, capsys):
+    _live_with_series(monkeypatch)
+    _stub_rc(monkeypatch, {"StartPropertySample": json.dumps({"ok": True, "replaced": True})})
+    assert cli.main(["sample", "start", "PlayerPawn", "X", "--name", "a", "--no-wait"]) == 0
+    body = _out(capsys)
+    assert body["replaced"] is True and "REPLACED" in body["warning"]
+
+
+def test_named_sample_on_old_plugin_is_refused_not_run_unnamed(monkeypatch, capsys):
+    """An old plugin would drop SeriesName and REPLACE the unnamed series: refuse instead."""
+    _live_with_series(monkeypatch, has_arg=False)
+    seen = _stub_rc(monkeypatch, {})
+    assert cli.main(["sample", "start", "PlayerPawn", "X", "--name", "a", "--no-wait"]) == 1
+    assert "SeriesName" in _out(capsys)["error"]
+    assert seen == []
+
+
+def test_sample_name_may_not_contain_the_wildcard(monkeypatch, capsys):
+    _stub_rc(monkeypatch, {})
+    assert cli.main(["sample", "read", "--name", "a*"]) == 1
+    assert "'*'" in _out(capsys)["error"]
+
+
+def test_sample_read_of_unknown_name_lists_held_series(monkeypatch, capsys):
+    _live_with_series(monkeypatch)
+    _stub_rc(monkeypatch, {"ReadPropertySample": json.dumps(
+        {"ok": False, "error": "no sample series named 'zz'", "series": ["fps", "pawn"]})})
+    assert cli.main(["sample", "read", "--name", "zz"]) == 1
+    assert _out(capsys)["series"] == ["fps", "pawn"]
+
+
 # --- P5: log verb -----------------------------------------------------------------------
 
 _LOG_JSON = json.dumps({"cursor": 42, "lines": [

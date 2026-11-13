@@ -86,9 +86,9 @@ public:
     UFUNCTION(BlueprintCallable, Category="Agent|Helpers") FString ListTestHelpersJson();
     UFUNCTION(BlueprintCallable, Category="Agent|Helpers") FString CallTestHelper(FString Name, FString JsonArgs);
     // Frame-rate property sampling (sub-second behaviour a ~1s exec round-trip cannot see).
-    UFUNCTION(BlueprintCallable, Category="Agent|Sample") FString StartPropertySample(FString ObjectPath, FString PropertyPath, float Seconds, int32 MaxSamples);
-    UFUNCTION(BlueprintCallable, Category="Agent|Sample") FString ReadPropertySample();
-    UFUNCTION(BlueprintCallable, Category="Agent|Sample") bool StopPropertySample();
+    UFUNCTION(BlueprintCallable, Category="Agent|Sample") FString StartPropertySample(FString ObjectPath, FString PropertyPath, float Seconds, int32 MaxSamples, FString SeriesName);
+    UFUNCTION(BlueprintCallable, Category="Agent|Sample") FString ReadPropertySample(FString SeriesName);
+    UFUNCTION(BlueprintCallable, Category="Agent|Sample") bool StopPropertySample(FString SeriesName);
 
 private:
     TSharedPtr<class FAgentLogCapture> LogCapture;

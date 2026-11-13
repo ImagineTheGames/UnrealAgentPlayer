@@ -1906,16 +1906,43 @@ def _sample_stats(samples: list) -> dict:
     }
 
 
+def _series_name(args) -> str:
+    """The --name of a sample series; "" is the legacy single (unnamed) series."""
+    name = getattr(args, "name", None) or ""
+    if "*" in name:
+        raise AgentError(ErrorCode.SCHEMA_VALIDATION,
+                         "a series name may not contain '*' (it is the stop-all wildcard)")
+    return name
+
+
+def _name_params(args, project) -> dict:
+    """{"SeriesName": name} only when a name was given, so an unnamed call is byte-for-byte what
+    it always was. A NAMED call on a plugin copy without the parameter is REFUSED: RemoteControl
+    would drop the argument and run the unnamed series, which REPLACES the one you meant to
+    keep -- the exact silent loss this flag exists to prevent."""
+    name = _series_name(args)
+    if not name:
+        return {}
+    for func in ("StartPropertySample", "ReadPropertySample", "StopPropertySample"):
+        msg = _missing_arg(func, "SeriesName", project)
+        if msg:
+            raise AgentError(ErrorCode.UE_OBJECT_NOT_FOUND, msg)
+    return {"SeriesName": name}
+
+
 def _sample(args) -> int:
     """Record a property once per frame IN-ENGINE for a bounded window, then return the series.
     The finest granularity an exec round-trip can reach is ~1s, which cannot see judder, a 0.6s
-    wind-up, or a one-frame pop."""
+    wind-up, or a one-frame pop. `--name` keeps several series running at once."""
     t0 = time.monotonic()
     body: dict = {"ok": True, "object": args.object, "property": args.property}
     try:
+        named = _name_params(args, args.project)
+        if named:
+            body["name"] = named["SeriesName"]
         raw = _rc_require("StartPropertySample",
                           {"ObjectPath": args.object, "PropertyPath": args.property,
-                           "Seconds": args.seconds, "MaxSamples": args.max_samples},
+                           "Seconds": args.seconds, "MaxSamples": args.max_samples, **named},
                           args.project, _NEEDS_SAMPLE)
         start = json.loads(raw) if isinstance(raw, str) else (raw or {})
         if not start.get("ok"):
@@ -1923,10 +1950,15 @@ def _sample(args) -> int:
                     "object": args.object, "property": args.property}
         elif args.no_wait:
             body["started"] = True
-            body["hint"] = "sampling in-engine; read it with `uap sample read`"
+            if start.get("replaced"):
+                body["replaced"] = True
+                body["warning"] = ("a series with this name was already held and has been "
+                                   "REPLACED; use a different --name to keep both")
+            read_hint = "uap sample read" + (f" --name {named['SeriesName']}" if named else "")
+            body["hint"] = f"sampling in-engine; read it with `{read_hint}`"
         else:
             time.sleep(args.seconds + 0.25)
-            raw = _rc_require("ReadPropertySample", {}, args.project, _NEEDS_SAMPLE)
+            raw = _rc_require("ReadPropertySample", dict(named), args.project, _NEEDS_SAMPLE)
             body.update(json.loads(raw) if isinstance(raw, str) else (raw or {}))
             body["stats"] = _sample_stats(body.get("samples") or [])
             body.update(_throttle.sampler_annotation(body["stats"].get("hz")))
@@ -1944,15 +1976,44 @@ def _sample_read(args) -> int:
     t0 = time.monotonic()
     body: dict = {"ok": True}
     try:
-        raw = _rc_require("ReadPropertySample", {}, args.project, _NEEDS_SAMPLE)
+        raw = _rc_require("ReadPropertySample", _name_params(args, args.project),
+                          args.project, _NEEDS_SAMPLE)
         body.update(json.loads(raw) if isinstance(raw, str) else (raw or {}))
-        body["stats"] = _sample_stats(body.get("samples") or [])
-        body.update(_throttle.sampler_annotation(body["stats"].get("hz")))
-        if args.summary:
-            body.pop("samples", None)
+        if body.get("ok"):
+            body["stats"] = _sample_stats(body.get("samples") or [])
+            body.update(_throttle.sampler_annotation(body["stats"].get("hz")))
+            if args.summary:
+                body.pop("samples", None)
     except (AgentError, json.JSONDecodeError) as exc:
         body = _err(exc)
-    _capture("sample:read", {}, body, int((time.monotonic() - t0) * 1000))
+    _capture("sample:read", {"name": getattr(args, "name", None)}, body,
+             int((time.monotonic() - t0) * 1000))
+    _emit(body)
+    return 0 if body.get("ok") else 1
+
+
+def _sample_stop(args) -> int:
+    """Stop a series early, keeping what it collected (`sample read` still returns it).
+    --name X stops that series, --all stops every series, neither stops the unnamed one."""
+    t0 = time.monotonic()
+    body: dict = {"ok": True}
+    try:
+        if args.all and getattr(args, "name", None):
+            raise AgentError(ErrorCode.SCHEMA_VALIDATION, "--all and --name are mutually exclusive")
+        if args.all:
+            params = {"SeriesName": "*"}
+            msg = _missing_arg("StopPropertySample", "SeriesName", args.project)
+            if msg:
+                raise AgentError(ErrorCode.UE_OBJECT_NOT_FOUND, msg)
+        else:
+            params = _name_params(args, args.project)
+        raw = _rc_require("StopPropertySample", params, args.project, _NEEDS_SAMPLE)
+        body["stopped"] = (params.get("SeriesName") or "(default)") if not args.all else "all"
+        body["result"] = raw
+    except AgentError as exc:
+        body = _err(exc)
+    _capture("sample:stop", {"name": getattr(args, "name", None), "all": args.all}, body,
+             int((time.monotonic() - t0) * 1000))
     _emit(body)
     return 0 if body["ok"] else 1
 
@@ -2971,6 +3032,12 @@ SAMPLING + LOGS (sub-second truth; a ~1s exec round-trip cannot see judder or a 
       property: dot path (CharacterMovement.Velocity) or a computed leaf
               (WorldLocation|WorldRotation|WorldScale|WorldTransform|ForwardVector|Velocity)
   uap sample read [--summary]          read the series (use with `sample start --no-wait`)
+  uap sample start ... --name pawn --no-wait      SEVERAL series at once: name each one
+  uap sample start ... --name fps  --no-wait      (no --name = one unnamed series, as before)
+  uap sample read --name pawn ; uap sample stop --name fps | --all
+      A start REPLACES only the series of the same name (result says `replaced`); a stopped
+      series keeps its samples until the editor restarts. Max 16 held. Named calls need a
+      plugin build with `SeriesName`; an older copy is refused as skew, never run unnamed.
   uap log cursor                       grab a cursor BEFORE driving the condition
   uap log since <cursor> --grep RE     what the editor logged since then
   uap log tail 200 [--grep RE]         the last N captured lines (or --lines 200)
@@ -3104,7 +3171,7 @@ VERBS (uap help <verb>)
   read-ui | click <text> | tab <id> | nav <dir>     on-screen UMG / CommonUI
   screenshot <abs.png> [--window <client>]          3D + UI composite; standalone clients
   input hold|axis|release|status|mouse              sustained / analog / mouse input
-  sample start|read              per-frame property series (sub-second truth)
+  sample start|read|stop         per-frame property series, --name for several at once
   log cursor|tail|since          editor log ring; --grep, cursor-based sweeps
   helpers | instances            project test helpers | which processes answer
   batch "<cmd>" ... | --file f   several verbs in one process
@@ -3753,10 +3820,20 @@ def build_parser() -> argparse.ArgumentParser:
                      help="return as soon as sampling starts (read it later with `sample read`)")
     sst.add_argument("--summary", action="store_true",
                      help="omit the raw series; keep only the stats")
+    sst.add_argument("--name", default=None,
+                     help="name this series so several run at once (e.g. --name pawn, --name fps); "
+                          "starting a name that is already held REPLACES only that one. No --name "
+                          "= the single unnamed series, as before")
     sst.set_defaults(func=_sample)
     sr = smps.add_parser("read", parents=[proj], help="read the series collected so far")
     sr.add_argument("--summary", action="store_true")
+    sr.add_argument("--name", default=None, help="read this named series (default: the unnamed one)")
     sr.set_defaults(func=_sample_read)
+    ssp = smps.add_parser("stop", parents=[proj],
+                          help="stop a series early, keeping what it collected")
+    ssp.add_argument("--name", default=None, help="stop this named series (default: the unnamed one)")
+    ssp.add_argument("--all", action="store_true", help="stop every series")
+    ssp.set_defaults(func=_sample_stop)
 
     # Editor log, through the plugin's in-process capture -- same project targeting as every
     # other verb, and the lines land in the report instead of a side-channel shell tail.
