@@ -76,7 +76,31 @@ def test_status_adds_empty_task_to_records_written_before_labels_existed():
     del state["exclusive"]["requested_by"]
     co._save("demo", state)
     st = co.status("demo")
-    assert st["exclusive"]["task"] == "" and st["exclusive"]["requested_by"] == ""
+    assert st["exclusive"]["task"] == "pie (old)" and st["exclusive"]["requested_by"] == ""
+
+
+def test_no_task_falls_back_to_reason_and_agent_in_status_and_queue_detail(capsys):
+    assert main(["lease", "acquire", "exclusive", "--reason", "pie", "--agent", "dx-t11v",
+                 "--project", "demo", "--wait", "0"]) == 0
+    st = _status(capsys)
+    assert st["exclusive"]["task"] == "pie (dx-t11v)"
+    state = co._load("demo")
+    co._enqueue(state, "other", "exclusive", "rebuild", "")
+    co._save("demo", state)
+    st = _status(capsys)
+    assert st["queue_detail"][0]["task"] == "rebuild (other)"
+
+
+def test_no_task_prefers_the_active_report_title(capsys):
+    assert main(["report", "start", "dx-t11-section-activator", "--agent", "dx-t11v"]) == 0
+    capsys.readouterr()
+    assert main(["lease", "acquire", "exclusive", "--reason", "pie", "--agent", "dx-t11v",
+                 "--project", "demo", "--wait", "0"]) == 0
+    st = _status(capsys)
+    assert st["exclusive"]["task"] == "dx-t11-section-activator"
+    assert main(["lease", "acquire", "exclusive", "--reason", "pie", "--agent", "dx-t11v",
+                 "--project", "demo", "--wait", "0", "--task", "explicit"]) == 0
+    assert _status(capsys)["exclusive"]["task"] == "explicit"
 
 
 def test_reacquire_without_a_label_keeps_the_existing_one():

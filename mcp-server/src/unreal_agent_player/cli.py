@@ -3673,9 +3673,14 @@ def _pie_state_for_lease(project: str | None) -> tuple[bool | None, str]:
     return None, "unreachable"
 
 
-def _task_label(args) -> str:
-    """The human task label for this call: --task, else $UAP_TASK, sanitised ("" if neither)."""
-    return _coord.sanitize_label(getattr(args, "task_label", None)) or _coord.default_task()
+def _task_label(args, reason=None) -> str:
+    """The human task label for this call: --task, else $UAP_TASK, else the agent's open report
+    title, else "<reason> (<agent>)" -- so the overlay never shows "none set" for a tokened agent."""
+    explicit = _coord.sanitize_label(getattr(args, "task_label", None)) or _coord.default_task()
+    if explicit:
+        return explicit
+    agent = getattr(args, "agent", None) or os.environ.get("UAP_AGENT_ID")
+    return _coord.fallback_task(agent, reason) if agent else ""
 
 
 def _requested_by(args, agent: str) -> str:
@@ -3712,7 +3717,7 @@ def _lease_inner(args) -> int:
     proj = getattr(args, "project", "") or _env_project()
     cmd = args.lease_cmd
     if cmd in ("acquire", "wait"):
-        task = _task_label(args)
+        task = _task_label(args, getattr(args, "reason", None))
         mb = _max_block(args)
         if cmd == "acquire":
             res = _coord.acquire(proj, args.mode, reason=args.reason, agent=args.agent,

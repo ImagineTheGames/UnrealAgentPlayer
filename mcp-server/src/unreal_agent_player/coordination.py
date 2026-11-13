@@ -228,6 +228,36 @@ def default_task() -> str:
     return sanitize_label(os.environ.get(UAP_TASK_ENV))
 
 
+def report_title(agent) -> str:
+    """Title of `agent`'s open report (sanitised), or "". Never raises: display only."""
+    token = (str(agent) if agent else "").strip()
+    if not token:
+        return ""
+    try:
+        from unreal_agent_player.reporting import session as sess
+
+        rec = sess.get_active_owner(token)
+        if not rec:
+            return ""
+        data = json.loads((pathlib.Path(rec["run_dir"]) / "data.json").read_text(encoding="utf-8"))
+        return sanitize_label(data.get("task"))
+    except Exception:
+        return ""
+
+
+def fallback_task(agent, reason=None) -> str:
+    """Label to show when no --task / UAP_TASK was given: the agent's active report title, else
+    "<reason> (<agent>)", else the bare agent token. Display-only, like every label."""
+    title = report_title(agent)
+    if title:
+        return title
+    who = sanitize_label(agent)
+    why = sanitize_label(reason)
+    if why and who:
+        return sanitize_label(f"{why} ({who})")
+    return why or who
+
+
 def _pid_alive(pid: int) -> bool:
     if not pid:
         return False
@@ -1387,7 +1417,8 @@ def note_activity(project: str | None, *, agent: str, verb: str = "",
 
 def _queue_detail(waiters: list[dict]) -> list[dict]:
     """The queue in arrival order with each waiter's labels, for humans reading status."""
-    return [{"agent": str(w.get("agent")), "task": w.get("task", ""),
+    return [{"agent": str(w.get("agent")),
+             "task": w.get("task") or fallback_task(w.get("agent"), w.get("reason")),
              "reason": w.get("reason", ""), "requested_by": w.get("requested_by", "")}
             for w in waiters]
 
@@ -1398,8 +1429,10 @@ def _with_labels(rec: dict | None) -> dict | None:
     if not isinstance(rec, dict):
         return rec
     out = dict(rec)
-    out.setdefault("task", "")
     out.setdefault("requested_by", "")
+    if not out.get("task") and out.get("agent"):
+        out["task"] = fallback_task(out.get("agent"), out.get("reason"))
+    out.setdefault("task", "")
     return out
 
 
