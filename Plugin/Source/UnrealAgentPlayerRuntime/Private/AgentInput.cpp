@@ -109,6 +109,30 @@ namespace
         if (!SlateUser.IsValid() || SlateUser->HasCapture(Evt.GetPointerIndex())) { return; }
         SlateUser->SetPointerCaptor(Evt.GetPointerIndex(), Captor.ToSharedRef(), Path);
     }
+
+    /**
+     * Is this pointer captured by the game's SViewport? The same-named failure as above but on a
+     * FOREGROUND client (17tm466y7g0): once the viewport holds the capture - after a click on
+     * non-interactive text, or a menu opened while the viewport captures permanently -
+     * ProcessMouseButtonDownEvent takes its HasCapture branch and routes every press to the
+     * captor, i.e. the game viewport, never to the button under the cursor. The call still
+     * reported clicked / down_handled / up_handled and no button ever fired, while
+     * `vrmenu.dev.press` (which routes the down straight to the button's own path) worked.
+     * The viewport is the one captor that is never a click in progress: a real drag (slider,
+     * scrollbar) is captured by the widget being dragged, so only SViewport is stolen back.
+     */
+    bool UAPViewportHoldsPointerCapture(const TSharedPtr<FSlateUser>& SlateUser, uint32 PointerIndex)
+    {
+        if (!SlateUser.IsValid() || !SlateUser->HasCapture(PointerIndex)) { return false; }
+        for (const FWidgetPath& P : SlateUser->GetCaptorPaths())
+        {
+            if (P.IsValid() && P.Widgets.Num() > 0 && P.Widgets.Last().Widget->GetType() == FName(TEXT("SViewport")))
+            {
+                return true;
+            }
+        }
+        return false;
+    }
 }
 
 namespace
@@ -499,18 +523,28 @@ bool FAgentInput::InjectMouseButtonAt(EAgentMouseButton Btn, bool bPressed, FVec
         if (bPressed) { UAPGrantCaptureWhileInactive(App, Reply, Redirected, Evt); }
         return Reply.IsEventHandled();
     }
-    // Background app (see UAPGrantCaptureWhileInactive): route the down along the same path
-    // ProcessMouseButtonDownEvent would hit-test, so the reply - and the capture it asks for -
-    // is visible here. With a captor already held, keep the engine route (it goes to the captor).
-    if (bPressed && !App.IsActive() && !App.GetHandleDeviceInputWhenApplicationNotActive())
+    // Route the down ourselves, along the same path ProcessMouseButtonDownEvent would hit-test, in
+    // the two cases its own route cannot click a button:
+    //  - a BACKGROUND app (see UAPGrantCaptureWhileInactive): the reply - and the capture it asks
+    //    for - must be visible here. With a captor already held, keep the engine route (it goes to
+    //    the captor, e.g. a drag in progress).
+    //  - the game's SViewport already holds the pointer capture, in the foreground or not
+    //    (see UAPViewportHoldsPointerCapture): the engine route would hand the press to the
+    //    viewport. Hand the capture back first (Slate-side only, the same call
+    //    ReleaseSlatePointerCapture makes), then route to what is under the cursor.
+    // No OS cursor call is made on any of these routes.
+    if (bPressed)
     {
         const TSharedPtr<FSlateUser> SlateUser = App.GetUser(User);
-        if (SlateUser.IsValid() && !SlateUser->HasCapture(Evt.GetPointerIndex()))
+        const bool bBackground = !App.IsActive() && !App.GetHandleDeviceInputWhenApplicationNotActive();
+        const bool bViewportCaptured = UAPViewportHoldsPointerCapture(SlateUser, Evt.GetPointerIndex());
+        if (SlateUser.IsValid() && (bViewportCaptured || (bBackground && !SlateUser->HasCapture(Evt.GetPointerIndex()))))
         {
             const FWidgetPath Path = App.LocateWindowUnderMouse(
                 ScreenPos, App.GetInteractiveTopLevelWindows(), /*bIgnoreEnabledStatus*/ false, User);
             if (Path.IsValid())
             {
+                if (bViewportCaptured) { SlateUser->ReleaseCapture(Evt.GetPointerIndex()); }
                 const FReply Reply = App.RoutePointerDownEvent(Path, Evt);
                 UAPGrantCaptureWhileInactive(App, Reply, Path, Evt);
                 return Reply.IsEventHandled();
@@ -1741,6 +1775,15 @@ namespace
             }
         }
         O->SetStringField(TEXT("pointer_capture_holder"), Holder);
+        if (Holder.Contains(TEXT("SViewport")))
+        {
+            // The click itself takes the capture back (see UAPViewportHoldsPointerCapture): informational.
+            O->SetStringField(TEXT("pointer_capture_warning"), FString::Printf(
+                TEXT("Slate user %d's pointer is captured by the game viewport ('%s'). A click ")
+                TEXT("hands that capture back and routes the press to the widget under the cursor, ")
+                TEXT("so this is normal for a foreground game client."), User, *Holder));
+            return;
+        }
         O->SetStringField(TEXT("pointer_capture_warning"), FString::Printf(
             TEXT("Slate user %d already holds a POINTER CAPTURE ('%s'), so this event is routed ")
             TEXT("to the captor instead of to whatever is under the cursor -- and it will still ")
