@@ -65,6 +65,9 @@ enum class EAgentXRHand : uint8
 {
     Left,
     Right,
+    // The HEAD (HMD): InjectXRControllerPose / ClearXRControllerOverride with Head place the client's
+    // head instead of a controller. Appended LAST so Left/Right keep their values.
+    Head,
 };
 
 USTRUCT(BlueprintType)

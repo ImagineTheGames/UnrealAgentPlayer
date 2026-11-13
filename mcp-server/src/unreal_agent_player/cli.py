@@ -1732,14 +1732,56 @@ def _input(args) -> int:
 _NEEDS_XR_AIM = ("opt-in aim-pose emulation for the injected XR controllers -- without it the "
                  "'<Hand>Aim' source answers the GRIP pose, so aim == grip")
 _NEEDS_XR_STATE = "reading back what the injected XR controllers answer (grip AND aim pose)"
-_XR_HANDS = {"left": "Left", "right": "Right"}
+_XR_HANDS = {"left": "Left", "right": "Right", "head": "Head"}
+_NEEDS_XR_HEAD = ("placing the HEAD (HMD) of a PIE client, so the server's copy of that player's head "
+                  "moves as it would with a real headset")
 _XR_AXES = {"grip": "Grip_Axis", "trigger": "Trigger_Axis"}
 _XR_CLICKS = {"grip": "Grip_Click", "trigger": "Trigger_Click"}
 _XR_CLICK_THRESHOLD = 0.5
 
 
 def _xr_hands(which: str) -> list[str]:
-    return ["Left", "Right"] if which == "both" else [_XR_HANDS[which]]
+    if which == "both":
+        return ["Left", "Right"]          # the two controllers; the head is its own target
+    if which == "all":
+        return ["Left", "Right", "Head"]
+    return [_XR_HANDS[which]]
+
+
+def _xr_require_head_support(project: str | None) -> None:
+    """Refuse a head verb on a plugin copy that predates it.
+
+    An older plugin has InjectXRControllerPose but its EAgentXRHand has no Head, and RemoteControl
+    may coerce the unknown enum name to the FIRST value -- which would move the LEFT HAND while the
+    caller believes it placed the head. A head-aware plugin reports a `head` block in
+    GetXRControllerState, so look for it first and refuse otherwise."""
+    state = _rc_json("GetXRControllerState", {}, project, needs=_NEEDS_XR_HEAD)
+    if state.get("ok") is False:
+        # The plugin refused the QUERY itself (e.g. --client 7: no such PIE client). That says nothing
+        # about head support, and the call that follows is refused for the same reason with the
+        # plugin's own wording, so let it speak.
+        return
+    blocks = state.get("clients") if isinstance(state.get("clients"), list) else [state]
+    if not any(isinstance(b, dict) and "head" in b for b in blocks):
+        raise _skew_error("head pose support (EAgentXRHand::Head)", project, _NEEDS_XR_HEAD)
+
+
+def _xr_rotation(args) -> tuple[float, float, float]:
+    """--rotation P,Y,R (pitch,yaw,roll) wins over --pitch/--yaw/--roll when given."""
+    rot = getattr(args, "rotation", None)
+    if rot is None:
+        return args.pitch, args.yaw, args.roll
+    parts = [p for p in re.split(r"[,\s]+", str(rot).strip()) if p]
+    if len(parts) != 3:
+        raise AgentError(ErrorCode.SCHEMA_VALIDATION,
+                         f"--rotation wants PITCH,YAW,ROLL (three numbers), got {rot!r}",
+                         recoverable=False)
+    try:
+        return float(parts[0]), float(parts[1]), float(parts[2])
+    except ValueError:
+        raise AgentError(ErrorCode.SCHEMA_VALIDATION,
+                         f"--rotation wants PITCH,YAW,ROLL (three numbers), got {rot!r}",
+                         recoverable=False) from None
 
 
 def _xr(args) -> int:
@@ -1771,20 +1813,37 @@ def _xr(args) -> int:
     try:
         if sub == "pose":
             hand = _XR_HANDS[args.hand]
+            pitch, yaw, roll = _xr_rotation(args)
+            if hand == "Head":
+                _xr_require_head_support(args.project)
             params = {"Hand": hand,
                       "Position": {"X": args.x, "Y": args.y, "Z": args.z},
-                      "Orientation": {"Pitch": args.pitch, "Yaw": args.yaw, "Roll": args.roll},
+                      "Orientation": {"Pitch": pitch, "Yaw": yaw, "Roll": roll},
                       "bTracked": not args.untracked}
             applied = _rc_call("InjectXRControllerPose", params, args.project)
             body.update({"hand": hand, "applied": bool(applied),
                          "position": [args.x, args.y, args.z],
-                         "orientation": {"pitch": args.pitch, "yaw": args.yaw, "roll": args.roll},
+                         "orientation": {"pitch": pitch, "yaw": yaw, "roll": roll},
                          "tracked": not args.untracked,
                          "note": "TRACKING-SPACE pose (relative to the pawn's tracking origin, cm). "
                                  "It stays applied until `uap xr clear`."})
+            if hand == "Head":
+                body["note"] = ("HEAD pose, TRACKING-SPACE (cm, like a real HMD: z is eye height above the "
+                                "tracking origin). Written into this client's VRExpansion camera every "
+                                "frame, which sends it to the server, so the SERVER's copy of the head "
+                                "moves like it does with a real headset. `uap xr state` shows "
+                                "head.applied_to / head.apply_count; `uap xr clear head` stops it "
+                                "(the head stays where it was last put).")
             if not applied:
                 body["ok"] = False
                 body["error"] = "InjectXRControllerPose returned false (no such PIE client - `uap input clients` lists them - or the agent motion controller is missing; the log names which)"
+        elif sub == "clear" and args.hand in ("head", "all"):
+            _xr_require_head_support(args.project)
+            cleared = {}
+            for hand in _xr_hands(args.hand):
+                cleared[hand] = bool(_rc_call("ClearXRControllerOverride", {"Hand": hand}, args.project))
+            body["cleared"] = cleared
+            body["ok"] = all(cleared.values())
         elif sub == "clear":
             cleared = {}
             for hand in _xr_hands(args.hand):
@@ -1809,7 +1868,7 @@ def _xr(args) -> int:
     except (AgentError, json.JSONDecodeError) as exc:
         body = _err(exc)
     _capture(f"xr:{sub}", {k: v for k, v in vars(args).items()
-                           if k in ("hand", "x", "y", "z", "pitch", "yaw", "roll", "mode")},
+                           if k in ("hand", "x", "y", "z", "pitch", "yaw", "roll", "rotation", "mode")},
              body, int((time.monotonic() - t0) * 1000))
     _emit(body)
     return 0 if body.get("ok") else 1
@@ -2988,6 +3047,12 @@ SUSTAINED INPUT (a single injected event CANNOT drive locomotion -- see below)
 
 VR HANDS (the injected Quest controllers -- drive the REAL VR pawn's hands with no headset)
   uap xr pose left|right X Y Z [--pitch P --yaw Y --roll R]   place a hand, TRACKING space (cm)
+  uap xr pose head X Y Z [--rotation P,Y,R] --client N   place the HEAD (HMD), TRACKING space (cm). A PIE
+                                       client never sends a tracked head, so the SERVER's copy of that
+                                       player's head sits at the floor and every server-side head check
+                                       (grab line of sight, looks, comfort, voice position) is wrong.
+                                       This feeds VRExpansion's replicated camera path every frame, so the
+                                       server's copy moves as with a real headset. Z is eye height (~170).
   uap xr grip left|right [v] --seconds N   hold OculusTouch_<Hand>_Grip_Axis + _Grip_Click (`input axis`
                                        hold: same ledger, same overlap refusal, same --wait)
   uap xr trigger left|right [v] --seconds N   ...OculusTouch_<Hand>_Trigger_Axis + _Trigger_Click
@@ -2998,7 +3063,7 @@ VR HANDS (the injected Quest controllers -- drive the REAL VR pawn's hands with 
                                        ON (default delta = Quest: pitch -60, loc 7.35 0 -6.73)
                                        makes lasers / distance grab see a real aim ray
   uap xr state                         grip + aim pose per hand, and whether aim is emulated
-  uap xr clear [left|right|both]       drop the injected pose(s)
+  uap xr clear [left|right|both|head|all]   drop the injected pose(s) (head stays where it was last put)
   --client N|all on any `uap xr` verb: the hands are PER PIE CLIENT. Default = client 0 ONLY (pose,
                                        grip, trigger, aim, state, clear), never every player.
   Rig recipe (possess the VR pawn in flat PIE, camera as the head): the project's own docs.
@@ -3746,18 +3811,23 @@ def build_parser() -> argparse.ArgumentParser:
     xrs = xr.add_subparsers(dest="xr_cmd", required=True)
     xp = xrs.add_parser("pose", parents=[proj],
                         help="place one injected controller at a TRACKING-SPACE pose (cm, degrees)")
-    xp.add_argument("hand", choices=["left", "right"])
+    xp.add_argument("hand", choices=["left", "right", "head"],
+                    help="left|right = a controller; head = the HMD (the server's copy of this "
+                         "client's head, which a PIE client never sends on its own)")
     xp.add_argument("x", type=float)
     xp.add_argument("y", type=float)
     xp.add_argument("z", type=float)
     xp.add_argument("--pitch", type=float, default=0.0)
     xp.add_argument("--yaw", type=float, default=0.0)
     xp.add_argument("--roll", type=float, default=0.0)
+    xp.add_argument("--rotation", default=None, metavar="PITCH,YAW,ROLL",
+                    help="all three angles at once (degrees); overrides --pitch/--yaw/--roll")
     xp.add_argument("--untracked", action="store_true",
                     help="report the pose as NOT tracked (a real device then wins, if one exists)")
     xp.set_defaults(func=_xr)
-    xc = xrs.add_parser("clear", parents=[proj], help="drop the injected pose (default: both hands)")
-    xc.add_argument("hand", nargs="?", default="both", choices=["left", "right", "both"])
+    xc = xrs.add_parser("clear", parents=[proj], help="drop the injected pose (default: both hands; "
+                                                       "head = the HMD, all = hands + head)")
+    xc.add_argument("hand", nargs="?", default="both", choices=["left", "right", "both", "head", "all"])
     xc.set_defaults(func=_xr)
     xa = xrs.add_parser("aim", parents=[proj],
                         help="opt-in aim-pose emulation: '<Hand>Aim' = grip_to_aim * grip "

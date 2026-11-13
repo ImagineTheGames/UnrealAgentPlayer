@@ -3,6 +3,11 @@
 #include "CoreMinimal.h"
 #include "IMotionController.h"
 #include "UAPAgentTypes.h"
+#include "Containers/Ticker.h"
+#include "UObject/WeakObjectPtr.h"
+
+class UActorComponent;
+class UWorld;
 
 /**
  * A fake IMotionController that returns agent-injected poses for Left/Right hands.
@@ -20,6 +25,19 @@
  * world (client 0), NOT "all" -- the old behaviour was the bug. "all" is explicit.
  * A poll made off the game thread (the render thread's late update) answers false: it cannot know
  * which client it serves, and the game-thread poll already placed the component.
+ *
+ * HEAD POSE. There is no registered feature for the HMD, so a PIE client's VR pawn never sends a
+ * tracked head and the SERVER's copy of that player's head sits at the floor. EAgentXRHand::Head
+ * (SetPose/ClearPose with Head) stores a head pose per client, and a core ticker writes it into that
+ * client's local pawn the way a real HMD would: into the VRExpansion ReplicatedVRCameraComponent's
+ * ReplicatedCameraTransform (found by class NAME through reflection, so this module needs no VRE
+ * dependency) and through the component's own OnRep_ReplicatedCameraTransform, which places the
+ * camera exactly as VRE does for a tracked HMD. VRE's own TickComponent then sends it to the server
+ * (Server_SendCameraTransform) and replicates it to the other clients. Re-asserted every frame while
+ * active; ClearPose(Head) stops asserting but leaves the head where it was last put. A head that
+ * was applied to a client is DROPPED when that client's PIE session ends (a hand pose is sticky
+ * across sessions, but a stale head would silently re-seat the next test's player); one set before
+ * PIE has started waits for the first session.
  */
 class UNREALAGENTPLAYERRUNTIME_API FAgentMotionController : public IMotionController
 {
@@ -33,6 +51,7 @@ public:
     // --- Per-client verbs. Client = "" (default client), "N" (PIE instance) or "all". ---------
     // A refusal (no such client) is logged to LogUAPRuntime (a bool cannot carry a reason) and
     // returns false; nothing is changed on ANY client in that case.
+    // Hand may be EAgentXRHand::Head (see HEAD POSE above); the pose is then a TRACKING-SPACE head pose.
     bool SetPose(const FString& Client, EAgentXRHand Hand, const FAgentControllerPose& Pose);
     bool ClearPose(const FString& Client, EAgentXRHand Hand);
 
@@ -65,7 +84,8 @@ public:
     // lookup, so the per-client isolation can be unit-checked without a PIE.
     bool QueryForSlot(int32 Slot, const FName MotionSource, FRotator& OutOrientation, FVector& OutPosition) const;
 
-    // True when ButtonKeyName names the OTHER hand (e.g. Hand=Right, "OculusTouch_Left_X_Click").
+    // True when ButtonKeyName names the OTHER hand (e.g. Hand=Right, "OculusTouch_Left_X_Click"),
+    // and always for Head (a head has no buttons).
     // InjectXRButton used to ignore Hand entirely; a contradiction is now refused instead of
     // silently pressing the key the name says.
     static bool KeyContradictsHand(EAgentXRHand Hand, const FString& ButtonKeyName);
@@ -85,16 +105,27 @@ private:
     {
         bool bActive = false;
         FAgentControllerPose Pose;
+        // Head only: what the ticker did with it.
+        TWeakObjectPtr<UActorComponent> Target;   // the pawn's ReplicatedVRCameraComponent it last wrote
+        int32 ApplyCount = 0;
+        bool bEverApplied = false;                 // once true, losing the client's world ends the injection
+        FString Note;                              // why it could not apply, if it could not
     };
     // One client's injected controllers + aim emulation.
     struct FClientState
     {
         FHandState Hands[2];
+        FHandState Head;
         bool bAimEmulation = false;
         FTransform RightGripToAim = FTransform::Identity;
     };
     // Keyed by PIE instance id (INDEX_NONE for a standalone game world). Game thread only.
     TMap<int32, FClientState> Clients;
+
+    static FHandState& HandFor(FClientState& S, EAgentXRHand Hand) { return Hand == EAgentXRHand::Head ? S.Head : S.Hands[(int32)Hand]; }
+    bool TickHead(float DeltaTime);
+    void ApplyHead(UWorld* World, FHandState& Head);
+    FTSTicker::FDelegateHandle HeadTicker;
 
     static FTransform GripToAimFor(const FClientState& S, EAgentXRHand Hand);
     bool Query(const FClientState& S, const FName MotionSource, FRotator& OutOrientation, FVector& OutPosition) const;
