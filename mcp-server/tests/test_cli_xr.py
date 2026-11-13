@@ -223,3 +223,116 @@ def test_old_plugin_without_client_on_pose_is_refused_not_applied_everywhere(mon
                     capsys)
     assert rc == 1 and body["ok"] is False
     assert not [1 for f, _ in sent if f == "InjectXRControllerPose"]
+
+
+# --- the HEAD (HMD) of a PIE client -----------------------------------------------------------
+# A PIE client never sends a tracked head, so the server's copy of that player's head sits at the
+# floor. `xr pose head` rides InjectXRControllerPose with Hand=Head; an older plugin has no Head in
+# its enum (and might coerce the name to Left), so the CLI refuses unless GetXRControllerState
+# reports a head block.
+
+def _head_fake(monkeypatch, sent, head_aware=True):
+    class FakeRC:
+        def __init__(self, *a, **k):
+            pass
+
+        async def call_preset(self, func, params, *a, **k):
+            sent.append((func, dict(params)))
+            if func in ("InjectXRControllerPose", "ClearXRControllerOverride"):
+                return True
+            if func == "GetXRControllerState":
+                body = {"ok": True, "client": 1, "aim_emulation": False, "hands": {}}
+                if head_aware:
+                    body["head"] = {"active": False}
+                return json.dumps(body)
+            return json.dumps({"ok": True})
+
+        async def aclose(self):
+            pass
+
+    monkeypatch.setattr(cli, "RemoteControlClient", FakeRC)
+    monkeypatch.setattr(cli, "_live_contract", lambda project=None: None)
+    monkeypatch.setattr(cli, "_CLIENT", [None])
+
+
+def test_head_pose_sends_head_with_client_and_rotation(monkeypatch, capsys):
+    sent = []
+    _head_fake(monkeypatch, sent)
+    assert cli.main(["xr", "pose", "head", "10", "-20", "170", "--rotation", "-5,90,0",
+                     "--client", "1"]) == 0
+    _func, params = [c for c in sent if c[0] == "InjectXRControllerPose"][-1]
+    assert params["Hand"] == "Head" and params["Client"] == "1"
+    assert params["Position"] == {"X": 10.0, "Y": -20.0, "Z": 170.0}
+    assert params["Orientation"] == {"Pitch": -5.0, "Yaw": 90.0, "Roll": 0.0}
+    assert params["bTracked"] is True
+
+
+def test_head_pose_without_client_sends_no_client(monkeypatch, capsys):
+    sent = []
+    _head_fake(monkeypatch, sent)
+    assert cli.main(["xr", "pose", "head", "0", "0", "170"]) == 0
+    assert "Client" not in [c for c in sent if c[0] == "InjectXRControllerPose"][-1][1]
+
+
+def test_head_pose_refused_on_a_plugin_without_head(monkeypatch, capsys):
+    sent = []
+    _head_fake(monkeypatch, sent, head_aware=False)
+    rc = cli.main(["xr", "pose", "head", "0", "0", "170", "--client", "1"])
+    out = json.loads(capsys.readouterr().out.strip().splitlines()[-1])
+    assert rc == 1 and out["ok"] is False
+    assert "head" in json.dumps(out).lower()
+    assert not [c for c in sent if c[0] == "InjectXRControllerPose"], "must not inject on a plugin without Head"
+
+
+def test_head_pose_to_a_missing_client_is_the_plugins_refusal_not_skew(monkeypatch, capsys):
+    class FakeRC:
+        def __init__(self, *a, **k):
+            pass
+
+        async def call_preset(self, func, params, *a, **k):
+            if func == "GetXRControllerState":
+                return json.dumps({"ok": False, "error": "no PIE client 7 (valid: 0, 1)"})
+            return False                       # InjectXRControllerPose refuses a missing client
+
+        async def aclose(self):
+            pass
+
+    monkeypatch.setattr(cli, "RemoteControlClient", FakeRC)
+    monkeypatch.setattr(cli, "_live_contract", lambda project=None: None)
+    monkeypatch.setattr(cli, "_CLIENT", [None])
+    rc = cli.main(["xr", "pose", "head", "0", "0", "170", "--client", "7"])
+    out = json.loads(capsys.readouterr().out.strip().splitlines()[-1])
+    assert rc == 1 and out["ok"] is False
+    assert "no such PIE client" in out["error"] and "plugin has no" not in out["error"]
+
+
+def test_hand_pose_does_not_need_head_support(monkeypatch, capsys):
+    sent = []
+    _head_fake(monkeypatch, sent, head_aware=False)
+    assert cli.main(["xr", "pose", "left", "1", "2", "3"]) == 0
+    assert not [c for c in sent if c[0] == "GetXRControllerState"]
+
+
+def test_head_rotation_must_be_three_numbers(monkeypatch, capsys):
+    sent = []
+    _head_fake(monkeypatch, sent)
+    rc = cli.main(["xr", "pose", "head", "0", "0", "170", "--rotation", "1,2"])
+    out = json.loads(capsys.readouterr().out.strip().splitlines()[-1])
+    assert rc == 1 and "PITCH,YAW,ROLL" in out["error"]
+
+
+def test_clear_head_and_all(monkeypatch, capsys):
+    sent = []
+    _head_fake(monkeypatch, sent)
+    assert cli.main(["xr", "clear", "head", "--client", "1"]) == 0
+    assert [p["Hand"] for f, p in sent if f == "ClearXRControllerOverride"] == ["Head"]
+    sent.clear()
+    assert cli.main(["xr", "clear", "all"]) == 0
+    assert [p["Hand"] for f, p in sent if f == "ClearXRControllerOverride"] == ["Left", "Right", "Head"]
+
+
+def test_default_clear_stays_hands_only(monkeypatch, capsys):
+    sent = []
+    _head_fake(monkeypatch, sent)
+    assert cli.main(["xr", "clear"]) == 0
+    assert [p["Hand"] for f, p in sent if f == "ClearXRControllerOverride"] == ["Left", "Right"]

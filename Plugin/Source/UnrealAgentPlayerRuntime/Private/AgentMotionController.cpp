@@ -4,6 +4,11 @@
 #include "AgentWorld.h"
 #include "UnrealAgentPlayerRuntimeModule.h"
 #include "Engine/World.h"
+#include "Engine/Engine.h"
+#include "GameFramework/PlayerController.h"
+#include "GameFramework/Pawn.h"
+#include "Components/SceneComponent.h"
+#include "UObject/UnrealType.h"
 
 static const FName GAgentMCDeviceType = TEXT("UAPAgentController");
 
@@ -16,6 +21,9 @@ void FAgentMotionController::Register()
     {
         IModularFeatures::Get().RegisterModularFeature(IMotionController::GetModularFeatureName(), this);
         bRegistered = true;
+        // Core ticker: once per frame on the game thread, before the world tick, so an injected head
+        // is in place when VRE's camera component ticks (and sends it to the server).
+        HeadTicker = FTSTicker::GetCoreTicker().AddTicker(FTickerDelegate::CreateRaw(this, &FAgentMotionController::TickHead), 0.f);
     }
 }
 
@@ -25,6 +33,11 @@ void FAgentMotionController::Unregister()
     {
         IModularFeatures::Get().UnregisterModularFeature(IMotionController::GetModularFeatureName(), this);
         bRegistered = false;
+        if (HeadTicker.IsValid())
+        {
+            FTSTicker::RemoveTicker(HeadTicker);
+            HeadTicker.Reset();
+        }
     }
 }
 
@@ -70,9 +83,10 @@ bool FAgentMotionController::SetPose(const FString& Client, EAgentXRHand Hand, c
     }
     for (int32 Slot : Slots)
     {
-        FHandState& S = Clients.FindOrAdd(Slot).Hands[(int32)Hand];
+        FHandState& S = HandFor(Clients.FindOrAdd(Slot), Hand);
         S.bActive = true;
         S.Pose = Pose;
+        if (Hand == EAgentXRHand::Head) { S.Note.Reset(); }
     }
     return true;
 }
@@ -88,7 +102,7 @@ bool FAgentMotionController::ClearPose(const FString& Client, EAgentXRHand Hand)
     }
     for (int32 Slot : Slots)
     {
-        if (FClientState* S = Clients.Find(Slot)) { S->Hands[(int32)Hand].bActive = false; }
+        if (FClientState* S = Clients.Find(Slot)) { HandFor(*S, Hand).bActive = false; }
     }
     return true;
 }
@@ -109,6 +123,115 @@ FTransform FAgentMotionController::GripToAimFor(const FClientState& S, EAgentXRH
     const FRotator R = S.RightGripToAim.Rotator();
     const FVector L = S.RightGripToAim.GetLocation();
     return FTransform(FRotator(R.Pitch, -R.Yaw, -R.Roll), FVector(L.X, -L.Y, L.Z));
+}
+
+// ---- Head pose: write it into the client's pawn the way a tracked HMD would --------------------
+
+namespace
+{
+    // The VRExpansion camera component, by class NAME: this module must not depend on VRExpansion
+    // (uap is shared by projects that may not ship it), and the name is the stable contract.
+    UActorComponent* UAPFindReplicatedVRCamera(APawn* Pawn)
+    {
+        for (UActorComponent* C : Pawn->GetComponents())
+        {
+            for (const UClass* K = C ? C->GetClass() : nullptr; K; K = K->GetSuperClass())
+            {
+                if (K->GetFName() == TEXT("ReplicatedVRCameraComponent")) { return C; }
+            }
+        }
+        return nullptr;
+    }
+}
+
+bool FAgentMotionController::TickHead(float)
+{
+    bool bAny = false;
+    for (const TPair<int32, FClientState>& Pair : Clients)
+    {
+        if (Pair.Value.Head.bActive) { bAny = true; break; }
+    }
+    if (!bAny) { return true; }
+
+    TArray<UWorld*> Worlds;
+    FAgentWorld::GetAllGameWorlds(Worlds);
+    for (TPair<int32, FClientState>& Pair : Clients)
+    {
+        FHandState& Head = Pair.Value.Head;
+        if (!Head.bActive || !Head.Pose.bTracked) { continue; }
+        UWorld* World = nullptr;
+        for (UWorld* W : Worlds)
+        {
+            if (FAgentWorld::GetClientIndex(W) == Pair.Key) { World = W; break; }
+        }
+        if (!World && Head.bEverApplied)
+        {
+            // Its PIE session is gone. Do not carry the head into the next session.
+            UE_LOG(LogUAPRuntime, Log, TEXT("xr head pose for client %d dropped: its PIE session ended"), Pair.Key);
+            Head = FHandState();
+            continue;
+        }
+        ApplyHead(World, Head);
+    }
+    return true;
+}
+
+void FAgentMotionController::ApplyHead(UWorld* World, FHandState& Head)
+{
+    if (!World) { Head.Note = TEXT("no game world for this client (PIE not running?)"); return; }
+    APlayerController* PC = GEngine ? GEngine->GetFirstLocalPlayerController(World) : nullptr;
+    APawn* Pawn = PC ? PC->GetPawn() : nullptr;
+    if (!Pawn) { Head.Note = TEXT("this client has no pawn yet"); return; }
+
+    UActorComponent* Cam = Head.Target.Get();
+    if (!Cam || Cam->GetOwner() != Pawn)
+    {
+        Cam = UAPFindReplicatedVRCamera(Pawn);
+        Head.Target = Cam;
+        Head.ApplyCount = 0;
+        if (Cam)
+        {
+            UE_LOG(LogUAPRuntime, Log, TEXT("xr head pose: driving %s"), *Cam->GetPathName());
+        }
+    }
+    if (!Cam)
+    {
+        Head.Note = FString::Printf(TEXT("pawn %s has no ReplicatedVRCameraComponent: it is not the VR pawn (possess the VR pawn; `uap input clients` shows each client's pawn)"), *Pawn->GetName());
+        return;
+    }
+
+    UClass* Cls = Cam->GetClass();
+    FStructProperty* TransformProp = CastField<FStructProperty>(Cls->FindPropertyByName(TEXT("ReplicatedCameraTransform")));
+    UFunction* OnRep = Cls->FindFunctionByName(TEXT("OnRep_ReplicatedCameraTransform"));
+    if (!TransformProp || !OnRep)
+    {
+        Head.Note = TEXT("ReplicatedVRCameraComponent has no ReplicatedCameraTransform / OnRep_ReplicatedCameraTransform: VRExpansion changed, update uap");
+        return;
+    }
+    void* Rep = TransformProp->ContainerPtrToValuePtr<void>(Cam);
+    FStructProperty* PosProp = CastField<FStructProperty>(TransformProp->Struct->FindPropertyByName(TEXT("Position")));
+    FStructProperty* RotProp = CastField<FStructProperty>(TransformProp->Struct->FindPropertyByName(TEXT("Rotation")));
+    if (!PosProp || !RotProp || PosProp->Struct != TBaseStructure<FVector>::Get() || RotProp->Struct != TBaseStructure<FRotator>::Get())
+    {
+        Head.Note = TEXT("FBPVRComponentPosRep layout changed (Position/Rotation): VRExpansion changed, update uap");
+        return;
+    }
+    *PosProp->ContainerPtrToValuePtr<FVector>(Rep) = Head.Pose.Position;
+    *RotProp->ContainerPtrToValuePtr<FRotator>(Rep) = Head.Pose.Orientation;
+
+    // OnRep places the camera (capsule offset, roomscale) exactly as VRE does for a tracked HMD. Its
+    // network smoothing only ever advances on NON-owning copies (UpdateTracking skips it when
+    // locally controlled), so on the owner a smoothed OnRep would start a lerp that never finishes:
+    // switch smoothing off for this one call.
+    FBoolProperty* SmoothProp = CastField<FBoolProperty>(Cls->FindPropertyByName(TEXT("bSmoothReplicatedMotion")));
+    const bool bSmooth = SmoothProp ? SmoothProp->GetPropertyValue_InContainer(Cam) : false;
+    if (SmoothProp && bSmooth) { SmoothProp->SetPropertyValue_InContainer(Cam, false); }
+    Cam->ProcessEvent(OnRep, nullptr);
+    if (SmoothProp && bSmooth) { SmoothProp->SetPropertyValue_InContainer(Cam, true); }
+
+    ++Head.ApplyCount;
+    Head.bEverApplied = true;
+    Head.Note.Reset();
 }
 
 FName FAgentMotionController::GetMotionControllerDeviceTypeName() const { return GAgentMCDeviceType; }
@@ -304,12 +427,21 @@ FString FAgentMotionController::OneClientStateJson(int32 Slot) const
         HandsJson += (I ? TEXT(",") : TEXT("")) + Entry;
     }
     const FTransform R = GripToAimFor(State, EAgentXRHand::Right);
-    return FString::Printf(TEXT("{\"ok\":true,\"client\":%d,\"registered\":%s,\"aim_emulation\":%s,\"right_grip_to_aim\":{\"loc\":%s,\"rot\":%s},\"hands\":{%s},\"note\":\"%s\"}"),
+    const FHandState& Hd = State.Head;
+    const UActorComponent* HeadTarget = Hd.Target.Get();
+    const FString HeadTargetJson = HeadTarget ? FString::Printf(TEXT("\"%s\""), *HeadTarget->GetPathName().Replace(TEXT("\\"), TEXT("\\\\")).Replace(TEXT("\""), TEXT("\\\""))) : FString(TEXT("null"));
+    const FString HeadNoteJson = Hd.Note.Replace(TEXT("\\"), TEXT("\\\\")).Replace(TEXT("\""), TEXT("\\\""));
+    const FString HeadJson = FString::Printf(TEXT("{\"active\":%s,\"tracked\":%s,\"pos\":%s,\"rot\":%s,\"applied_to\":%s,\"apply_count\":%d,\"note\":\"%s\"}"),
+        Hd.bActive ? TEXT("true") : TEXT("false"),
+        (Hd.bActive && Hd.Pose.bTracked) ? TEXT("true") : TEXT("false"),
+        *UAPVecJson(Hd.Pose.Position), *UAPRotJson(Hd.Pose.Orientation),
+        *HeadTargetJson, Hd.ApplyCount, *HeadNoteJson);
+    return FString::Printf(TEXT("{\"ok\":true,\"client\":%d,\"registered\":%s,\"aim_emulation\":%s,\"right_grip_to_aim\":{\"loc\":%s,\"rot\":%s},\"hands\":{%s},\"head\":%s,\"note\":\"%s\"}"),
         Slot,
         bRegistered ? TEXT("true") : TEXT("false"),
         State.bAimEmulation ? TEXT("true") : TEXT("false"),
         *UAPVecJson(R.GetLocation()), *UAPRotJson(R.Rotator()),
-        *HandsJson,
+        *HandsJson, *HeadJson,
         State.bAimEmulation
             ? TEXT("aim pose EMULATED: <Hand>Aim = grip_to_aim * grip")
             : TEXT("aim pose NOT emulated: <Hand>Aim == grip (a real runtime differs; Quest is pitch -60)"));
@@ -325,6 +457,7 @@ FString FAgentMotionController::StateJson(const FString& Client) const
 
 bool FAgentMotionController::KeyContradictsHand(EAgentXRHand Hand, const FString& ButtonKeyName)
 {
+    if (Hand == EAgentXRHand::Head) { return true; }   // a head has no buttons
     const bool bNamesLeft = ButtonKeyName.Contains(TEXT("_Left_"), ESearchCase::IgnoreCase);
     const bool bNamesRight = ButtonKeyName.Contains(TEXT("_Right_"), ESearchCase::IgnoreCase);
     return (Hand == EAgentXRHand::Right && bNamesLeft) || (Hand == EAgentXRHand::Left && bNamesRight);

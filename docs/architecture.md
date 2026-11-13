@@ -41,10 +41,23 @@ Three injectable surfaces for desktop-mode VR testing (no headset required):
    makes `<Hand>Aim` answer grip_to_aim * grip so lasers and "where does the player point" checks
    see a real delta. Off by default so nothing changes for a project that does not ask.
    **Per client:** `FAgentMotionController` is one modular feature shared by every PIE world, and every pawn polls it with ControllerIndex 0, so it keeps one set of hands PER PIE INSTANCE and attributes a poll to a client by `UE::GetPlayInEditorID()` (set by the editor for the whole of that world's tick). `Client` selects the slot on the four pose verbs (empty = client 0). The render thread's late-update poll answers `false` (it cannot name its client); the game-thread poll already placed the component.
-3. **HMD pose — DEFERRED.** There is no `IMotionController`-equivalent injection hook for the
-   head pose; overriding it requires a fake `IXRTrackingSystem`/stereo render device, which is
-   invasive and risks destabilizing the Meta XR runtime path. Revisit only when a concrete test
-   needs head-pose control.
+3. **HMD pose — injected at the VRExpansion camera, per client** (`InjectXRControllerPose` with
+   `Hand=Head`, `uap xr pose head`). There is still no `IMotionController`-equivalent hook for the
+   head, and a fake `IXRTrackingSystem`/stereo device is still out (invasive, risks the Meta XR
+   path), so the head is NOT faked at the tracking layer. What a multi-client PIE actually needs
+   is the SERVER's copy of a client's head to move: VRExpansion's `UReplicatedVRCameraComponent`
+   only fills `ReplicatedCameraTransform` from a tracked HMD, so a PIE client (no HMD) never sends
+   one and the server's copy sits at the floor. `FAgentMotionController` therefore stores a head
+   pose per PIE client and a core ticker (once per frame, before the world tick) writes it into
+   that client's local pawn the way a real HMD would: it sets `ReplicatedCameraTransform` and calls
+   the component's own `OnRep_ReplicatedCameraTransform` (which applies VRE's capsule-offset /
+   roomscale placement), with `bSmoothReplicatedMotion` off for that one call because smoothing only
+   advances on non-owning copies. VRE's own `TickComponent` then sends it to the server
+   (`Server_SendCameraTransform`) and replicates it to the other clients, exactly as for a headset.
+   The component is found by class NAME through reflection, so the plugin has no VRExpansion
+   dependency (a pawn without one reports `head.note` instead). A head that was applied is dropped
+   when its PIE session ends. This does not move the render camera of a real stereo device and is
+   not a tracked HMD for anything that asks `IXRTrackingSystem`.
 
 **Verified limitation (HMD-less PIE + VRExpansion + OpenXR):** `InjectXRControllerPose`
 registers a valid `IMotionController` and returns `true`, but the injected pose is **not

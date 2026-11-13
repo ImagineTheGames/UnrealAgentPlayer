@@ -1487,3 +1487,44 @@ per channel was entirely fictitious; the real figure was 2.5). [ClickUp 17tm466f
   = the old single unnamed series, byte-for-byte (the CLI sends no `SeriesName`). A named call on a plugin copy
   without `SeriesName` is refused as skew (`contract.ARG_PURPOSE`): RemoteControl would drop the argument and run
   the unnamed series, replacing the one you meant to keep.
+
+## 47. A PIE client's HEAD never reached the server, so every server-side head check saw the floor -- FIXED (17tm466zxgu)
+
+* **Symptom (grip line-of-sight, CL 5043 / 17tm466zxfv, 2026-11-12):** in a 2-client PIE the server's copy of the
+  client's head sat at the floor (camera world (109.5, -114.1, -0.15) vs the client's own z 170), so the head
+  line-of-sight line hit a tabletop and the grip was refused. The same fact misleads every server-side check that uses
+  the head: grab LOS, look checks, comfort, voice position, `SOBodyFit` "eye 0.0cm above floor".
+* **Cause:** VRExpansion's `UReplicatedVRCameraComponent` fills `ReplicatedCameraTransform` only from a tracked HMD
+  (`UpdateTracking` / `HandleXRCamera`), and a PIE client has none, so `Server_SendCameraTransform` never carries a
+  head. uap placed the hands per client (#43) but had no head.
+* **Fix (plugin):** `EAgentXRHand` gained `Head` (appended, so Left/Right keep their values). `InjectXRControllerPose` /
+  `ClearXRControllerOverride` with `Hand=Head` store a head pose per PIE client in `FAgentMotionController`, and a
+  core ticker (once per frame, before the world tick) writes it into that client's local pawn: the pawn's
+  `ReplicatedVRCameraComponent` is found by class NAME through reflection (no VRExpansion dependency),
+  `ReplicatedCameraTransform.Position/Rotation` are set, and the component's own `OnRep_ReplicatedCameraTransform`
+  runs (VRE's capsule-offset / roomscale placement) with `bSmoothReplicatedMotion` off for that call (smoothing only
+  advances on non-owning copies, so on the owner it would start a lerp that never ends). VRE's own `TickComponent`
+  then sends it to the server (`Server_SendCameraTransform`) and replicates it to the other clients, as for a
+  headset. A head that was applied is DROPPED when its PIE session ends (a hand pose is sticky across sessions; a
+  stale head would silently re-seat the next test's player: a first live run showed client 0 still at the previous
+  session's pose). `GetXRControllerState` reports `head` (`active`, `pos`, `rot`, `applied_to`, `apply_count`,
+  `note`). `InjectXRButton` refuses `Head`. No subsystem signature changed (no Blueprint/C++ caller breaks); every
+  project needs a plugin re-sync + rebuild (`Restart-Editor.ps1`).
+* **Fix (CLI):** `uap xr pose head X Y Z [--rotation P,Y,R] [--client N]` (`--rotation` also accepted for hands),
+  `uap xr clear head|all` (the default `clear` stays hands only). An older plugin has no `Head` in the enum and
+  RemoteControl might coerce the name to `Left` (it would move the left hand), so the head verbs first require a
+  `head` block in `GetXRControllerState` and are refused as skew otherwise; a refused QUERY (e.g. `--client 7`) is
+  passed through as the plugin's own refusal, not mislabelled as skew.
+* **Verified live (2026-11-12, School's Out editor, `Map_GripStudio`, 2 PIE clients = ListenServer + Client, both on
+  `BP_SO_VRcharacter` via `DEFER dx.dev.vrpawn`; every number read from each pawn's `VR Replicated Camera` on each
+  machine):** baseline (no head): the server's copy of client 1's head is at world (0, 0, 0). `xr pose head 10 -20 170
+  --rotation 0,90,0 --client 1`: client 1's own camera and the SERVER's copy of client 1 both read cam rel (0, 8, 170),
+  world (8, 8, 170), yaw 90, tracking transform (10, -20, 170); client 0 stayed (0, 0, 0). `xr pose head -30 15 155
+  --rotation 10,-45,0 --client 0`: client 0's camera rel (5.7, -5.7, 155), pitch 10 yaw -45, tracking (-30, 15, 155),
+  and client 1's copy of the host pawn identical (replicated); client 1's own and server copies unchanged. After PIE
+  stop both heads were dropped (`xr head pose for client N dropped: its PIE session ended`). Report
+  `C:/Users/reivi/.uap-reports/20261112-220550__uap-xr-pose-head-17tm466zxgu-in-a-2-clie/index.html`.
+* **Limits:** not a fake `IXRTrackingSystem` (nothing that asks the XR system for the HMD sees it, and no stereo render
+  camera moves); it needs a VRExpansion `ReplicatedVRCameraComponent` on the pawn (a flat pawn reports `head.note`).
+  The injected head is VRE's own input, so VRE's placement applies: with `bRetainRoomscale` false the camera's XY
+  is zeroed (capsule follows) and only Z / rotation carry, exactly as with a headset.
