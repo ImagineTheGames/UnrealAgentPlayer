@@ -163,7 +163,14 @@ def select(cands: list[Candidate], selector: str) -> tuple[Candidate, str]:
             f"--window {sel!r} matches {len(ctx_hits)} processes launched with "
             f"-DevAuthToolName={sel}; pass --window pid:<n> to pick one", ctx_hits)
 
-    title_hits = [c for c in per_pid if sel.lower() in (c.title or "").lower()]
+    # A TITLE names a window, not a process. Several PIE clients live in ONE editor process and
+    # their windows are the same size, so collapsing to one window per pid kept whichever came
+    # first in z-order: after a late join (so.painttest.latejoin) the new client's window sat on
+    # top, and `--window "Client 1"` lost its window [17tm466zx5y]. Search every window first.
+    all_hits = [c for c in cands if sel.lower() in (c.title or "").lower()]
+    if len(all_hits) == 1:
+        return all_hits[0], "title"
+    title_hits = all_hits if len({c.pid for c in all_hits}) == 1 and         len({c.title for c in all_hits}) > 1 else         [c for c in per_pid if sel.lower() in (c.title or "").lower()]
     if len(title_hits) == 1:
         return title_hits[0], "title"
     if len(title_hits) > 1:

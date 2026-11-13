@@ -1450,6 +1450,14 @@ per channel was entirely fictitious; the real figure was 2.5). [ClickUp 17tm466f
   THAT client's own game viewport. A client that does not exist or has no viewport returns false (the CLI reports
   it); `--client all` is refused (one image); no flag keeps the first-viewport behaviour. A plugin copy without the
   parameter is refused as skew.
+* **Late join:** `--client N` is resolved by PIE instance index, so a client added by `so.painttest.latejoin` (client 2)
+  is captured like any other. `screenshot --window "Client 1"` lost its window after a late join: every PIE window
+  belongs to ONE editor process, same size and stacked, and `window_capture._one_per_pid` kept only the topmost (the
+  newest). Title selectors now search every window; a title naming several windows of one process (`NetMode`) is
+  refused as ambiguous, with the windows listed.
+* **Verified live** (2-client PIE, then a late join; pawn 0 on the floor, pawn 1 teleported off the map): the old CLI
+  returned the same floor view for both clients; the fixed one returned the floor for client 0, a black void for
+  client 1 (its pawn read z=-60438) and client 2's own spawn view.
 * **BREAKING (plugin):** `CaptureViewportWithUI` gained a trailing `FString Client` parameter (editor and runtime
   subsystems). C++ callers on the old arity stop compiling and BlueprintCallable callers break when the asset is
   next compiled; the only caller in School's Out is `uap` itself (it sends the parameter only with `--client`;
