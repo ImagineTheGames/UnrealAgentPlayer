@@ -614,6 +614,110 @@ def editor_running(project: str | None) -> bool | None:
 _editor_probe: Callable[[str | None], bool | None] = editor_running
 
 
+# --- hung editor: process alive, Remote Control unreachable -------------------------------------
+# `editor_running` only sees a process that is GONE. After a GPU hang (DXGI DEVICE_HUNG) the editor
+# process stays up and answers nothing, so the queue kept granting `pie` leases to agents who could
+# never use them (2026-11-13: one held exclusive on a dead editor) while every `relaunch-preflight`
+# (Restart-Editor) waiter sat behind pie waiters: nobody could recover without releasing by hand.
+#
+# So the lease also LOOKS at Remote Control, from the waiters' own polls (outside the lock: a
+# probe is seconds). The first moment it is seen unreachable is stored as `rc_down_since`; a
+# reachable answer clears it. Each consequence has its own grace, so a level load or a shader
+# compile that stalls the game thread for a while is never read as a hang:
+#   * RC_DOWN_GRACE    a queued rebuild/relaunch jumps ahead of every non-rebuild waiter, and no
+#                      non-rebuild exclusive lease is granted (the waiter stays queued, FIFO among
+#                      its peers, and is told `editor_down`);
+#   * RC_EVICT_GRACE   a pie/level lease held on that editor is auto-released.
+# Fail safe as ever: an undecidable probe (None) changes nothing and clears nothing.
+EVICT_EDITOR_UNRESPONSIVE = "editor_unresponsive"
+RC_DOWN_GRACE = 30.0
+RC_EVICT_GRACE = 120.0
+_RC_PROBE_OFF = {"0", "false", "no", "off"}
+_RC_UP_CACHE_SECONDS = 5.0
+_RC_DOWN_CACHE_SECONDS = 3.0
+_RC_CACHE: dict[str, tuple[float, bool]] = {}
+
+
+def _env_seconds(name: str, default: float) -> float:
+    try:
+        raw = os.environ.get(name, "").strip()
+        return max(0.0, float(raw)) if raw else default
+    except ValueError:
+        return default
+
+
+def rc_down_grace() -> float:
+    return _env_seconds("UAP_RC_DOWN_GRACE", RC_DOWN_GRACE)
+
+
+def rc_evict_grace() -> float:
+    return _env_seconds("UAP_RC_EVICT_GRACE", RC_EVICT_GRACE)
+
+
+def _probe_rc_live(project: str | None) -> bool | None:
+    """True = Remote Control answered, False = it did not (hung / unreachable), None = cannot tell."""
+    raw = os.environ.get("UAP_RC_LIVENESS")
+    if raw is not None and raw.strip().lower() in _RC_PROBE_OFF:
+        return None
+    if _scope_key(project) in ("_default", MACHINE_SCOPE):
+        return None
+    try:
+        from unreal_agent_player import cli
+        from unreal_agent_player.errors import AgentError
+    except Exception:
+        return None
+    try:
+        cli._status_probe(project)
+        return True
+    except AgentError:
+        return False
+    except Exception:
+        return None
+
+
+# The seam, like `_editor_probe`: tests (and conftest) replace this one name.
+_rc_probe: Callable[[str | None], bool | None] = _probe_rc_live
+
+
+def rc_reachable(project: str | None) -> bool | None:
+    """Cached `_rc_probe`. Never raises."""
+    key = _scope_key(project)
+    hit = _RC_CACHE.get(key)
+    if hit is not None and _now() - hit[0] < (_RC_UP_CACHE_SECONDS if hit[1]
+                                              else _RC_DOWN_CACHE_SECONDS):
+        return hit[1]
+    try:
+        ans = _rc_probe(project)
+    except Exception:
+        return None
+    if ans is not None:
+        _RC_CACHE[key] = (_now(), bool(ans))
+    return ans
+
+
+def _note_rc(state: dict, rc: bool | None) -> None:
+    if rc is True:
+        state.pop("rc_down_since", None)
+    elif rc is False:
+        state.setdefault("rc_down_since", _now())
+
+
+def _rc_down_for(state: dict) -> float:
+    """Seconds Remote Control has been continuously unreachable (0 when reachable / unknown)."""
+    since = state.get("rc_down_since")
+    return max(0.0, _now() - float(since)) if since else 0.0
+
+
+def editor_is_down(state: dict) -> bool:
+    return bool(state.get("rc_down_since")) and _rc_down_for(state) >= rc_down_grace()
+
+
+def _needs_live_editor(mode: str, reason) -> bool:
+    """Would granting this lease hand the agent an editor it cannot use? Every exclusive hold
+    except the ones whose job is to bring the editor back (rebuild / relaunch)."""
+    return mode == "exclusive" and not _is_rebuild_reason(reason)
+
+
 # --- standalone / packaged game clients -------------------------------------------------------
 # A game client is a game window: it takes the GPU, the foreground and (for a test) the keyboard
 # exactly as PIE does. But nothing that starts one goes through a guarded uap verb -- School's
@@ -740,16 +844,26 @@ def _evict_dead_editor(state: dict, project: str | None) -> dict | None:
         running = _editor_probe(project)
     except Exception:
         return None                  # fail safe: a broken probe never evicts
-    if running is not False:
-        return None
     key = _scope_key(project)
+    if running is not False:
+        down = _rc_down_for(state)
+        if not (down > 0 and down >= rc_evict_grace()):
+            return None
+        why = EVICT_EDITOR_UNRESPONSIVE
+        msg = (f"lease_evicted: {EVICT_EDITOR_UNRESPONSIVE} -- the {key} editor process is up but "
+               f"Remote Control has not answered for {round(down)}s (hung, e.g. a GPU device "
+               f"hang), so your '{ex.get('reason')}' lease protected nothing and was released. "
+               f"A relaunch (Restart-Editor.ps1) is queued or needed. Re-acquire once the "
+               f"editor is back.")
+    else:
+        why = EVICT_EDITOR_NOT_RUNNING
+        msg = (f"lease_evicted: {EVICT_EDITOR_NOT_RUNNING} -- the {key} editor process is "
+               f"gone, so your '{ex.get('reason')}' lease protected nothing and was "
+               f"voided. Any PIE session or loaded level died with the editor. "
+               f"Re-acquire once the editor is back.")
     rec = {"agent": ex.get("agent"), "held_reason": ex.get("reason"),
-           "why": EVICT_EDITOR_NOT_RUNNING, "evicted_at": _now(),
-           "acquired_at": ex.get("acquired_at"), "project": key,
-           "message": (f"lease_evicted: {EVICT_EDITOR_NOT_RUNNING} -- the {key} editor process is "
-                       f"gone, so your '{ex.get('reason')}' lease protected nothing and was "
-                       f"voided. Any PIE session or loaded level died with the editor. "
-                       f"Re-acquire once the editor is back.")}
+           "why": why, "evicted_at": _now(),
+           "acquired_at": ex.get("acquired_at"), "project": key, "message": msg}
     state["exclusive"] = None
     now = _now()
     notes = {a: n for a, n in state.get("evicted", {}).items()
@@ -779,17 +893,18 @@ def _rebuild_first(state: dict, project: str | None) -> None:
         running = _editor_probe(project)
     except Exception:
         return
-    if running is False:
+    if running is False or editor_is_down(state):
         state["waiters"] = first + [w for w in q if not _is_rebuild_reason(w.get("reason"))]
 
 
-def _refresh(project: str | None) -> tuple[dict, dict | None]:
+def _refresh(project: str | None, rc: bool | None = None) -> tuple[dict, dict | None]:
     """Load the project's state with every kind of dead entry settled. Call with the lock held.
 
     Returns (state, eviction record or None); the caller saves, and after releasing the lock hands
     the record to `_after_eviction`.
     """
     state = _load(project)
+    _note_rc(state, rc)
     aged_out = _ttl_expired_exclusive(state, project)
     state = _evict_stale(state)
     if aged_out is not None and state.get("exclusive") is None:
@@ -992,14 +1107,34 @@ def _ttl_for(reason: str, ttl: int | None) -> int:
     return _TTL_BY_REASON.get((reason or "").split(":")[0], _DEFAULT_TTL)
 
 
+_EDITOR_DOWN_HINT = ("editor_down: the editor process is up but Remote Control has not answered "
+                     "for {n}s (hung). No pie/level/livecoding lease is granted on a dead editor; "
+                     "a queued Restart-Editor (relaunch-preflight) goes first. Wait for the "
+                     "relaunch, then re-acquire -- your queue place is kept while you wait.")
+
 _POSITION_NOTE_EVERY = 20.0     # seconds between "still waiting" lines on stderr
+
+
+def progress_enabled() -> bool:
+    """Wait-progress lines are printed only when asked for: `--progress` / $UAP_LEASE_PROGRESS=1,
+    or stderr is an interactive terminal. Scripted callers (launchers, Jenkins) stay silent."""
+    raw = os.environ.get("UAP_LEASE_PROGRESS", "").strip().lower()
+    if raw:
+        return raw not in ("0", "false", "no", "off")
+    try:
+        return bool(sys.stderr.isatty())
+    except Exception:
+        return False
 
 
 def _note_waiting(agent: str, holder, position: int, queue_len: int, ahead: list,
                   waited: float) -> None:
     """One stderr line while a lease call blocks, so a long wait is not silent.
 
-    stderr, never stdout: stdout is the one JSON answer a caller parses.
+    stderr, never stdout: stdout is the one JSON answer a caller parses. OPT-IN only (see
+    `progress_enabled`): any stderr line from a native command is a terminating
+    NativeCommandError in Windows PowerShell 5.1 under `$ErrorActionPreference = 'Stop'` with
+    `2>&1`, which killed Restart-Editor.ps1 in the queue.
     """
     who = holder.get("agent") if isinstance(holder, dict) else holder
     where = f"position {position}/{queue_len}" if position else "not yet queued"
@@ -1066,10 +1201,13 @@ def acquire(project: str | None, mode: str, *, reason: str = "", agent: str | No
         # A holder that aged out may have left its PIE running: stop that BEFORE the editor is
         # handed to the next agent, not after it has started driving a session that is not its own.
         reap_stale_pie(project)
+        # Is Remote Control answering? Probed OUTSIDE the lock (seconds when it is hung) and
+        # only for an exclusive call, so shared readers never pay for it.
+        rc = rc_reachable(project) if mode == "exclusive" else None
         _acquire_filelock(project)
         evicted = None
         try:
-            state, evicted = _refresh(project)
+            state, evicted = _refresh(project, rc)
             mine = _holds_already(state, mode, agent)
             if not mine:
                 queued = _queue_position(state, agent) > 0
@@ -1097,7 +1235,11 @@ def acquire(project: str | None, mode: str, *, reason: str = "", agent: str | No
                                 w["reason"] = reason
                 _rebuild_first(state, project)      # a fresh rebuild request may jump the queue
             first = False
-            if _grantable(state, mode, agent) and (mine or _turn_ok(state, mode, agent)) \
+            editor_down = (not mine and _needs_live_editor(mode, reason)
+                           and editor_is_down(state))
+            down_for = round(_rc_down_for(state)) if editor_down else 0
+            if not editor_down and _grantable(state, mode, agent) \
+                    and (mine or _turn_ok(state, mode, agent)) \
                     and (mine or _reaper_holder(state) is None):
                 _dequeue(state, agent)
                 (state.get("lost_waiters") or {}).pop(agent, None)
@@ -1129,6 +1271,8 @@ def acquire(project: str | None, mode: str, *, reason: str = "", agent: str | No
                 return res
             holder = (state.get("exclusive") or (state.get("shared") or [None])[0]
                       or _reaper_holder(state))
+            if editor_down and holder is None:
+                holder = {"agent": "(editor)", "reason": "unresponsive"}
             position = _queue_position(state, agent)
             ahead = _queue_ahead(state, agent)
             queue_len = len(state.get("waiters", []))
@@ -1152,6 +1296,9 @@ def acquire(project: str | None, mode: str, *, reason: str = "", agent: str | No
                             "acquire); do not poll `lease status`.")}
             if requeued:
                 res["requeued"] = True
+            if editor_down:
+                res.update({"editor_down": True, "rc_down_seconds": down_for,
+                            "hint": _EDITOR_DOWN_HINT.format(n=down_for)})
             return res
         if _now() >= deadline:
             # Give the slot back: a caller that has stopped waiting must not hold up the queue
@@ -1186,8 +1333,11 @@ def acquire(project: str | None, mode: str, *, reason: str = "", agent: str | No
             if parking:
                 res.update({"held": False, "still_waiting": False, "position": position,
                             "waited_seconds": round(_now() - started, 1)})
+            if editor_down:
+                res.update({"editor_down": True, "rc_down_seconds": down_for,
+                            "hint": _EDITOR_DOWN_HINT.format(n=down_for)})
             return res
-        if wait > 0 and holder is not None and _now() >= next_note:
+        if wait > 0 and holder is not None and _now() >= next_note and progress_enabled():
             next_note = _now() + _POSITION_NOTE_EVERY
             _note_waiting(agent, holder, position, queue_len, ahead, _now() - started)
         if parking:

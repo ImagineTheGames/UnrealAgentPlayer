@@ -72,12 +72,36 @@ def test_fifo_order_kept_across_parked_waits_and_grant_goes_to_head():
     assert co.wait_turn("demo", agent="B", seconds=1.0)["granted"]
 
 
-def test_progress_line_with_position_goes_to_stderr(capsys, monkeypatch):
+def test_progress_is_silent_by_default(capsys, monkeypatch):
+    """Any stderr line is a terminating NativeCommandError for a PowerShell 5.1 caller doing
+    `uap lease acquire ... 2>&1` under EAP Stop (it killed Restart-Editor.ps1 in the queue)."""
+    monkeypatch.setenv("UAP_LEASE_PROGRESS", "")
+    monkeypatch.setattr(co, "_POSITION_NOTE_EVERY", 0.0)
+    monkeypatch.setattr(co.sys.stderr, "isatty", lambda: False, raising=False)
+    _hold()
+    co.acquire("demo", "exclusive", reason="pie", agent="B", wait=0.3)
+    assert capsys.readouterr().err == ""
+
+
+def test_progress_line_is_opt_in_via_env(capsys, monkeypatch):
+    monkeypatch.setenv("UAP_LEASE_PROGRESS", "1")
     monkeypatch.setattr(co, "_POSITION_NOTE_EVERY", 0.0)
     _hold()
     co.acquire("demo", "exclusive", reason="pie", agent="B", wait=0.3)
     err = capsys.readouterr().err
     assert "B waiting" in err and "held by A" in err and "position 1/1" in err
+
+
+def test_progress_flag_on_the_cli(capsys, monkeypatch):
+    monkeypatch.setenv("UAP_LEASE_PROGRESS", "")
+    monkeypatch.setattr(co, "_POSITION_NOTE_EVERY", 0.0)
+    _hold()
+    main(["lease", "acquire", "exclusive", "--reason", "pie", "--agent", "B",
+          "--project", "demo", "--wait", "0.3"])
+    assert capsys.readouterr().err == ""
+    main(["lease", "acquire", "exclusive", "--reason", "pie", "--agent", "B",
+          "--project", "demo", "--wait", "0.3", "--progress"])
+    assert "position 1/1" in capsys.readouterr().err
 
 
 def test_cli_lease_wait_accepts_wait_alias(capsys):
