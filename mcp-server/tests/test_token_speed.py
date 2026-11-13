@@ -112,14 +112,20 @@ def test_an_expired_park_loses_the_place_and_says_so(fast_queue, monkeypatch):
     assert _queue() == ["B"]
 
 
-def test_total_wait_budget_spans_resumes(fast_queue):
+def test_explicit_lease_wait_blocks_even_after_the_original_budget_is_gone(fast_queue):
+    # Was `test_total_wait_budget_spans_resumes`: it asserted that a spent --wait budget made
+    # `lease wait --seconds 5` return busy at once and drop the slot. That instant answer is the
+    # spin bug (agents re-queued at the back each time). An explicit `lease wait --seconds S`
+    # now blocks S seconds and keeps the place; the original --wait only bounds the acquire call.
     co.acquire(PROJ, "exclusive", reason="pie", agent="A", pid=0, wait=0)
     r = co.acquire(PROJ, "exclusive", reason="pie", agent="B", pid=0, wait=0.4, max_block=0.1)
     assert r["still_waiting"]
-    time.sleep(0.5)                        # the 0.4s total budget is gone
-    r = co.wait_turn(PROJ, agent="B", seconds=5)
-    assert r["busy"] and not r["still_waiting"] and not r["held"]
-    assert _queue() == []                  # gave its slot back
+    time.sleep(0.5)                        # the 0.4s original budget is gone
+    t0 = time.time()
+    r = co.wait_turn(PROJ, agent="B", seconds=0.5)
+    assert time.time() - t0 >= 0.45
+    assert r["busy"] and r["still_waiting"] and not r["held"]
+    assert _queue() == ["B"]               # place kept
 
 
 def test_a_fresh_acquire_while_parked_keeps_the_place(fast_queue):

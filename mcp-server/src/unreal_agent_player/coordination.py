@@ -44,6 +44,7 @@ import errno
 import json
 import os
 import pathlib
+import sys
 import time
 import uuid
 from collections.abc import Callable
@@ -991,6 +992,25 @@ def _ttl_for(reason: str, ttl: int | None) -> int:
     return _TTL_BY_REASON.get((reason or "").split(":")[0], _DEFAULT_TTL)
 
 
+_POSITION_NOTE_EVERY = 20.0     # seconds between "still waiting" lines on stderr
+
+
+def _note_waiting(agent: str, holder, position: int, queue_len: int, ahead: list,
+                  waited: float) -> None:
+    """One stderr line while a lease call blocks, so a long wait is not silent.
+
+    stderr, never stdout: stdout is the one JSON answer a caller parses.
+    """
+    who = holder.get("agent") if isinstance(holder, dict) else holder
+    where = f"position {position}/{queue_len}" if position else "not yet queued"
+    behind = f", behind {', '.join(ahead)}" if ahead else ""
+    try:
+        print(f"uap lease: {agent} waiting {round(waited)}s - held by {who}, {where}{behind}",
+              file=sys.stderr, flush=True)
+    except Exception:
+        pass
+
+
 def acquire(project: str | None, mode: str, *, reason: str = "", agent: str | None = None,
             pid: int | None = None, wait: float = DEFAULT_WAIT_CAP, ttl: int | None = None,
             task: str | None = None, requested_by: str | None = None,
@@ -1041,6 +1061,7 @@ def acquire(project: str | None, mode: str, *, reason: str = "", agent: str | No
     queue_len = 0
     requeued = False
     first = True
+    next_note = 0.0
     while True:
         # A holder that aged out may have left its PIE running: stop that BEFORE the editor is
         # handed to the next agent, not after it has started driving a session that is not its own.
@@ -1116,7 +1137,7 @@ def acquire(project: str | None, mode: str, *, reason: str = "", agent: str | No
         finally:
             _release_filelock(project)
             _after_eviction(project, evicted)
-        if parking and _now() >= block_deadline and _now() < deadline:
+        if parking and _now() >= block_deadline and (resume or _now() < deadline):
             # Harness-safe return: still queued, place kept (parked_until was set above).
             res = {"ok": False, "granted": False, "held": False, "still_waiting": True,
                    "busy": True, "agent": agent, "mode": mode, "holder": holder,
@@ -1124,7 +1145,7 @@ def acquire(project: str | None, mode: str, *, reason: str = "", agent: str | No
                    "queue_length": queue_len, "queue_ahead": ahead,
                    "waited_seconds": round(_now() - started, 1),
                    "parked_seconds": round(_park_ttl()),
-                   "give_up_in_seconds": round(deadline - _now()),
+                   "give_up_in_seconds": max(0, round(deadline - _now())),
                    "resume": f"uap lease wait --agent {agent}",
                    "hint": ("your place in the queue is KEPT for parked_seconds. Resume with "
                             "`uap lease wait --agent <tok> --seconds 110` (or this same "
@@ -1138,6 +1159,17 @@ def acquire(project: str | None, mode: str, *, reason: str = "", agent: str | No
             _acquire_filelock(project)
             try:
                 state = _load(project)
+                if parking:
+                    # The --wait budget ran out while parked. Remember the request so the next
+                    # `lease wait` re-queues AND blocks (requeued:true) instead of answering
+                    # `not_queued` instantly -- an instant answer is what made agents spin.
+                    gone = next((w for w in state.get("waiters", [])
+                                 if w.get("agent") == agent), None)
+                    if gone is not None:
+                        state.setdefault("lost_waiters", {})[agent] = {
+                            "mode": mode, "reason": reason, "task": task,
+                            "requested_by": requested_by, "lease_pid": pid,
+                            "lease_ttl": ttl, "give_up_at": 0, "lost_at": _now()}
                 _dequeue(state, agent)
                 _save(project, state)
             finally:
@@ -1155,6 +1187,9 @@ def acquire(project: str | None, mode: str, *, reason: str = "", agent: str | No
                 res.update({"held": False, "still_waiting": False, "position": position,
                             "waited_seconds": round(_now() - started, 1)})
             return res
+        if wait > 0 and holder is not None and _now() >= next_note:
+            next_note = _now() + _POSITION_NOTE_EVERY
+            _note_waiting(agent, holder, position, queue_len, ahead, _now() - started)
         if parking:
             time.sleep(min(POLL_SECONDS, max(0.05, block_deadline - _now())))
         else:
@@ -1190,12 +1225,15 @@ def wait_turn(project: str | None, *, agent: str | None = None, seconds: float =
         return {"ok": True, "granted": True, "held": True, "still_waiting": False,
                 "agent": agent, "mode": "exclusive" if held_ex else "shared",
                 "already_held": True}
-    lost = rec is not None and "lost_at" in rec
     rec = rec or {}
     give_up = float(rec.get("give_up_at") or 0)
     budget = max(0.0, give_up - _now()) if give_up else float(seconds)
-    if lost:
-        budget = max(budget, float(seconds))    # it lost its place; give the re-queue a turn
+    # `lease wait --seconds S` is an explicit "block S more seconds". The original `--wait` budget
+    # may have less than S left (or none: `acquire --wait 110 --max-block 110`), and honouring only
+    # the remainder made the call return `busy` after a moment -- or at once -- so agents spun,
+    # re-queueing at the BACK each time. The explicit request always gets its full S, and it
+    # moves the give-up time out (acquire re-stamps give_up_at from this budget).
+    budget = max(budget, float(seconds))
     lp = rec.get("lease_pid")
     return acquire(project, mode or rec.get("mode") or "exclusive",
                    reason=reason if reason is not None else (rec.get("reason") or ""),

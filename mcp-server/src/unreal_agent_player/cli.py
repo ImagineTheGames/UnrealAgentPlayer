@@ -4302,7 +4302,7 @@ def build_parser() -> argparse.ArgumentParser:
     lzw = lzs.add_parser("wait", parents=[proj],
                          help="resume a `lease acquire --max-block` wait WITHOUT losing your "
                               "queue place")
-    lzw.add_argument("--seconds", type=float, default=None,
+    lzw.add_argument("--seconds", "--wait", dest="seconds", type=float, default=None,
                      help="max seconds to block this call (default --max-block, "
                           "$UAP_MAX_BLOCK, else 110)")
     lzw.add_argument("--mode", choices=["exclusive", "shared"], default=None,
