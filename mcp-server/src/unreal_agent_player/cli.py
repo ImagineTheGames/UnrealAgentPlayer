@@ -58,48 +58,54 @@ PythonRemoteExecClient = _Lazy("unreal_agent_player.transport", "PythonRemoteExe
 RemoteControlClient = _Lazy("unreal_agent_player.transport", "RemoteControlClient")
 
 
-def _load_active() -> sess.ReportSession | None:
-    run = sess.get_active_run()
+def _agent_token(agent: str | None = None) -> str:
+    """The caller's report identity: --agent, else $UAP_AGENT_ID, else empty (tokenless)."""
+    return (agent or os.environ.get("UAP_AGENT_ID") or "").strip()
+
+
+def _load_active(agent: str | None = None) -> sess.ReportSession | None:
+    """THIS agent's open report (the sole open one when tokenless).
+
+    Raises sess.ReportAmbiguous when tokenless and several reports are open: never guesses.
+    """
+    run = sess.get_active_run(_agent_token(agent))
     if run is None or not (run / "data.json").exists():
         return None
     return sess.ReportSession.load(run)
 
 
 def _require_active(agent: str | None = None):
-    """Return the active session, or None after emitting the no-session error.
+    """Return this agent's open report, or None after emitting the error.
 
-    Two failures used to arrive as the same bare `no active report`, and neither said what
-    happened. The slot is ONE per machine: a second `report start` took it, so a first agent's
-    later note/assert either wrote into a STRANGER'S report or, once that one finished and
-    cleared the pointer, got told there was no report at all -- as if it had forgotten to start
-    one. Both are now named.
+    Reports are keyed by --agent token, so two agents hold open reports at once without seeing
+    each other's. The failure modes are named instead of arriving as a bare `no active report`:
+    several reports open and no token (refused, never guessed), a report this token lost by
+    restarting under it, or none started at all.
     """
-    s = _load_active()
+    token = _agent_token(agent)
+    try:
+        s = _load_active(token)
+    except sess.ReportAmbiguous as exc:
+        _emit({"ok": False, "error": str(exc), "ambiguous": True,
+               "open_reports": [{"agent": r.get("agent"), "run_dir": r.get("run_dir")}
+                                for r in exc.slots]})
+        return None
     if s is None:
-        body = {"ok": False, "error": "no active report; run `uap report start` first"}
-        lost = sess.find_superseded_run(agent)
+        body = {"ok": False, "error": (
+            f"no active report for agent {token!r}; run `uap report start --agent {token}` first"
+            if token else "no active report; run `uap report start` first")}
+        lost = sess.find_superseded_run(token or None)
         if lost:
             by = lost.get("superseded_by") or {}
             body["error"] = (
-                f"no active report. NOTE: run {lost['run_dir']} (task {lost.get('task')!r}, "
-                f"agent {lost.get('agent')!r}) LOST the machine-wide report slot at "
-                f"{by.get('at')} to a `report start` from agent {by.get('agent')!r} -- there is "
-                f"one slot per machine. If that was your report, its evidence up to that point "
-                f"is in that directory; anything after it was never recorded. Start a fresh "
-                f"report and pass --agent <your-token> so the slot cannot be taken silently.")
+                f"no active report for agent {token or '(no token)'!r}. NOTE: run "
+                f"{lost['run_dir']} (task {lost.get('task')!r}, agent {lost.get('agent')!r}) was "
+                f"CLOSED as superseded at {by.get('at')} by a `report start` from agent "
+                f"{by.get('agent')!r}. If that was your report, its evidence up to that point is "
+                f"in that directory; anything after it was never recorded. Start a fresh report "
+                f"and keep passing --agent <your-token>.")
             body["superseded"] = lost
         _emit(body)
-        return None
-    holder = sess.get_active_owner() or {}
-    held_agent = (holder.get("agent") or "").strip()
-    mine = (agent or "").strip()
-    if held_agent and mine and held_agent != mine:
-        _emit({"ok": False, "error": (
-            f"the active report belongs to agent {held_agent!r} (task {getattr(s, 'task', '')!r}, "
-            f"run_dir {holder.get('run_dir')}), not to you ({mine!r}). There is ONE report slot "
-            f"per machine, so writing here would put your evidence in their report. Wait for "
-            f"them to finish, then `uap report start` your own."),
-            "held_by": held_agent, "run_dir": holder.get("run_dir")})
         return None
     return s
 
@@ -227,19 +233,20 @@ def _err(exc: Exception) -> dict:
 # --- report verbs ---
 
 def _report_start(args) -> int:
-    """Claim the machine-wide report slot.
+    """Open this agent's report. Reports are keyed by --agent token (or $UAP_AGENT_ID), so
+    two agents hold open reports at once and neither sees the other's notes, steps or shots.
 
-    It REFUSES when a running report is held by a different --agent token. Before this it
-    overwrote the pointer unconditionally, so two agents verifying at once collided quietly:
-    the first agent's evidence stopped being recorded and it found out through a bare `no
-    active report` some calls later. With no token on either side there is no identity to
-    compare, so the take still proceeds -- but the displaced run is closed as `incomplete`,
-    rendered, and named here rather than abandoned mid-write.
+    Starting again under the SAME token closes that agent's previous running report as
+    `incomplete` (rendered, never abandoned). A start with NO token while other agents'
+    reports are open is refused: it would have no slot anyone could address afterwards, and
+    superseding a stranger's run is the bug this design removed. --takeover overrides that
+    for a report left behind by a session that is gone.
     """
+    token = _agent_token(args.agent)
     try:
         s = sess.start_session(task=args.task, project=args.project,
                                requires_screenshot=args.require_screenshot,
-                               agent=args.agent, takeover=getattr(args, "takeover", False))
+                               agent=token or None, takeover=getattr(args, "takeover", False))
     except sess.ReportSlotConflict as exc:
         _emit({"ok": False, "error": str(exc), "busy": True,
                "held_by": exc.holder.get("agent"), "run_dir": exc.holder.get("run_dir")})
@@ -250,16 +257,15 @@ def _report_start(args) -> int:
     if displaced:
         out["displaced"] = displaced
         out["warning"] = (
-            f"this start TOOK the machine-wide report slot from a still-running report "
-            f"({displaced['run_dir']}, task {displaced.get('task')!r}, agent "
-            f"{displaced.get('agent')!r}). There is one slot per machine. That run has been "
-            f"closed as `incomplete` and rendered, so its evidence so far is not lost -- but "
-            f"if another agent is verifying right now, it just stopped being able to record. "
-            f"Pass --agent <your-token> on every report call so this is refused instead.")
+            f"this start closed a still-running report ({displaced['run_dir']}, task "
+            f"{displaced.get('task')!r}, agent {displaced.get('agent')!r}) as `incomplete` and "
+            f"rendered it, so its evidence so far is kept. Reports are one per --agent token; "
+            f"it was closed because it held the slot this start claims.")
     if not s.agent:
-        out["hint"] = ("no --agent token on this report, so nothing can stop another agent's "
-                       "`report start` from taking the slot from you. Pass --agent <token> "
-                       "(or set $UAP_AGENT_ID) on every report call.")
+        out["hint"] = ("no --agent token on this report: it lives in the shared anonymous slot, "
+                       "and once another agent opens a report your tokenless calls are refused "
+                       "as ambiguous. Pass --agent <token> (or set $UAP_AGENT_ID) on every "
+                       "report call.")
     _emit(out)
     return 0
 
@@ -420,10 +426,10 @@ def _report_finish(args) -> int:
     try:
         html_path.write_text(render(s.to_dict()), encoding="utf-8")
     except Exception as exc:
-        sess.clear_active_run()
+        sess.clear_active_run(run_dir=s.run_dir)
         _emit({"ok": False, "error": f"render failed: {exc}"})
         return 1
-    sess.clear_active_run()
+    sess.clear_active_run(run_dir=s.run_dir)
     # One window per testing session, not one tab per report: this REPLACES the window the
     # previous report opened instead of adding another (see reporting/viewer.py). `html` below
     # still names the per-run file -- agents quote that path, and nothing about it moved.
@@ -809,7 +815,12 @@ def _rc_json(func: str, params: dict, project: str | None = None,
 
 
 def _capture(tool: str, args: dict, body: dict, ms: int) -> None:
-    s = _load_active()
+    # Auto-capture records into THIS call's agent report only. Tokenless with several reports
+    # open is ambiguous, so it records nowhere rather than into whichever is first.
+    try:
+        s = _load_active(_OUT.get("agent"))
+    except sess.ReportAmbiguous:
+        return
     if s is None:
         return
     try:
@@ -2561,20 +2572,31 @@ def _window_frame_paths(file: str, frames: int) -> list[str]:
 
 
 def _report_for_attach(agent: str | None):
-    """The active report, unless it belongs to a DIFFERENT agent (then attaching would put
-    this agent's frames in a stranger's report). Returns (session|None, refusal|None)."""
-    s = _load_active()
-    if s is None:
+    """The report to attach a capture to: this agent's own. Returns (session|None, refusal|None).
+
+    Stricter than the editor path on purpose: a tokenless capture never drops frames into a
+    report that belongs to a TOKENED agent. Two-client tests are exactly when several agents
+    are working."""
+    mine = _agent_token(agent)
+    try:
+        rec = sess.get_active_owner(mine) if mine else None
+        if not mine:
+            rec = next((r for r in sess.list_active_slots() if not (r.get("agent") or "").strip()),
+                       None)
+    except sess.ReportAmbiguous:
+        rec = None
+    if rec is None:
+        others = [r for r in sess.list_active_slots() if (r.get("agent") or "").strip()]
+        if not mine and others:
+            held = others[0].get("agent")
+            return None, (f"not attached: the open report belongs to agent {held!r} and this "
+                          f"capture has no --agent token. Pass --agent <your-token>; the image "
+                          f"files are still written.")
         return None, None
-    held = ((sess.get_active_owner() or {}).get("agent") or "").strip()
-    mine = (agent or os.environ.get("UAP_AGENT_ID") or "").strip()
-    # Stricter than the editor path on purpose: a tokenless capture does NOT drop frames into a
-    # report someone else owns. Two-client tests are exactly when several agents are working.
-    if held and held != mine:
-        return None, (f"not attached: the active report belongs to agent {held!r}, not "
-                      f"{mine or '(no --agent token)'!r}. Pass --agent <your-token> if it is "
-                      f"yours; the image files are still written.")
-    return s, None
+    run = pathlib.Path(rec["run_dir"])
+    if not (run / "data.json").exists():
+        return None, None
+    return sess.ReportSession.load(run), None
 
 
 def _window_screenshot(args) -> int:
@@ -3641,13 +3663,12 @@ def build_parser() -> argparse.ArgumentParser:
                     default=True, help="(default) require a screenshot for a passing report")
     rs.add_argument("--no-require-screenshot", dest="require_screenshot", action="store_false",
                     help="rare: allow a pass with no screenshot (justify in the summary)")
-    # The report slot is ONE per machine. Starting a report while ANOTHER agent's is running is
-    # refused, because the take used to be silent and the first agent's evidence simply stopped
-    # being recorded. --takeover is the deliberate override for a slot left by a dead session.
+    # Reports are one per --agent token. A TOKENLESS start while another agent's report is open
+    # is refused; --takeover closes that one instead, for a report left by a session that is gone.
     rs.add_argument("--takeover", action="store_true",
-                    help="take the report slot even though another agent's report is still "
-                         "running (closes theirs as `incomplete` and renders it). Only for a "
-                         "slot left behind by a session that is gone")
+                    help="tokenless start only: close the one other open report as `incomplete` "
+                         "and render it. Only for a report left behind by a session that is "
+                         "gone; with --agent <token> you never need it")
     rs.set_defaults(func=_report_start)
     ra = rep.add_parser("assert", parents=[common])
     ra.add_argument("label")

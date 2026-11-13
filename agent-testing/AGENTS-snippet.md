@@ -32,16 +32,14 @@ and renders an HTML report.
 - **SET `--task "<what you are doing>"` (or `$env:UAP_TASK`) next to your `--agent` token.** The
   overlay on the editor and `uap lease status` show it for the lease holder and for everyone
   queued behind it; a bare token tells the person watching nothing. Display only.
-- **THE REPORT SLOT IS ONE PER MACHINE, so pass `--agent <your-token>` on every report call.**
-  Two agents verifying at once used to collide QUIETLY: the second `report start` took the slot
-  with no check and no record, so the first agent's later notes and asserts went into the second
-  agent's run and then, once that one finished, got a bare `no active report` -- which reads as
-  "you forgot to start one". A start against a slot held by a DIFFERENT token is now REFUSED
-  (`busy: true, held_by: <token>`); with no token on either side there is nothing to compare, so
-  the take still happens -- it just says so, and the displaced run is closed as `incomplete`,
-  stamped and rendered instead of abandoned. `--takeover` is only for a slot left by a dead
-  session. If you get `no active report` mid-run, read the `superseded` field: it names the run
-  that lost the slot, when, and to whom.
+- **REPORTS ARE ONE PER `--agent` TOKEN, so pass `--agent <your-token>` on EVERY report call and on
+  every capturing call (`uap screenshot` ...).** Two agents hold open reports at once and neither
+  sees the other's notes, steps or screenshots -- you do NOT wait for another agent's report. A call
+  with no token while several reports are open is REFUSED (`ambiguous: true`), never guessed. A
+  token with no report of its own gets `no active report for agent '<token>'`. Starting again under
+  your own token closes your previous run as `incomplete` (check `displaced`). `--takeover` is only
+  for a tokenless start beside a dead session's report. Reports only RECORD: the editor and PIE are
+  still shared, and `uap lease` still decides who may drive them.
 - A passing report REQUIRES a screenshot FROM THE EDITOR UNDER TEST -- capture with
   `uap screenshot <abs.png>` via this project's `uap.ps1` (it stamps the source editor). A shot of
   another editor (or a manual attach of unknown origin) auto-FAILS the pass. Pixels are not proof

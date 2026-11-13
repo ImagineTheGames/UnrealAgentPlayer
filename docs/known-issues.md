@@ -1261,7 +1261,7 @@ safe-to-proceed direction (PIE stopped, a `FlushPressedKeys`, another agent's `i
 and refusing a hold that is not really there would be its own false failure -- so when the two
 disagree the engine wins and the ledger is dropped.
 
-## 38. The report slot could be taken mid-run, and nothing said so -- FIXED
+## 38. The report slot could be taken mid-run, and nothing said so -- FIXED (superseded by #49: slots are now per agent)
 
 The report slot is **one per machine**: a single `~/.uap-reports/.active` pointer, and every CLI
 call is a fresh process, so that file is the only thing saying which run is being written to.
@@ -1544,3 +1544,36 @@ per channel was entirely fictitious; the real figure was 2.5). [ClickUp 17tm466f
   process's output as the editor's.
 * **Fix 2:** two or more live nodes matching the selector are now refused (`UE_WRONG_INSTANCE`), naming every pid; pin one
   with `--instance pid:<n>` or retry if one is transient. A pid selector always matches exactly one.
+
+## 49. ONE report slot per machine made concurrent agents queue behind each other and bleed into each other's reports -- FIXED (86akgg1cj)
+
+#38 made the single machine-wide slot loud, not concurrent. A second agent's `report start` was
+refused with `busy` while the first agent's report stayed open, so it WAITED (2026-11-13: a Marble
+Race agent waited about 45 minutes behind a chalkboard agent's open report) -- and the editor
+auto-capture never looked at the caller's token at all, so the Marble agent's first two calls
+(status, pie) were appended to the chalkboard report's timeline anyway. Related older symptom:
+17tm466rhva (another agent's screenshots auto-attached to the slot holder's report).
+
+**Fixed: one open report per `--agent` token.**
+
+* The claim record is `~/.uap-reports/.active.d/<token>.json` (`anon.json` for no token), not a
+  single `.active` file. Two tokens never see each other: `report start/note/assert/screenshot/diag/
+  finish`, the auto-appended timeline (`_capture`) and the `uap screenshot` auto-attach are all
+  resolved from the caller's token (`--agent`, else `$UAP_AGENT_ID`).
+* A call with NO token while several reports are open is refused (`ambiguous: true`, `open_reports`),
+  never guessed; it writes nothing. A tokenless auto-capture in that state records nowhere. With
+  exactly one open report a tokenless call still uses it, so the single-agent workflow is unchanged.
+* A token with no report of its own gets `no active report for agent '<token>'`; it never falls
+  through to someone else's.
+* Same token starting again closes its own previous running run as `incomplete` (stamped, rendered)
+  as before. A tokenless `report start` beside a TOKENED agent's open report is refused (`busy`);
+  `--takeover` (tokenless only) closes that one report instead.
+* A claim whose run is finished or deleted is not an open report. Run dirs are made unique when two
+  agents start the same question in the same second.
+* `.active` is kept as a mirror of the newest open report (the in-editor overlay's `report` line
+  reads it) and is still read as a fallback for a report an older CLI started.
+* Reports only RECORD. PIE / editor ownership is still the lease's job; two agents with open
+  reports still need `uap lease` to share the one editor.
+
+Tests: `mcp-server/tests/test_report_slot_ownership.py`. **Still open:** the overlay shows only the
+newest open report, not all of them.
