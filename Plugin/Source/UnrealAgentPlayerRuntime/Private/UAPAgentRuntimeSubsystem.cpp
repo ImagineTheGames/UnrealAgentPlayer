@@ -237,22 +237,22 @@ FString UUAPAgentRuntimeSubsystem::GetHeldInput(FString Client)
 }
 
 FString UUAPAgentRuntimeSubsystem::StartPropertySample(FString ObjectPath, FString PropertyPath,
-                                                       float Seconds, int32 MaxSamples)
+    float Seconds, int32 MaxSamples, FString SeriesName)
 {
     UAP_ACTIVITY(TEXT("sample start"), PropertyPath);
-    return FAgentSampler::Start(ObjectPath, PropertyPath, Seconds, MaxSamples);
+    return FAgentSampler::Start(ObjectPath, PropertyPath, Seconds, MaxSamples, SeriesName);
 }
 
-FString UUAPAgentRuntimeSubsystem::ReadPropertySample()
+FString UUAPAgentRuntimeSubsystem::ReadPropertySample(FString SeriesName)
 {
     UAP_ACTIVITY(TEXT("sample read"), FString());
-    return FAgentSampler::Read();
+    return FAgentSampler::Read(SeriesName);
 }
 
-bool UUAPAgentRuntimeSubsystem::StopPropertySample()
+bool UUAPAgentRuntimeSubsystem::StopPropertySample(FString SeriesName)
 {
     UAP_ACTIVITY(TEXT("sample stop"), FString());
-    FAgentSampler::Stop();
+    FAgentSampler::Stop(SeriesName);
     return true;
 }
 

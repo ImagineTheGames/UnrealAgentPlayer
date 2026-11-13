@@ -33,8 +33,10 @@ namespace
         TArray<TSharedPtr<FJsonValue>> Values;
     };
 
-    FUAPSeries GSeries;
+    /** Series by name. The empty name is the legacy single series (`sample start` with no --name). */
+    TMap<FString, FUAPSeries> GSeries;
     FTSTicker::FDelegateHandle GSampleTicker;
+    constexpr int32 GMaxSeries = 16;
 
     FString UAPToJsonString(const TSharedRef<FJsonObject>& Obj)
     {
@@ -247,39 +249,50 @@ namespace
 
     bool UAPSampleTick(float /*DeltaTime*/)
     {
-        if (!GSeries.bActive)
-        {
-            GSampleTicker.Reset();
-            return false;
-        }
         const double Now = FPlatformTime::Seconds();
-        TSharedPtr<FJsonValue> Value;
-        FString Error;
-        if (UAPReadPath(GSeries.Object.Get(), GSeries.PropertyPath, Value, Error))
+        bool bAnyActive = false;
+        for (TPair<FString, FUAPSeries>& Pair : GSeries)
         {
-            GSeries.Times.Add(Now - GSeries.StartRealTime);
-            GSeries.Values.Add(Value);
-        }
-        else
-        {
-            GSeries.LastError = Error;
-        }
+            FUAPSeries& Series = Pair.Value;
+            if (!Series.bActive) { continue; }
+            TSharedPtr<FJsonValue> Value;
+            FString Error;
+            if (UAPReadPath(Series.Object.Get(), Series.PropertyPath, Value, Error))
+            {
+                Series.Times.Add(Now - Series.StartRealTime);
+                Series.Values.Add(Value);
+            }
+            else
+            {
+                Series.LastError = Error;
+            }
 
-        if (Now >= GSeries.EndRealTime || GSeries.Values.Num() >= GSeries.MaxSamples)
+            if (Now >= Series.EndRealTime || Series.Values.Num() >= Series.MaxSamples)
+            {
+                Series.bActive = false;
+            }
+            else
+            {
+                bAnyActive = true;
+            }
+        }
+        if (!bAnyActive)
         {
-            GSeries.bActive = false;
             GSampleTicker.Reset();
             return false;
         }
         return true;
     }
+
+    FString UAPNameLabel(const FString& SeriesName)
+    {
+        return SeriesName.IsEmpty() ? TEXT("(default)") : SeriesName;
+    }
 }
 
 FString FAgentSampler::Start(const FString& ObjectPath, const FString& PropertyPath,
-                             float Seconds, int32 MaxSamples)
+                             float Seconds, int32 MaxSamples, const FString& SeriesName)
 {
-    Stop();
-
     if (Seconds <= 0.f) { return UAPError(TEXT("Seconds must be > 0")); }
     // Bounded on purpose: this holds every sample in memory and is meant for short windows.
     const float ClampedSeconds = FMath::Min(Seconds, 60.f);
@@ -292,62 +305,105 @@ FString FAgentSampler::Start(const FString& ObjectPath, const FString& PropertyP
     TSharedPtr<FJsonValue> Probe;
     if (!UAPReadPath(Obj, PropertyPath, Probe, Error)) { return UAPError(Error); }
 
-    GSeries = FUAPSeries();
-    GSeries.Object = Obj;
-    GSeries.ObjectLabel = Obj->GetName();
-    GSeries.PropertyPath = PropertyPath;
-    GSeries.StartRealTime = FPlatformTime::Seconds();
-    GSeries.EndRealTime = GSeries.StartRealTime + ClampedSeconds;
-    GSeries.MaxSamples = ClampedMax;
-    GSeries.bActive = true;
+    // Only a series of the SAME name is replaced; any other named series keeps recording.
+    const bool bReplaced = GSeries.Contains(SeriesName);
+    if (!bReplaced && GSeries.Num() >= GMaxSeries)
+    {
+        return UAPError(FString::Printf(
+            TEXT("%d series already held; stop one (`sample stop --name X`) or stop all (`--all`) first"),
+            GMaxSeries));
+    }
 
-    GSampleTicker = FTSTicker::GetCoreTicker().AddTicker(
-        FTickerDelegate::CreateStatic(&UAPSampleTick), 0.f);
+    FUAPSeries& Series = GSeries.FindOrAdd(SeriesName);
+    Series = FUAPSeries();
+    Series.Object = Obj;
+    Series.ObjectLabel = Obj->GetName();
+    Series.PropertyPath = PropertyPath;
+    Series.StartRealTime = FPlatformTime::Seconds();
+    Series.EndRealTime = Series.StartRealTime + ClampedSeconds;
+    Series.MaxSamples = ClampedMax;
+    Series.bActive = true;
+
+    if (!GSampleTicker.IsValid())
+    {
+        GSampleTicker = FTSTicker::GetCoreTicker().AddTicker(
+            FTickerDelegate::CreateStatic(&UAPSampleTick), 0.f);
+    }
 
     TSharedRef<FJsonObject> O = MakeShared<FJsonObject>();
     O->SetBoolField(TEXT("ok"), true);
-    O->SetStringField(TEXT("object"), GSeries.ObjectLabel);
-    O->SetStringField(TEXT("property"), GSeries.PropertyPath);
+    O->SetStringField(TEXT("name"), SeriesName);
+    O->SetBoolField(TEXT("replaced"), bReplaced);
+    O->SetStringField(TEXT("object"), Series.ObjectLabel);
+    O->SetStringField(TEXT("property"), Series.PropertyPath);
     O->SetNumberField(TEXT("seconds"), ClampedSeconds);
     O->SetNumberField(TEXT("max_samples"), ClampedMax);
+    O->SetNumberField(TEXT("series_held"), GSeries.Num());
     return UAPToJsonString(O);
 }
 
-FString FAgentSampler::Read()
+FString FAgentSampler::Read(const FString& SeriesName)
 {
+    const FUAPSeries* Found = GSeries.Find(SeriesName);
+    if (!Found)
+    {
+        TArray<FString> Names;
+        GSeries.GetKeys(Names);
+        Names.Sort();
+        TSharedRef<FJsonObject> E = MakeShared<FJsonObject>();
+        E->SetBoolField(TEXT("ok"), false);
+        E->SetStringField(TEXT("error"), FString::Printf(
+            TEXT("no sample series named '%s' (never started, or the editor restarted)"),
+            *UAPNameLabel(SeriesName)));
+        TArray<TSharedPtr<FJsonValue>> NameArr;
+        for (const FString& N : Names) { NameArr.Add(MakeShared<FJsonValueString>(N)); }
+        E->SetArrayField(TEXT("series"), NameArr);
+        return UAPToJsonString(E);
+    }
+    const FUAPSeries& Series = *Found;
+
     TSharedRef<FJsonObject> O = MakeShared<FJsonObject>();
     O->SetBoolField(TEXT("ok"), true);
-    O->SetBoolField(TEXT("active"), GSeries.bActive);
-    O->SetStringField(TEXT("object"), GSeries.ObjectLabel);
-    O->SetStringField(TEXT("property"), GSeries.PropertyPath);
-    O->SetNumberField(TEXT("count"), GSeries.Values.Num());
-    if (!GSeries.LastError.IsEmpty()) { O->SetStringField(TEXT("last_error"), GSeries.LastError); }
+    O->SetStringField(TEXT("name"), SeriesName);
+    O->SetBoolField(TEXT("active"), Series.bActive);
+    O->SetStringField(TEXT("object"), Series.ObjectLabel);
+    O->SetStringField(TEXT("property"), Series.PropertyPath);
+    O->SetNumberField(TEXT("count"), Series.Values.Num());
+    if (!Series.LastError.IsEmpty()) { O->SetStringField(TEXT("last_error"), Series.LastError); }
 
     TArray<TSharedPtr<FJsonValue>> Arr;
-    Arr.Reserve(GSeries.Values.Num());
-    for (int32 i = 0; i < GSeries.Values.Num(); ++i)
+    Arr.Reserve(Series.Values.Num());
+    for (int32 i = 0; i < Series.Values.Num(); ++i)
     {
         TSharedRef<FJsonObject> S = MakeShared<FJsonObject>();
-        S->SetNumberField(TEXT("t"), GSeries.Times[i]);
-        S->SetField(TEXT("v"), GSeries.Values[i]);
+        S->SetNumberField(TEXT("t"), Series.Times[i]);
+        S->SetField(TEXT("v"), Series.Values[i]);
         Arr.Add(MakeShared<FJsonValueObject>(S));
     }
     O->SetArrayField(TEXT("samples"), Arr);
     return UAPToJsonString(O);
 }
 
-void FAgentSampler::Stop()
+void FAgentSampler::Stop(const FString& SeriesName)
 {
-    GSeries.bActive = false;
+    // "*" stops every series, keeping what each collected. Any other name stops just that one.
+    if (SeriesName == TEXT("*"))
+    {
+        for (TPair<FString, FUAPSeries>& Pair : GSeries) { Pair.Value.bActive = false; }
+    }
+    else if (FUAPSeries* Found = GSeries.Find(SeriesName))
+    {
+        Found->bActive = false;
+    }
+    // The ticker retires itself on its next tick once nothing is active.
+}
+
+void FAgentSampler::Shutdown()
+{
     if (GSampleTicker.IsValid())
     {
         FTSTicker::RemoveTicker(GSampleTicker);
         GSampleTicker.Reset();
     }
-}
-
-void FAgentSampler::Shutdown()
-{
-    Stop();
-    GSeries = FUAPSeries();
+    GSeries.Empty();
 }
