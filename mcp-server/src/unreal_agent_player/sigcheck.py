@@ -19,7 +19,7 @@ import os
 import subprocess
 import sys
 
-from unreal_agent_player.contract import PRESET_HEADERS, parse_header
+from unreal_agent_player.contract import all_headers, parse_header
 
 # Any of these in a pushed commit message counts as declaring the break.
 MARKERS = ("BREAKING", "SIGNATURE CHANGE", "SIGNATURE-CHANGE")
@@ -63,7 +63,7 @@ def collect(base: str) -> dict[str, list[str]]:
     """Breaking signature changes between `base` and the working tree, across every plugin
     public header. A header that does not exist at `base` is new -- nothing to break."""
     acc: dict[str, set[str]] = {"changed": set(), "removed": set(), "added": set()}
-    for path in PRESET_HEADERS.values():
+    for path in all_headers():
         old_text = _header_at(base, path)
         if not old_text:
             continue

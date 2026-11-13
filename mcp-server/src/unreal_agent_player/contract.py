@@ -62,7 +62,20 @@ PRESET_HEADERS = {
     "UAP_RuntimePreset": (
         "Plugin/Source/UnrealAgentPlayerRuntime/Public/UAPAgentRuntimeSubsystem.h"),
 }
+# More editor subsystems exposed on the SAME preset (UAP_Preset). They are separate classes so a
+# verb family can ship without editing UAPAgentSubsystem.h, but a client sees one flat verb list.
+PRESET_EXTRA_HEADERS = {
+    "UAP_Preset": ("Plugin/Source/UnrealAgentPlayer/Public/UAPAgentLevelSubsystem.h",),
+}
 DEFAULT_PRESET = "UAP_Preset"
+
+
+def all_headers() -> list[str]:
+    """Every plugin header whose UFUNCTIONs the CLI may call (primary + extra)."""
+    out = list(PRESET_HEADERS.values())
+    for extra in PRESET_EXTRA_HEADERS.values():
+        out.extend(extra)
+    return out
 
 # What a verb is FOR, quoted back when a plugin copy lacks it, so the refusal says what is
 # unavailable and not just which symbol is missing. A verb with no entry degrades to the
@@ -94,6 +107,10 @@ PURPOSE = {
     "CaptureLevelViewport": "`screenshot` / `screenshot --pose` with no PIE -- draws the LEVEL "
                             "EDITOR viewport itself (an idle editor never renders a frame to wait for)",
     "LevelViewportPose": "`viewport pose` -- sets/reads the pose on the SAME pane the capture uses",
+    "OpenLevel": "`level open` -- the SAFE level change; the only alternative is load_level from "
+                 "Python, which has killed the shared editor",
+    "GetCurrentLevel": "`level current` -- the open map, read back from the live editor world",
+    "GetLevelOpenStatus": "`level open` -- waiting for the queued load to finish",
 }
 
 # Argument-level purposes: a verb can be present while the PARAMETER the CLI wants is not.
@@ -210,12 +227,20 @@ def expected_contract(preset: str = DEFAULT_PRESET,
     rel = PRESET_HEADERS.get(preset)
     if not rel:
         return None
-    path = (root or repo_root()) / rel
+    base = root or repo_root()
+    path = base / rel
     try:
         text = path.read_text(encoding="utf-8")
     except OSError:
         return None
     parsed = parse_header(text)
+    # Extra subsystems on the same preset. A missing EXTRA header only means "expect less"
+    # (the safe direction), never "unknown": the primary header is what proves we can read.
+    for extra in PRESET_EXTRA_HEADERS.get(preset, ()):
+        try:
+            parsed.update(parse_header((base / extra).read_text(encoding="utf-8")))
+        except OSError:
+            continue
     return parsed or None
 
 

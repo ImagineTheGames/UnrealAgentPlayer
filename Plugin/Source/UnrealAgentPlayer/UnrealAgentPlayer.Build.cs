@@ -27,6 +27,7 @@ public class UnrealAgentPlayer : ModuleRules
             "LevelEditor",
             "EditorFramework",
             "Projects",
+            "AssetRegistry",
             "Json",
             "JsonUtilities",
             "RemoteControl",

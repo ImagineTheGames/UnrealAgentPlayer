@@ -9,9 +9,12 @@
 
 static URemoteControlPreset* GAgentPreset = nullptr;
 
-void FAgentRemoteControlBootstrap::Expose(UUAPAgentSubsystem* Subsystem)
+void FAgentRemoteControlBootstrap::Expose(UObject* Subsystem)
 {
-    if (!Subsystem || GAgentPreset) { return; }
+    // Called once per agent subsystem (UUAPAgentSubsystem, UUAPAgentLevelSubsystem). The FIRST call
+    // creates the shared UAP_Preset; every call adds that object's functions to it. This used to
+    // return when the preset already existed, which would silently drop the second subsystem.
+    if (!Subsystem) { return; }
 
     // Skip during headless commandlets (e.g. the cook commandlet). There is no RemoteControl
     // HTTP server to expose to, and ExposeFunction below calls URemoteControlPreset::ExposeFunction
@@ -20,12 +23,15 @@ void FAgentRemoteControlBootstrap::Expose(UUAPAgentSubsystem* Subsystem)
     // TransBuffer failed") and fails the cook.
     if (IsRunningCommandlet()) { return; }
 
-    GAgentPreset = NewObject<URemoteControlPreset>(
-        GetTransientPackage(),
-        URemoteControlPreset::StaticClass(),
-        TEXT("UAP_Preset"),
-        RF_Transient);
-    GAgentPreset->AddToRoot();
+    if (!GAgentPreset)
+    {
+        GAgentPreset = NewObject<URemoteControlPreset>(
+            GetTransientPackage(),
+            URemoteControlPreset::StaticClass(),
+            TEXT("UAP_Preset"),
+            RF_Transient);
+        GAgentPreset->AddToRoot();
+    }
 
     for (TFieldIterator<UFunction> It(Subsystem->GetClass()); It; ++It)
     {

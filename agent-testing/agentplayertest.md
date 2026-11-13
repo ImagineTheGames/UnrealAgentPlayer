@@ -548,8 +548,9 @@ State the concrete pass condition before running. A non-zero speed with a frozen
    below), not a performance finding, and every timing already taken is void. The same flag rides
    on `uap sample` (from the sampler's own `hz`) and is rendered into the HTML report, so a
    throttled run cannot be quietly summarised as a slow game.
-4. **Scene**: `uap exec` to `load_level('/Game/...')` if the question implies a specific map;
-   else use the open level and `uap report note "using level X"`.
+4. **Scene**: `uap level open /Game/...` (NEVER `load_level` through `uap exec`: it has killed the shared
+   editor) if the question implies a specific map; else use the open level (`uap level current`) and
+   `uap report note "using level X"`.
 5. **Start PIE**: `uap pie start` -- it BLOCKS until the game world is live (1-5s typically) and
    fails if it never comes up, so there is nothing to poll and nothing to wait on afterwards. Do
    NOT build a watcher, and do NOT tight-loop `uap exec` to check whether PIE is up: exec runs on

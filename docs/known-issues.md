@@ -1631,3 +1631,25 @@ PNG with `ok:true, exists:true`.
   with the render state recovered the same clients returned 800 KB frames (host flat pawn at a wall, concrete block and
   spray can with its cloud; late-joined client 2 hands against a cream wall) that were opened and described.
 * Tests: `mcp-server/tests/test_screenshot_blank_frame.py`.
+
+## 51. No `level` verb, and swapping levels with `load_level` from `uap exec` KILLED the shared editor -- FIXED (86akezbrp)
+
+* **Symptom:** the editor died on a routine level swap done from editor Python, for every agent sharing it.
+  Three earlier deaths were `Fatal error: ... World Memory Leaks: 1 leaks objects and packages`
+  (EditorServer.cpp:1938); on 2026-11-13 04:57 it was `Assertion failed: IsValidLowLevel() [Obj.cpp:1312]`
+  (`LogUObjectArray: Warning: Other object in slot`, script stack `LevelEditorSubsystem.LoadLevel`, loading
+  `/MarbleRace/Maps/Map_MarbleRace`).
+* **Root cause (minidump, cdb):** `load_level` ran `FEditorFileUtils::LoadMap` -> `Map_Load` -> `CollectGarbage` ->
+  `UnhashUnreachableObjects` -> `ConditionalBeginDestroy` NESTED INSIDE the Python frame (python311 +
+  PythonScriptPlugin frames sit directly below `execLoadLevel` on the stack). The `OnMapLoad` guard
+  (`ClearRemoteExecGlobals`) fired and dropped three globals and the editor died anyway: it can only drop globals,
+  and it runs a second Python eval nested in the frame that is mid-call. The stack proves the shape; the exact
+  object was not nameable (no private engine symbols).
+* **Fix:** `uap level open <map> [--discard]` and `uap level current`. The plugin (`UUAPAgentLevelSubsystem`) only
+  QUEUES the request; a core-ticker callback then runs outside any Python frame, re-checks PIE/dirty, drops the
+  exec globals, runs Python's cycle collector and calls `FEditorFileUtils::LoadMap`. Refuses during PIE, refuses a
+  dirty map unless `--discard`, never saves; mounts an unmounted content-only plugin for a Dream map. The CLI polls
+  through the busy game thread and reads the map back from the live editor.
+  `uap exec` now REFUSES inline Python that calls `load_level` / `load_map` / `new_level` ... (`--unsafe-level-load`
+  overrides); `exec-file` warns only, since map-builder scripts open their own map.
+* Tests: `mcp-server/tests/test_cli_level.py`.
