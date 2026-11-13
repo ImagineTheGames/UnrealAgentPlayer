@@ -1054,12 +1054,38 @@ def _exec(args) -> int:
     client = PythonRemoteExecClient(node_project_substr=args.project,
                                     node_instance=getattr(args, "instance", None))
     try:
+        # --client N: run with client N's PIE world as the target world. It used to be IGNORED
+        # here, so a 2-client "client reads" script read the host twice [17tm466zztw].
+        sel = _client_tag()
+        wrapped = False
+        if sel and not _exec_client_is_noop(args, sel):
+            from unreal_agent_player import exec_client as _xc
+            try:
+                code = _xc.build_client_code(code, sel)
+            except ValueError as exc:
+                raise AgentError(ErrorCode.SCHEMA_VALIDATION, str(exc)) from exc
+            wrapped = True
         res = client.exec_python(code)
         body["result"] = res.get("result")
         body["output"] = [o.get("output", "") for o in (res.get("output") or [])]
         body["ok"] = bool(res.get("success", True))
         if not body["ok"]:
             body["error"] = "exec returned success=false; see output"
+        if wrapped:
+            from unreal_agent_player import exec_client as _xc
+            body["output"], info, refusal = _xc.parse_client_output(body["output"])
+            if refusal:
+                body["ok"] = False
+                body["error"] = f"--client {sel}: {refusal} The script was NOT run."
+            elif info is None:
+                # The preamble never reported: it did not run (or its output was lost). Handing
+                # back the script's answer would be the silent host read this exists to stop.
+                body["ok"] = False
+                body["error"] = (f"--client {sel} could not be honoured: the client-world preamble "
+                                 "did not report, so the script may have run against the wrong "
+                                 "world. See output; do not trust this result.")
+            else:
+                body["client"] = info
     except AgentError as exc:
         body = _err(exc)
     # Always say WHICH process answered. The failure this exists for was an exec that landed on
@@ -1070,6 +1096,14 @@ def _exec(args) -> int:
     _capture("exec", {"code": code[:200]}, body, int((time.monotonic() - t0) * 1000))
     _emit(body)
     return 0 if body["ok"] else 1
+
+
+def _exec_client_is_noop(args, sel: str) -> bool:
+    """`--client 0` against a `-game` standalone client: that process has exactly one game world
+    (and no editor Python), so there is nothing to select and the preamble would not work."""
+    if sel != "0":
+        return False
+    return _standalone_instance_selected(args, None)
 
 
 def _target_of(client: PythonRemoteExecClient) -> dict | None:
@@ -2802,6 +2836,42 @@ def _screenshot_level_viewport(args, out_path: str) -> dict:
     return body
 
 
+def _refuse_blank_frame(body: dict, file: str, allow_blank: bool) -> dict:
+    """A PIE capture that is all black / one flat colour is NOT a screenshot [17tm466zztw].
+
+    The engine rendered that frame (an OS PrintWindow of the same window was black too), so it is
+    the game view that is blank, not the capture. It used to come back `ok:true, exists:true` and
+    read as proof. Now the file is moved aside (`<name>.BLANK.png`) so the path the caller asked
+    for never holds an untrustworthy picture, and the answer says why. `--allow-blank` keeps it
+    (a deliberate fade-to-black test), flagged `blank:true`."""
+    from unreal_agent_player.png_stats import png_blank_stats
+    stats = png_blank_stats(file)
+    body["blank_check"] = {k: v for k, v in stats.items() if k != "blank"}
+    body["blank"] = stats.get("blank")
+    if stats.get("blank") is not True:
+        return body
+    if allow_blank:
+        body["warning"] = ("BLANK FRAME kept because of --allow-blank: " + str(stats.get("reason"))
+                           + ". It is not proof of anything.")
+        return body
+    stem, ext = os.path.splitext(file)
+    kept = f"{stem}.BLANK{ext or '.png'}"
+    try:
+        os.replace(file, kept)
+        body["blank_file"] = kept
+    except OSError:
+        pass
+    body["ok"] = False
+    body["exists"] = False
+    body["error"] = (f"BLANK frame refused: {stats.get('reason')}. The game view rendered blank (the "
+                     "capture itself worked), so this is not a screenshot of the feature under "
+                     "test. Do not treat it as proof. Known cause: a lit scene renders black in a "
+                     "PIE session with 2+ game windows until dynamic shadows are off "
+                     "(docs/known-issues.md #50). The rejected image is kept at blank_file; "
+                     "`--allow-blank` returns it anyway.")
+    return body
+
+
 def _screenshot(args) -> int:
     if getattr(args, "window", None):
         return _window_screenshot(args)
@@ -2839,6 +2909,8 @@ def _screenshot(args) -> int:
             while time.monotonic() < deadline and not os.path.exists(args.file):
                 time.sleep(0.25)
             body = _screenshot_body(args.file, os.path.exists(args.file))
+            if body.get("exists"):
+                body = _refuse_blank_frame(body, args.file, bool(getattr(args, "allow_blank", False)))
         body["caption"] = args.caption
         if body.get("exists"):
             # Stamp which editor this shot came from, so report finish can reject a pass whose
@@ -3286,6 +3358,8 @@ VERBS (uap help <verb>)
   pie start|stop|wait            play-in-editor; start blocks until the world is live
   lease acquire|wait|release|status|heartbeat|machine-status|machine-release
   exec "<py>" | exec-file <p>    Python in the editor (read state; never drive RPCs from it)
+                                  --client N runs it against client N's PIE world (UAP_WORLD, UAP_CLIENT;
+                                  get_game_world() too); a missing client is REFUSED, never the host
   rc <Func> k=v ...              a plugin UFUNCTION over Remote Control
   read-ui | click <text> | tab <id> | nav <dir>     on-screen UMG / CommonUI
   screenshot <abs.png> [--window <client>]          3D + UI composite; standalone clients
@@ -3639,7 +3713,9 @@ def build_parser() -> argparse.ArgumentParser:
                       help="which PIE client the input / click / read-ui verbs act on: its PIE "
                            "instance index (0, 1, ...; `uap input clients` lists them) or 'all'. "
                            "Default $UAP_CLIENT, else the first game world (unchanged). "
-                           "`screenshot --client N` captures that client's own viewport.")
+                           "`screenshot --client N` captures that client's own viewport; "
+                           "`exec`/`exec-file --client N` run with that client's PIE world as "
+                           "UAP_WORLD (and as get_game_world()), refusing a client that is not there.")
     # Output mode + harness-safe waiting, accepted by every verb like the flags above.
     proj.add_argument("--brief", action="store_true", default=False,
                       help="compact output (also $UAP_OUTPUT=brief). Opt-in; default unchanged.")
@@ -3781,6 +3857,10 @@ def build_parser() -> argparse.ArgumentParser:
                     help=f"with --window: capture N frames (1..{_MAX_FRAMES}) as motion proof")
     sc.add_argument("--editor", action="store_true",
                     help="capture the LEVEL EDITOR viewport even while PIE runs (default with no PIE)")
+    sc.add_argument("--allow-blank", dest="allow_blank", action="store_true",
+                    help="keep a PIE frame that rendered all black / one flat colour. Default: such "
+                         "a frame is NOT returned as a screenshot (ok:false, blank:true) because a "
+                         "picture of nothing is not proof [17tm466zztw]")
     _add_level_pose_args(sc)
     sc.add_argument("--interval-ms", dest="interval_ms", type=int, default=500,
                     help="with --window --frames: milliseconds between frames (default 500)")
@@ -4498,10 +4578,12 @@ def _run_parsed(args) -> int:
     # exclusive lease or the machine lock -- a two-client test holding its own lease would
     # otherwise wait on itself, and a rebuild of the editor has nothing to do with the client.
     if cmd == "screenshot" and getattr(args, "window", None):
+        _keepalive_lease(args, project)
         return args.func(args)
     # `--instance` at a standalone -game client: same reasoning, see _standalone_instance_selected.
     if cmd in (_INSTANCE_RC_CMDS | {"exec", "exec-file"}) and _standalone_instance_selected(
             args, _INSTANCE_TARGET[0]):
+        _keepalive_lease(args, project)
         _RC_TARGET[0] = _INSTANCE_TARGET[0]
         try:
             return args.func(args)
@@ -4510,6 +4592,10 @@ def _run_parsed(args) -> int:
     # Say who is using the editor before anything can block, so a call stuck behind a lease or a
     # rebuild still appears (with its task) in `uap lease status` and the overlay. Display only.
     task = _task_label(args)
+    if cmd not in _LEASE_GUARDED:
+        # The guard chain heartbeats the caller's lease only for lease-guarded verbs; every other
+        # verb made under --agent (status, report, ...) is still the holder working. [17tm466zzn0]
+        _keepalive_lease(args, project)
     g0 = time.monotonic()
     tracked = False
     try:
@@ -4532,6 +4618,25 @@ def _run_parsed(args) -> int:
     # about the OTHER project's editor: a Project Broken Wings agent could start PIE while a
     # School's Out VR agent was mid-session, and neither lease noticed.
     return _run_under_machine_lock(args, cmd, project, tracked=tracked)
+
+
+def _keepalive_lease(args, project: str) -> None:
+    """Any uap call made under an explicit --agent / $UAP_AGENT_ID refreshes that agent's lease,
+    whatever the call targets (a standalone `--instance pid:<n>`, `screenshot --window`, a report
+    verb). Without it an agent driving only standalone clients under its own
+    `lease acquire exclusive --reason pie` lost the lease to TTL mid-run and a second agent
+    started PIE in the same hub. [17tm466zzn0] `lease` verbs manage the lease themselves, an
+    anonymous call refreshes nothing, and it never waits, raises, or touches another agent's
+    hold (coordination.keepalive)."""
+    if getattr(args, "cmd", None) == "lease":
+        return
+    who = getattr(args, "agent", None) or os.environ.get("UAP_AGENT_ID")
+    if not who:
+        return
+    try:
+        _coord.keepalive(project, agent=who)
+    except Exception:
+        pass
 
 
 def _guard_fast(args, cmd, project: str, task: str) -> dict | None:

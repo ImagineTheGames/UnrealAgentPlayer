@@ -1278,6 +1278,50 @@ def heartbeat(project: str | None, *, agent: str | None = None,
     return res
 
 
+def keepalive(project: str | None, *, agent: str) -> int:
+    """Refresh `agent`'s lease holds because the agent just made a uap call, whatever that call
+    targets. Returns how many holds it touched. Never raises.
+
+    The editor lease is meant to live as long as its holder keeps working. The guard chain
+    heartbeats it for editor verbs, but a call at a standalone `-game` client (`--instance
+    pid:<n>`) or `screenshot --window` deliberately skips that chain (it must not WAIT behind
+    anyone's lease), so an agent that spent ten minutes driving two clients under its own
+    `lease acquire exclusive --reason pie` lost the lease to TTL and another agent started PIE
+    in the same hub mid-run. [17tm466zzn0]
+
+    Safety rules are the guard chain's, unchanged: dead and expired holds are settled FIRST
+    (`_refresh`), so a lease that already aged out is evicted, not revived; only holds that
+    belong to `agent` are touched, never another agent's; and an eviction notice is left in
+    place for the agent's next guarded call to report (this never pops it). It never waits,
+    never acquires, and never takes the machine lock.
+    """
+    if not agent:
+        return 0
+    try:
+        _acquire_filelock(project)
+    except Exception:
+        return 0
+    evicted = None
+    touched = 0
+    try:
+        state, evicted = _refresh(project)
+        now = _now()
+        for h in [state.get("exclusive"), *state.get("shared", [])]:
+            if h and h.get("agent") == agent:
+                h["heartbeat_at"] = now
+                touched += 1
+        _save(project, state)        # also persists whatever _refresh settled (an aged-out hold)
+    except Exception:
+        touched = 0
+    finally:
+        _release_filelock(project)
+        try:
+            _after_eviction(project, evicted)
+        except Exception:
+            pass
+    return touched
+
+
 def note_activity(project: str | None, *, agent: str, verb: str = "",
                   task: str | None = None) -> None:
     """Record that `agent` just issued `verb`, so a view of the editor can name who is using it

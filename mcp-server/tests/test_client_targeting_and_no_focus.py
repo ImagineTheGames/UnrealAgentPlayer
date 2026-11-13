@@ -186,6 +186,26 @@ def test_a_hold_remembers_its_world_and_reenters_it_every_tick():
     assert cpp.count("FAgentWorld::FScope Scope(") >= 3
 
 
+# --- uap click with the game viewport already holding the pointer capture [17tm466y7g0] ---
+
+def test_a_click_takes_the_pointer_capture_back_from_the_game_viewport():
+    """A foreground client whose SViewport holds the pointer capture routed every press to the
+    viewport (ProcessMouseButtonDownEvent's HasCapture branch), so `uap click` reported
+    clicked/down_handled/up_handled and no button fired, while vrmenu.dev.press worked. The
+    down is now routed to the widget under the cursor after the Slate-side capture is released.
+    C++ cannot run under pytest, so this pins the source."""
+    cpp = _plugin("UnrealAgentPlayerRuntime/Private/AgentInput.cpp")
+    assert "UAPViewportHoldsPointerCapture" in cpp
+    assert 'FName(TEXT("SViewport"))' in cpp
+    body = cpp[cpp.index("bool FAgentInput::InjectMouseButtonAt"):]
+    body = body[:body.index("FString FAgentInput::DescribeWidgetsAt")]
+    assert "bViewportCaptured" in body
+    # release BEFORE routing the down; the route goes to the located path, not the captor
+    assert body.index("ReleaseCapture(") < body.index("RoutePointerDownEvent(Path, Evt)")
+    # only the viewport is stolen back: a drag held by another widget keeps the engine route
+    assert "bBackground && !SlateUser->HasCapture" in body
+
+
 # --- no window activation, no OS input --------------------------------------------------
 
 # A CALL (not a mention in a comment or a help string) of any window-activation or OS-input API.
