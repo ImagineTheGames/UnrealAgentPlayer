@@ -3717,6 +3717,8 @@ def _lease_inner(args) -> int:
     proj = getattr(args, "project", "") or _env_project()
     cmd = args.lease_cmd
     if cmd in ("acquire", "wait"):
+        if getattr(args, "progress", False):
+            os.environ["UAP_LEASE_PROGRESS"] = "1"
         task = _task_label(args, getattr(args, "reason", None))
         mb = _max_block(args)
         if cmd == "acquire":
@@ -4299,6 +4301,9 @@ def build_parser() -> argparse.ArgumentParser:
     la.add_argument("--wait", type=float, default=_coord.DEFAULT_WAIT_CAP,
                     help="max seconds to block before returning busy (default 900)")
     la.add_argument("--ttl", type=int, default=None)
+    la.add_argument("--progress", action="store_true",
+                    help="print a 'waiting ... position n/m' line to stderr every 20s while "
+                         "blocked (default silent; also $UAP_LEASE_PROGRESS=1 or a TTY)")
     la.add_argument("--requested-by", dest="requested_by", default=None, metavar="AGENT",
                     help="the agent this token acts for, when --agent is a mechanical token such "
                          "as rebuild-<pid> (default: $UAP_AGENT_ID when it differs from --agent). "
@@ -4310,6 +4315,8 @@ def build_parser() -> argparse.ArgumentParser:
     lzw.add_argument("--seconds", "--wait", dest="seconds", type=float, default=None,
                      help="max seconds to block this call (default --max-block, "
                           "$UAP_MAX_BLOCK, else 110)")
+    lzw.add_argument("--progress", action="store_true",
+                     help="print wait progress to stderr (default silent; see `lease acquire`)")
     lzw.add_argument("--mode", choices=["exclusive", "shared"], default=None,
                      help="only needed if you were never queued (default: the parked request)")
     lzw.add_argument("--reason", default=None)
