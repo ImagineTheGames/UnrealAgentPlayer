@@ -9,6 +9,17 @@
  * Registered as a modular feature so UMotionControllerComponent polls it like a real device.
  * When an override for a hand is cleared, GetControllerOrientationAndPosition returns false
  * for that source so real devices (if any) win.
+ *
+ * PER-CLIENT STATE [17tm466zwx5]. A modular feature is ONE object shared by every world in the
+ * process, and every pawn's UMotionControllerComponent polls it with ControllerIndex 0, so a single
+ * Hands[2] made `uap xr pose` move the hand on EVERY PIE client. State is now kept per PIE
+ * instance. A poll is attributed to a client by UE::GetPlayInEditorID(), which the editor sets to
+ * the world's PIE instance for the whole of that world's tick (the component's TickComponent runs
+ * inside it). Callers that name a client use the same selector as every other `--client` verb
+ * (FAgentWorld::ResolveClients); an EMPTY selector means "the default client", i.e. the first game
+ * world (client 0), NOT "all" -- the old behaviour was the bug. "all" is explicit.
+ * A poll made off the game thread (the render thread's late update) answers false: it cannot know
+ * which client it serves, and the game-thread poll already placed the component.
  */
 class UNREALAGENTPLAYERRUNTIME_API FAgentMotionController : public IMotionController
 {
@@ -19,8 +30,15 @@ public:
     void Register();
     void Unregister();
 
-    void SetPose(EAgentXRHand Hand, const FAgentControllerPose& Pose);
-    void ClearPose(EAgentXRHand Hand);
+    // --- Per-client verbs. Client = "" (default client), "N" (PIE instance) or "all". ---------
+    // A refusal (no such client) is logged to LogUAPRuntime (a bool cannot carry a reason) and
+    // returns false; nothing is changed on ANY client in that case.
+    bool SetPose(const FString& Client, EAgentXRHand Hand, const FAgentControllerPose& Pose);
+    bool ClearPose(const FString& Client, EAgentXRHand Hand);
+
+    // Resolve a Client selector to the state slots (PIE instance ids) it names. Public so the
+    // subsystems and tests share one rule. Empty -> exactly one slot, the default client's.
+    static bool ResolveSlots(const FString& Client, TArray<int32>& OutSlots, FString& OutError);
 
     // --- Aim-pose emulation (opt-in, OFF by default) ------------------------------------------
     // A real OpenXR runtime answers the "<Hand>Aim" motion source with a DIFFERENT pose from
@@ -32,18 +50,20 @@ public:
     // I point" check) sees a delta of zero -- the trap a grip-pose check fell into once already.
     // With emulation ON, "<Hand>Aim" answers GripToAim * grip. The delta is given for the RIGHT
     // hand; the left hand uses its mirror image (Y, yaw and roll negated), which for the Quest
-    // delta (Y = 0, pitch only) is the same transform.
-    void SetAimEmulation(bool bEnabled, const FTransform& InRightGripToAim);
-    bool IsAimEmulationEnabled() const { return bAimEmulation; }
-    FTransform GetGripToAim(EAgentXRHand Hand) const;
+    // delta (Y = 0, pitch only) is the same transform. Per client, like the poses.
     static FTransform QuestGripToAim();
 
     // JSON for the subsystems' SetXRAimEmulation / GetXRControllerState, so the editor and the
     // runtime subsystem cannot drift apart. A zero delta (location AND rotation) means "use the
     // Quest default": RemoteControl zero-initialises omitted arguments, and a zero delta is
-    // exactly the aim == grip state emulation exists to remove.
-    FString SetAimEmulationJson(bool bEnabled, const FVector& GripToAimLocation, const FRotator& GripToAimRotation);
-    FString StateJson() const;
+    // exactly the aim == grip state emulation exists to remove. One client -> that client's
+    // object with "client":N; several ("all") -> {"ok":true,"clients":[...]}.
+    FString SetAimEmulationJson(const FString& Client, bool bEnabled, const FVector& GripToAimLocation, const FRotator& GripToAimRotation);
+    FString StateJson(const FString& Client) const;
+
+    // Test hooks: what THIS slot answers for a source, bypassing the "which client is polling"
+    // lookup, so the per-client isolation can be unit-checked without a PIE.
+    bool QueryForSlot(int32 Slot, const FName MotionSource, FRotator& OutOrientation, FVector& OutPosition) const;
 
     // True when ButtonKeyName names the OTHER hand (e.g. Hand=Right, "OculusTouch_Left_X_Click").
     // InjectXRButton used to ignore Hand entirely; a contradiction is now refused instead of
@@ -66,10 +86,23 @@ private:
         bool bActive = false;
         FAgentControllerPose Pose;
     };
-    FHandState Hands[2];
+    // One client's injected controllers + aim emulation.
+    struct FClientState
+    {
+        FHandState Hands[2];
+        bool bAimEmulation = false;
+        FTransform RightGripToAim = FTransform::Identity;
+    };
+    // Keyed by PIE instance id (INDEX_NONE for a standalone game world). Game thread only.
+    TMap<int32, FClientState> Clients;
 
-    bool ResolveHand(const FName MotionSource, int32& OutIndex, bool& bOutAim) const;
+    static FTransform GripToAimFor(const FClientState& S, EAgentXRHand Hand);
+    bool Query(const FClientState& S, const FName MotionSource, FRotator& OutOrientation, FVector& OutPosition) const;
+    FString OneClientStateJson(int32 Slot) const;
+    FString OneClientAimJson(int32 Slot, bool bEnabled, const FVector& GripToAimLocation, const FRotator& GripToAimRotation);
+
+    static bool ResolveHand(const FName MotionSource, int32& OutIndex, bool& bOutAim);
+    // The state slot of the client whose world is ticking right now (UE::GetPlayInEditorID()).
+    static int32 PollingSlot();
     bool bRegistered = false;
-    bool bAimEmulation = false;
-    FTransform RightGripToAim = FTransform::Identity;
 };

@@ -68,12 +68,14 @@ public:
     // answers when each step ACTUALLY fired (start_error_ms, frame), for measuring the playback.
     UFUNCTION(BlueprintCallable, Category="Agent|Input") FString RunInputSequence(FString ScriptJson, FString StartAt, FString Client);
     UFUNCTION(BlueprintCallable, Category="Agent|Input") FString GetInputSequenceLog(FString Client);
-    UFUNCTION(BlueprintCallable, Category="Agent|Input") bool InjectXRControllerPose(EAgentXRHand Hand, FVector Position, FRotator Orientation, bool bTracked);
-    UFUNCTION(BlueprintCallable, Category="Agent|Input") bool ClearXRControllerOverride(EAgentXRHand Hand);
-    // Opt-in aim-pose emulation (OFF by default) and the injected controllers' state. Same
-    // contract as UUAPAgentSubsystem; both forward to FAgentMotionController.
-    UFUNCTION(BlueprintCallable, Category="Agent|Input") FString SetXRAimEmulation(bool bEnabled, FVector GripToAimLocation, FRotator GripToAimRotation);
-    UFUNCTION(BlueprintCallable, Category="Agent|Input") FString GetXRControllerState();
+    // Per-client [17tm466zwx5]: Client "" = the default client (client 0), "N" = that PIE instance,
+    // "all" = every client. Same contract as UUAPAgentSubsystem; both forward to
+    // FAgentMotionController, which keeps one set of injected hands per PIE client.
+    UFUNCTION(BlueprintCallable, Category="Agent|Input") bool InjectXRControllerPose(EAgentXRHand Hand, FVector Position, FRotator Orientation, bool bTracked, FString Client);
+    UFUNCTION(BlueprintCallable, Category="Agent|Input") bool ClearXRControllerOverride(EAgentXRHand Hand, FString Client);
+    // Opt-in aim-pose emulation (OFF by default) and the injected controllers' state.
+    UFUNCTION(BlueprintCallable, Category="Agent|Input") FString SetXRAimEmulation(bool bEnabled, FVector GripToAimLocation, FRotator GripToAimRotation, FString Client);
+    UFUNCTION(BlueprintCallable, Category="Agent|Input") FString GetXRControllerState(FString Client);
     UFUNCTION(BlueprintCallable, Category="Agent|UI") FString DumpViewportUI(FString Client);
     UFUNCTION(BlueprintCallable, Category="Agent|Capture") bool CaptureViewportWithUI(FString Filename);
     UFUNCTION(BlueprintCallable, Category="Agent|Log") int64 GetLogCursor() const;

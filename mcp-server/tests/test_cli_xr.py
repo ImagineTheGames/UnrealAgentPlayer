@@ -153,3 +153,73 @@ def test_no_click_and_light_squeeze_hold_only_the_axis(monkeypatch, capsys):
     _run(["xr", "grip", "right", "--seconds", "1", "--no-click"], capsys)
     _run(["xr", "grip", "right", "0.3", "--seconds", "1", "--overlap"], capsys)
     assert not [c for c in calls if c[0] == "HoldKey"]
+
+
+# --- per-client hands [17tm466zwx5] ---------------------------------------------------------
+# Before this, InjectXRControllerPose / ClearXRControllerOverride / SetXRAimEmulation /
+# GetXRControllerState took no Client and the plugin kept ONE global hand state, so `uap xr pose`
+# moved the hand on EVERY PIE player. These pin the CLI half: the client rides all four verbs
+# (and the whole grip/trigger path), and an older plugin without the parameter is refused
+# instead of silently driving the wrong (or every) client.
+
+def _fake_rc(monkeypatch, sent):
+    class FakeRC:
+        def __init__(self, *a, **k):
+            pass
+
+        async def call_preset(self, func, params, *a, **k):
+            sent.append((func, dict(params)))
+            if func in ("InjectXRControllerPose", "ClearXRControllerOverride"):
+                return True
+            if func == "GetHeldInput":
+                return json.dumps({"ok": True, "held": []})
+            return json.dumps({"ok": True, "key": params.get("AxisKeyName") or params.get("KeyName"),
+                               "pressed": True, "client": 1, "aim_emulation": True, "hands": {}})
+
+        async def aclose(self):
+            pass
+
+    monkeypatch.setattr(cli, "RemoteControlClient", FakeRC)
+    monkeypatch.setattr(cli, "_live_contract", lambda project=None: None)
+    monkeypatch.setattr(cli, "_CLIENT", [None])
+
+
+@pytest.mark.parametrize("argv,func", [
+    (["xr", "pose", "right", "1", "2", "3"], "InjectXRControllerPose"),
+    (["xr", "clear", "left"], "ClearXRControllerOverride"),
+    (["xr", "aim", "on"], "SetXRAimEmulation"),
+    (["xr", "state"], "GetXRControllerState"),
+])
+def test_client_rides_every_xr_pose_verb(monkeypatch, capsys, argv, func):
+    sent = []
+    _fake_rc(monkeypatch, sent)
+    assert cli.main(argv + ["--client", "1"]) == 0
+    calls = [p for f, p in sent if f == func]
+    assert calls and all(p["Client"] == "1" for p in calls), (func, sent)
+
+
+def test_no_client_flag_leaves_the_xr_pose_calls_without_a_client(monkeypatch, capsys):
+    """Omitted = the plugin's default client (client 0), so the wire is exactly as before."""
+    sent = []
+    _fake_rc(monkeypatch, sent)
+    assert cli.main(["xr", "pose", "right", "1", "2", "3"]) == 0
+    assert next(p for f, p in sent if f == "InjectXRControllerPose").get("Client") is None
+
+
+def test_grip_with_client_holds_on_that_client_only(monkeypatch, capsys):
+    sent = []
+    _fake_rc(monkeypatch, sent)
+    assert cli.main(["xr", "grip", "right", "--seconds", "1", "--client", "1"]) == 0
+    holds = [p for f, p in sent if f in ("HoldAxis", "HoldKey")]
+    assert holds and all(p.get("Client") == "1" for p in holds), sent
+
+
+def test_old_plugin_without_client_on_pose_is_refused_not_applied_everywhere(monkeypatch, capsys):
+    sent = []
+    _fake_rc(monkeypatch, sent)
+    monkeypatch.setattr(cli, "_live_contract", lambda project=None: {
+        "InjectXRControllerPose": {"Hand": "x", "Position": "x", "Orientation": "x", "bTracked": "x"}})
+    rc, body = _run(["xr", "pose", "right", "1", "2", "3", "--client", "1", "--project", "SchoolsOut"],
+                    capsys)
+    assert rc == 1 and body["ok"] is False
+    assert not [1 for f, _ in sent if f == "InjectXRControllerPose"]

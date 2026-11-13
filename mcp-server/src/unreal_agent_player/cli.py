@@ -536,6 +536,9 @@ _CLIENT_VERBS = frozenset({
     "InjectKey", "InjectMouseMove", "InjectMouseButton", "SetMousePosition", "ClickMouse",
     "InjectAxis", "InjectGamepad", "InjectXRButton", "HoldKey", "HoldAxis", "ReleaseHeldInput",
     "GetHeldInput", "DumpViewportUI", "RunInputSequence", "GetInputSequenceLog",
+    # The injected XR hands are per client too [17tm466zwx5]: a pose with no --client reaches client 0
+    # ONLY (it used to reach every PIE player).
+    "InjectXRControllerPose", "ClearXRControllerOverride", "SetXRAimEmulation", "GetXRControllerState",
 })
 
 
@@ -1774,7 +1777,7 @@ def _xr(args) -> int:
                                  "It stays applied until `uap xr clear`."})
             if not applied:
                 body["ok"] = False
-                body["error"] = "InjectXRControllerPose returned false (agent motion controller missing)"
+                body["error"] = "InjectXRControllerPose returned false (no such PIE client - `uap input clients` lists them - or the agent motion controller is missing; the log names which)"
         elif sub == "clear":
             cleared = {}
             for hand in _xr_hands(args.hand):
@@ -2917,6 +2920,8 @@ VR HANDS (the injected Quest controllers -- drive the REAL VR pawn's hands with 
                                        makes lasers / distance grab see a real aim ray
   uap xr state                         grip + aim pose per hand, and whether aim is emulated
   uap xr clear [left|right|both]       drop the injected pose(s)
+  --client N|all on any `uap xr` verb: the hands are PER PIE CLIENT. Default = client 0 ONLY (pose,
+                                       grip, trigger, aim, state, clear), never every player.
   Rig recipe (possess the VR pawn in flat PIE, camera as the head): the project's own docs.
   What this cannot be: real OpenXR input, an interaction profile, a stereo/Quest render, feel.
 

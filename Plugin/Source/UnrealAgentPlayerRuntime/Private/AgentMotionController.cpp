@@ -1,5 +1,9 @@
 #include "AgentMotionController.h"
 #include "Features/IModularFeatures.h"
+#include "CoreGlobals.h"
+#include "AgentWorld.h"
+#include "UnrealAgentPlayerRuntimeModule.h"
+#include "Engine/World.h"
 
 static const FName GAgentMCDeviceType = TEXT("UAPAgentController");
 
@@ -24,16 +28,69 @@ void FAgentMotionController::Unregister()
     }
 }
 
-void FAgentMotionController::SetPose(EAgentXRHand Hand, const FAgentControllerPose& Pose)
+int32 FAgentMotionController::PollingSlot()
 {
-    FHandState& S = Hands[(int32)Hand];
-    S.bActive = true;
-    S.Pose = Pose;
+    // The editor sets this to the PIE instance of the world it is ticking (SetPlayInEditorWorld),
+    // thread-locally, for the whole tick of that world; INDEX_NONE in a standalone game.
+    return UE::GetPlayInEditorID();
 }
 
-void FAgentMotionController::ClearPose(EAgentXRHand Hand)
+bool FAgentMotionController::ResolveSlots(const FString& Client, TArray<int32>& OutSlots, FString& OutError)
 {
-    Hands[(int32)Hand].bActive = false;
+    OutSlots.Reset();
+    OutError.Reset();
+    if (Client.TrimStartAndEnd().IsEmpty())
+    {
+        // The DEFAULT client, not "all": the first game world, as every other verb treats it.
+        // No game world yet (a pose set before PIE starts) -> client 0, which is what the first
+        // PIE client will be.
+        // A standalone (-game) world has no PIE instance: its slot is INDEX_NONE, which is also
+        // what UE::GetPlayInEditorID() answers there.
+        UWorld* W = FAgentWorld::GetActiveGameWorld();
+        OutSlots.Add(W ? FAgentWorld::GetClientIndex(W) : 0);
+        return true;
+    }
+    TArray<UWorld*> Worlds;
+    if (!FAgentWorld::ResolveClients(Client, Worlds, OutError)) { return false; }
+    for (UWorld* W : Worlds)
+    {
+        OutSlots.AddUnique(FAgentWorld::GetClientIndex(W));
+    }
+    return OutSlots.Num() > 0;
+}
+
+bool FAgentMotionController::SetPose(const FString& Client, EAgentXRHand Hand, const FAgentControllerPose& Pose)
+{
+    TArray<int32> Slots;
+    FString Error;
+    if (!ResolveSlots(Client, Slots, Error))
+    {
+        UE_LOG(LogUAPRuntime, Error, TEXT("InjectXRControllerPose: %s"), *Error);
+        return false;
+    }
+    for (int32 Slot : Slots)
+    {
+        FHandState& S = Clients.FindOrAdd(Slot).Hands[(int32)Hand];
+        S.bActive = true;
+        S.Pose = Pose;
+    }
+    return true;
+}
+
+bool FAgentMotionController::ClearPose(const FString& Client, EAgentXRHand Hand)
+{
+    TArray<int32> Slots;
+    FString Error;
+    if (!ResolveSlots(Client, Slots, Error))
+    {
+        UE_LOG(LogUAPRuntime, Error, TEXT("ClearXRControllerOverride: %s"), *Error);
+        return false;
+    }
+    for (int32 Slot : Slots)
+    {
+        if (FClientState* S = Clients.Find(Slot)) { S->Hands[(int32)Hand].bActive = false; }
+    }
+    return true;
 }
 
 FTransform FAgentMotionController::QuestGripToAim()
@@ -42,27 +99,21 @@ FTransform FAgentMotionController::QuestGripToAim()
     return FTransform(FRotator(-60.f, 0.f, 0.f), FVector(7.35f, 0.f, -6.73f));
 }
 
-void FAgentMotionController::SetAimEmulation(bool bEnabled, const FTransform& InRightGripToAim)
-{
-    bAimEmulation = bEnabled;
-    RightGripToAim = InRightGripToAim;
-}
-
-FTransform FAgentMotionController::GetGripToAim(EAgentXRHand Hand) const
+FTransform FAgentMotionController::GripToAimFor(const FClientState& S, EAgentXRHand Hand)
 {
     if (Hand == EAgentXRHand::Right)
     {
-        return RightGripToAim;
+        return S.RightGripToAim;
     }
     // Mirror across the controller's XZ plane: Y, yaw and roll change sign.
-    const FRotator R = RightGripToAim.Rotator();
-    const FVector L = RightGripToAim.GetLocation();
+    const FRotator R = S.RightGripToAim.Rotator();
+    const FVector L = S.RightGripToAim.GetLocation();
     return FTransform(FRotator(R.Pitch, -R.Yaw, -R.Roll), FVector(L.X, -L.Y, L.Z));
 }
 
 FName FAgentMotionController::GetMotionControllerDeviceTypeName() const { return GAgentMCDeviceType; }
 
-bool FAgentMotionController::ResolveHand(const FName MotionSource, int32& OutIndex, bool& bOutAim) const
+bool FAgentMotionController::ResolveHand(const FName MotionSource, int32& OutIndex, bool& bOutAim)
 {
     const FString S = MotionSource.ToString();
     bOutAim = false;
@@ -85,22 +136,37 @@ bool FAgentMotionController::ResolveHand(const FName MotionSource, int32& OutInd
     return false;
 }
 
-bool FAgentMotionController::GetControllerOrientationAndPosition(const int32, const FName MotionSource, FRotator& OutOrientation, FVector& OutPosition, float) const
+bool FAgentMotionController::Query(const FClientState& State, const FName MotionSource, FRotator& OutOrientation, FVector& OutPosition) const
 {
     int32 Idx;
     bool bAim;
-    if (!ResolveHand(MotionSource, Idx, bAim) || !Hands[Idx].bActive) { return false; }
-    OutOrientation = Hands[Idx].Pose.Orientation;
-    OutPosition = Hands[Idx].Pose.Position;
-    if (bAim && bAimEmulation)
+    if (!ResolveHand(MotionSource, Idx, bAim) || !State.Hands[Idx].bActive) { return false; }
+    OutOrientation = State.Hands[Idx].Pose.Orientation;
+    OutPosition = State.Hands[Idx].Pose.Position;
+    if (bAim && State.bAimEmulation)
     {
         // Aim = GripToAim expressed in the grip frame, then the grip pose (UE order: A * B applies A first).
         const FTransform Grip(OutOrientation, OutPosition);
-        const FTransform Aim = GetGripToAim((EAgentXRHand)Idx) * Grip;
+        const FTransform Aim = GripToAimFor(State, (EAgentXRHand)Idx) * Grip;
         OutOrientation = Aim.Rotator();
         OutPosition = Aim.GetLocation();
     }
-    return Hands[Idx].Pose.bTracked;
+    return State.Hands[Idx].Pose.bTracked;
+}
+
+bool FAgentMotionController::QueryForSlot(int32 Slot, const FName MotionSource, FRotator& OutOrientation, FVector& OutPosition) const
+{
+    const FClientState* S = Clients.Find(Slot);
+    return S && Query(*S, MotionSource, OutOrientation, OutPosition);
+}
+
+bool FAgentMotionController::GetControllerOrientationAndPosition(const int32, const FName MotionSource, FRotator& OutOrientation, FVector& OutPosition, float) const
+{
+    // Off the game thread (the render thread's late update) there is no way to tell which client
+    // is asking, and answering with another client's pose would move the wrong hand on screen.
+    // Answer false: the component keeps the pose its game-thread poll already gave it.
+    if (!IsInGameThread()) { return false; }
+    return QueryForSlot(PollingSlot(), MotionSource, OutOrientation, OutPosition);
 }
 
 bool FAgentMotionController::GetControllerOrientationAndPosition(const int32 ControllerIndex, const FName MotionSource, FRotator& OutOrientation, FVector& OutPosition, bool& OutbProvidedLinearVelocity, FVector& OutLinearVelocity, bool& OutbProvidedAngularVelocity, FVector& OutAngularVelocityAsAxisAndLength, bool& OutbProvidedLinearAcceleration, FVector& OutLinearAcceleration, float WorldToMetersScale) const
@@ -124,7 +190,17 @@ ETrackingStatus FAgentMotionController::GetControllerTrackingStatus(const int32,
 {
     int32 Idx;
     bool bAim;
-    if (ResolveHand(MotionSource, Idx, bAim) && Hands[Idx].bActive && Hands[Idx].Pose.bTracked)
+    if (!ResolveHand(MotionSource, Idx, bAim)) { return ETrackingStatus::NotTracked; }
+    if (!IsInGameThread())
+    {
+        // The render thread cannot name its client and must not touch the game-thread-owned
+        // Clients map. It only ever polls a component whose game-thread poll SUCCEEDED (so that
+        // component is tracked), and its position poll above answers false, so Tracked is the
+        // truthful value to leave in CurrentTrackingStatus.
+        return ETrackingStatus::Tracked;
+    }
+    const FClientState* S = Clients.Find(PollingSlot());
+    if (S && S->Hands[Idx].bActive && S->Hands[Idx].Pose.bTracked)
     {
         return ETrackingStatus::Tracked;
     }
@@ -160,24 +236,57 @@ static FString UAPRotJson(const FRotator& R)
     return FString::Printf(TEXT("{\"pitch\":%.3f,\"yaw\":%.3f,\"roll\":%.3f}"), R.Pitch, R.Yaw, R.Roll);
 }
 
-FString FAgentMotionController::SetAimEmulationJson(bool bEnabled, const FVector& GripToAimLocation, const FRotator& GripToAimRotation)
+// One client -> its own object (already carries "client"); several -> {"ok":true,"clients":[...]}.
+static FString UAPPerClientJson(const TArray<int32>& Slots, TFunctionRef<FString(int32)> One)
+{
+    if (Slots.Num() == 1) { return One(Slots[0]); }
+    FString Joined;
+    for (int32 I = 0; I < Slots.Num(); ++I)
+    {
+        Joined += (I ? TEXT(",") : TEXT("")) + One(Slots[I]);
+    }
+    return FString::Printf(TEXT("{\"ok\":true,\"clients\":[%s]}"), *Joined);
+}
+
+static FString UAPXRRefusalJson(const FString& Error)
+{
+    FString Esc = Error.Replace(TEXT("\\"), TEXT("\\\\")).Replace(TEXT("\""), TEXT("\\\""));
+    return FString::Printf(TEXT("{\"ok\":false,\"error\":\"%s\"}"), *Esc);
+}
+
+FString FAgentMotionController::OneClientAimJson(int32 Slot, bool bEnabled, const FVector& GripToAimLocation, const FRotator& GripToAimRotation)
 {
     const bool bDefault = GripToAimLocation.IsNearlyZero() && GripToAimRotation.IsNearlyZero();
     const FTransform Delta = bDefault ? QuestGripToAim() : FTransform(GripToAimRotation, GripToAimLocation);
-    SetAimEmulation(bEnabled, Delta);
-    return FString::Printf(TEXT("{\"ok\":true,\"aim_emulation\":%s,\"delta_source\":\"%s\",\"right_grip_to_aim\":{\"loc\":%s,\"rot\":%s},\"left_grip_to_aim\":{\"loc\":%s,\"rot\":%s}}"),
+    FClientState& S = Clients.FindOrAdd(Slot);
+    S.bAimEmulation = bEnabled;
+    S.RightGripToAim = Delta;
+    const FTransform L = GripToAimFor(S, EAgentXRHand::Left);
+    return FString::Printf(TEXT("{\"ok\":true,\"client\":%d,\"aim_emulation\":%s,\"delta_source\":\"%s\",\"right_grip_to_aim\":{\"loc\":%s,\"rot\":%s},\"left_grip_to_aim\":{\"loc\":%s,\"rot\":%s}}"),
+        Slot,
         bEnabled ? TEXT("true") : TEXT("false"),
         bDefault ? TEXT("quest_default") : TEXT("caller"),
         *UAPVecJson(Delta.GetLocation()), *UAPRotJson(Delta.Rotator()),
-        *UAPVecJson(GetGripToAim(EAgentXRHand::Left).GetLocation()), *UAPRotJson(GetGripToAim(EAgentXRHand::Left).Rotator()));
+        *UAPVecJson(L.GetLocation()), *UAPRotJson(L.Rotator()));
 }
 
-FString FAgentMotionController::StateJson() const
+FString FAgentMotionController::SetAimEmulationJson(const FString& Client, bool bEnabled, const FVector& GripToAimLocation, const FRotator& GripToAimRotation)
 {
+    TArray<int32> Slots;
+    FString Error;
+    if (!ResolveSlots(Client, Slots, Error)) { return UAPXRRefusalJson(Error); }
+    return UAPPerClientJson(Slots, [&](int32 Slot) { return OneClientAimJson(Slot, bEnabled, GripToAimLocation, GripToAimRotation); });
+}
+
+FString FAgentMotionController::OneClientStateJson(int32 Slot) const
+{
+    static const FClientState Empty;
+    const FClientState* Found = Clients.Find(Slot);
+    const FClientState& State = Found ? *Found : Empty;
     FString HandsJson;
     for (int32 I = 0; I < 2; ++I)
     {
-        const FHandState& H = Hands[I];
+        const FHandState& H = State.Hands[I];
         FString Entry = FString::Printf(TEXT("\"%s\":{\"active\":%s,\"tracked\":%s,\"grip\":{\"pos\":%s,\"rot\":%s}"),
             I == 0 ? TEXT("left") : TEXT("right"),
             H.bActive ? TEXT("true") : TEXT("false"),
@@ -185,24 +294,33 @@ FString FAgentMotionController::StateJson() const
             *UAPVecJson(H.Pose.Position), *UAPRotJson(H.Pose.Orientation));
         if (H.bActive)
         {
-            // What THIS controller answers for "<Hand>Aim" right now (== grip when emulation is off).
+            // What THIS client's controller answers for "<Hand>Aim" right now (== grip when emulation is off).
             FRotator AimRot;
             FVector AimPos;
-            GetControllerOrientationAndPosition(0, I == 0 ? FName(TEXT("LeftAim")) : FName(TEXT("RightAim")), AimRot, AimPos, 100.f);
+            Query(State, I == 0 ? FName(TEXT("LeftAim")) : FName(TEXT("RightAim")), AimRot, AimPos);
             Entry += FString::Printf(TEXT(",\"aim\":{\"pos\":%s,\"rot\":%s}"), *UAPVecJson(AimPos), *UAPRotJson(AimRot));
         }
         Entry += TEXT("}");
         HandsJson += (I ? TEXT(",") : TEXT("")) + Entry;
     }
-    const FTransform R = GetGripToAim(EAgentXRHand::Right);
-    return FString::Printf(TEXT("{\"ok\":true,\"registered\":%s,\"aim_emulation\":%s,\"right_grip_to_aim\":{\"loc\":%s,\"rot\":%s},\"hands\":{%s},\"note\":\"%s\"}"),
+    const FTransform R = GripToAimFor(State, EAgentXRHand::Right);
+    return FString::Printf(TEXT("{\"ok\":true,\"client\":%d,\"registered\":%s,\"aim_emulation\":%s,\"right_grip_to_aim\":{\"loc\":%s,\"rot\":%s},\"hands\":{%s},\"note\":\"%s\"}"),
+        Slot,
         bRegistered ? TEXT("true") : TEXT("false"),
-        bAimEmulation ? TEXT("true") : TEXT("false"),
+        State.bAimEmulation ? TEXT("true") : TEXT("false"),
         *UAPVecJson(R.GetLocation()), *UAPRotJson(R.Rotator()),
         *HandsJson,
-        bAimEmulation
+        State.bAimEmulation
             ? TEXT("aim pose EMULATED: <Hand>Aim = grip_to_aim * grip")
             : TEXT("aim pose NOT emulated: <Hand>Aim == grip (a real runtime differs; Quest is pitch -60)"));
+}
+
+FString FAgentMotionController::StateJson(const FString& Client) const
+{
+    TArray<int32> Slots;
+    FString Error;
+    if (!ResolveSlots(Client, Slots, Error)) { return UAPXRRefusalJson(Error); }
+    return UAPPerClientJson(Slots, [this](int32 Slot) { return OneClientStateJson(Slot); });
 }
 
 bool FAgentMotionController::KeyContradictsHand(EAgentXRHand Hand, const FString& ButtonKeyName)
