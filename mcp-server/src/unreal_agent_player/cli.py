@@ -4492,10 +4492,12 @@ def _run_parsed(args) -> int:
     # exclusive lease or the machine lock -- a two-client test holding its own lease would
     # otherwise wait on itself, and a rebuild of the editor has nothing to do with the client.
     if cmd == "screenshot" and getattr(args, "window", None):
+        _keepalive_lease(args, project)
         return args.func(args)
     # `--instance` at a standalone -game client: same reasoning, see _standalone_instance_selected.
     if cmd in (_INSTANCE_RC_CMDS | {"exec", "exec-file"}) and _standalone_instance_selected(
             args, _INSTANCE_TARGET[0]):
+        _keepalive_lease(args, project)
         _RC_TARGET[0] = _INSTANCE_TARGET[0]
         try:
             return args.func(args)
@@ -4504,6 +4506,10 @@ def _run_parsed(args) -> int:
     # Say who is using the editor before anything can block, so a call stuck behind a lease or a
     # rebuild still appears (with its task) in `uap lease status` and the overlay. Display only.
     task = _task_label(args)
+    if cmd not in _LEASE_GUARDED:
+        # The guard chain heartbeats the caller's lease only for lease-guarded verbs; every other
+        # verb made under --agent (status, report, ...) is still the holder working. [17tm466zzn0]
+        _keepalive_lease(args, project)
     g0 = time.monotonic()
     tracked = False
     try:
@@ -4526,6 +4532,25 @@ def _run_parsed(args) -> int:
     # about the OTHER project's editor: a Project Broken Wings agent could start PIE while a
     # School's Out VR agent was mid-session, and neither lease noticed.
     return _run_under_machine_lock(args, cmd, project, tracked=tracked)
+
+
+def _keepalive_lease(args, project: str) -> None:
+    """Any uap call made under an explicit --agent / $UAP_AGENT_ID refreshes that agent's lease,
+    whatever the call targets (a standalone `--instance pid:<n>`, `screenshot --window`, a report
+    verb). Without it an agent driving only standalone clients under its own
+    `lease acquire exclusive --reason pie` lost the lease to TTL mid-run and a second agent
+    started PIE in the same hub. [17tm466zzn0] `lease` verbs manage the lease themselves, an
+    anonymous call refreshes nothing, and it never waits, raises, or touches another agent's
+    hold (coordination.keepalive)."""
+    if getattr(args, "cmd", None) == "lease":
+        return
+    who = getattr(args, "agent", None) or os.environ.get("UAP_AGENT_ID")
+    if not who:
+        return
+    try:
+        _coord.keepalive(project, agent=who)
+    except Exception:
+        pass
 
 
 def _guard_fast(args, cmd, project: str, task: str) -> dict | None:
