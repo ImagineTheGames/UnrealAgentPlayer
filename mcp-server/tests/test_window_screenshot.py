@@ -313,10 +313,16 @@ def test_relative_path_and_bad_frames_are_refused(capsys, tmp_path, stub_os):
 
 def test_window_shot_does_not_attach_to_another_agents_report(capsys, tmp_path, stub_os):
     _start(capsys, agent="someone-else")
-    rc, body = _run(capsys, ["screenshot", str(tmp_path / "o.png"), "--window", "Context_2",
-                             "--agent", "shot-agent"])
+    # A tokenless capture never drops frames into a TOKENED agent's report.
+    rc, body = _run(capsys, ["screenshot", str(tmp_path / "o.png"), "--window", "Context_2"])
     assert rc == 0 and "someone-else" in body["report"]
     assert "attached" not in body
+    # A different token has no report of its own; it must not fall through to someone else's.
+    rc, body = _run(capsys, ["screenshot", str(tmp_path / "o2.png"), "--window", "Context_2",
+                             "--agent", "shot-agent"])
+    assert rc == 0 and "attached" not in body
+    run = sess.get_active_run("someone-else")
+    assert json.loads((run / "data.json").read_text(encoding="utf-8"))["screenshots"] == []
 
 
 def test_window_shot_skips_editor_lease_and_machine_lock(capsys, tmp_path, stub_os, monkeypatch):

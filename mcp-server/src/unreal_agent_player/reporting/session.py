@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
@@ -29,8 +30,8 @@ class ReportSession:
         self.timeline: list[dict[str, Any]] = []
         self.screenshots: list[dict[str, Any]] = []
         self.logs: list[dict[str, Any]] = []
-        # Who started this report, and who (if anyone) took the machine-wide slot away from it.
-        # The slot is ONE per machine; see start_session.
+        # Who started this report, and who (if anyone) closed it by restarting under the same token.
+        # Reports are one per agent token; see start_session.
         self.agent: str | None = agent
         self.superseded_by: dict[str, Any] | None = None
         # Not persisted: what THIS start displaced, so `report start` can warn about it once.
@@ -216,8 +217,17 @@ class ReportSession:
 
 
 # --- Active session registry ---
+#
+# One open report PER AGENT TOKEN, not one per machine. Every CLI call is a fresh process, so the
+# only thing that says "which run does this call write to" is a file on disk. It used to be a
+# single `.active` pointer: a second agent's `report start` took (or queued behind) the first
+# agent's slot, and auto-capture of anyone's calls landed in whoever held it. It is now a
+# directory of claim records, `.active.d/<key>.json`, one per agent token. Reports only RECORD;
+# who owns the editor / PIE is the lease's job and is untouched here.
 
 _active: ReportSession | None = None
+
+_ANON_KEY = "anon"
 
 
 def _slug(text: str, maxlen: int = 40) -> str:
@@ -231,30 +241,74 @@ def _reports_root() -> Path:
 
 
 def _active_pointer() -> Path:
+    """The LEGACY single-slot pointer `.active`. It is no longer the source of truth (the
+    per-agent slots are); it is kept as a MIRROR of the newest open report so the in-editor
+    overlay (which reads it) and an older CLI mid-upgrade still see something sensible. Still
+    READ as a fallback, for a report an older CLI started."""
     return _reports_root() / ".active"
 
 
-def set_active_run(run_dir, agent: str | None = None) -> None:
-    """Claim the machine-wide report slot, recording WHO claimed it.
+def _slots_dir() -> Path:
+    return _reports_root() / ".active.d"
 
-    The pointer used to be a bare path, so nothing in it said whose report it was -- which is
-    why a second `report start` could take the slot from a running one and neither agent could
-    tell. It is JSON now; `get_active_run` still reads the old bare-path form.
-    """
-    p = _active_pointer()
+
+def slot_key(agent: str | None) -> str:
+    """Filesystem-safe key for an agent token; tokenless calls share the `anon` slot."""
+    a = (agent or "").strip()
+    if not a:
+        return _ANON_KEY
+    safe = re.sub(r"[^A-Za-z0-9._-]+", "_", a)[:60]
+    if safe != a:       # keep two different odd tokens from collapsing to one key
+        safe += "-" + hashlib.sha1(a.encode("utf-8")).hexdigest()[:8]
+    return "a-" + safe
+
+
+def _slot_path(agent: str | None) -> Path:
+    return _slots_dir() / f"{slot_key(agent)}.json"
+
+
+def set_active_run(run_dir, agent: str | None = None) -> None:
+    """Claim the report slot of `agent` (tokenless = the shared anonymous slot)."""
+    p = _slot_path(agent)
     p.parent.mkdir(parents=True, exist_ok=True)
-    p.write_text(json.dumps({"run_dir": str(run_dir), "agent": agent or None,
+    p.write_text(json.dumps({"run_dir": str(run_dir), "agent": (agent or "").strip() or None,
                              "pid": os.getpid(),
                              "claimed": datetime.now().isoformat(timespec="seconds")}),
                  encoding="utf-8")
+    _mirror_legacy_pointer()
 
 
-def get_active_owner() -> dict[str, Any] | None:
-    """The slot's claim record: {run_dir, agent, pid, claimed}, or None if unclaimed."""
-    p = _active_pointer()
-    if not p.exists():
+def _mirror_legacy_pointer() -> None:
+    """Point `.active` at the newest open report (or remove it when none is open)."""
+    lp = _active_pointer()
+    d = _slots_dir()
+    recs = []
+    if d.is_dir():
+        for p in d.glob("*.json"):
+            rec = _read_record(p)
+            if rec and _run_is_open(rec["run_dir"]):
+                recs.append(rec)
+    if recs:
+        newest = max(recs, key=lambda r: r.get("claimed") or "")
+        lp.write_text(json.dumps(newest), encoding="utf-8")
+    else:
+        lp.unlink(missing_ok=True)
+
+
+def _run_is_open(run_dir) -> bool:
+    """A claim whose run is finished or gone is a leftover, not an open report."""
+    try:
+        data = json.loads((Path(run_dir) / "data.json").read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return False
+    return data.get("status", "running") == "running"
+
+
+def _read_record(p: Path) -> dict[str, Any] | None:
+    try:
+        raw = p.read_text(encoding="utf-8").strip()
+    except OSError:
         return None
-    raw = p.read_text(encoding="utf-8").strip()
     if not raw:
         return None
     try:
@@ -266,25 +320,94 @@ def get_active_owner() -> dict[str, Any] | None:
     return rec
 
 
-def get_active_run() -> Path | None:
-    rec = get_active_owner()
+def list_active_slots() -> list[dict[str, Any]]:
+    """Every claim record whose run is still open, oldest claim first.
+
+    Includes the legacy `.active` pointer when it names a run no per-agent slot already covers,
+    so a checkout mid-upgrade does not read an in-flight report as absent.
+    """
+    recs: list[dict[str, Any]] = []
+    d = _slots_dir()
+    if d.is_dir():
+        for p in sorted(d.glob("*.json")):
+            rec = _read_record(p)
+            if rec and _run_is_open(rec["run_dir"]):
+                recs.append(rec)
+    lp = _active_pointer()
+    legacy = _read_record(lp) if lp.is_file() else None
+    if legacy and _run_is_open(legacy["run_dir"]) and \
+            all(str(r["run_dir"]) != str(legacy["run_dir"]) for r in recs):
+        recs.append(legacy)
+    recs.sort(key=lambda r: r.get("claimed") or "")
+    return recs
+
+
+class ReportAmbiguous(Exception):
+    """No --agent token, and more than one report is open: refuse rather than guess."""
+
+    def __init__(self, slots: list[dict[str, Any]]):
+        self.slots = slots
+        names = ", ".join(f"{(r.get('agent') or '(no token)')!r}" for r in slots)
+        super().__init__(
+            f"{len(slots)} reports are open at once (agents: {names}) and this call carries no "
+            f"--agent token, so it cannot tell which one to write to. Refusing to guess. Pass "
+            f"--agent <your-token> (or set $UAP_AGENT_ID) on every report call.")
+
+
+def get_active_owner(agent: str | None = None) -> dict[str, Any] | None:
+    """The claim record {run_dir, agent, pid, claimed} for THIS agent's open report, or None.
+
+    With a token: exactly that agent's slot. With none: the sole open report if there is one
+    (single-agent behaviour, unchanged); raises ReportAmbiguous when there are several.
+    """
+    token = (agent or "").strip()
+    slots = list_active_slots()
+    if token:
+        for r in slots:
+            if (r.get("agent") or "").strip() == token:
+                return r
+        return None
+    if len(slots) > 1:
+        raise ReportAmbiguous(slots)
+    return slots[0] if slots else None
+
+
+def get_active_run(agent: str | None = None) -> Path | None:
+    rec = get_active_owner(agent)
     return Path(rec["run_dir"]) if rec else None
 
 
-def clear_active_run() -> None:
-    p = _active_pointer()
-    if p.exists():
-        p.unlink()
+def clear_active_run(agent: str | None = None, run_dir=None) -> None:
+    """Release a slot: by run_dir when known (finish), else the agent's own, else the sole one."""
+    target = str(run_dir) if run_dir is not None else None
+    if target is None:
+        try:
+            rec = get_active_owner(agent)
+        except ReportAmbiguous:
+            return
+        target = str(rec["run_dir"]) if rec else None
+    if target is None:
+        return
+    d = _slots_dir()
+    if d.is_dir():
+        for p in d.glob("*.json"):
+            rec = _read_record(p)
+            if rec and str(rec["run_dir"]) == target:
+                p.unlink(missing_ok=True)
+    lp = _active_pointer()
+    if lp.is_file():
+        rec = _read_record(lp)
+        if rec and str(rec["run_dir"]) == target:
+            lp.unlink(missing_ok=True)
+    _mirror_legacy_pointer()
 
 
 class ReportSlotConflict(Exception):
-    """A running report is held by a DIFFERENT agent, so taking the slot would erase it.
+    """A tokenless `report start` while other agents' reports are open.
 
-    The slot is one per machine. Before this, `report start` overwrote the pointer with no
-    check: the first agent's later `report note` / `assert` / `finish` then resolved the
-    pointer to the SECOND agent's run and, once that one finished and cleared it, got a bare
-    `no active report`. Nothing announced it and the first agent's evidence was gone. Two
-    agents verifying at once collided quietly instead of loudly.
+    Per-agent slots mean two TOKENED agents never conflict. A tokenless start has no slot of its
+    own that anyone could later address unambiguously, and silently superseding someone else's
+    run is the old bug, so it is refused unless --takeover names that intent.
     """
 
     def __init__(self, holder: dict[str, Any], task: str, status: str):
@@ -292,12 +415,12 @@ class ReportSlotConflict(Exception):
         self.task = task
         self.status = status
         super().__init__(
-            f"the report slot is already held by agent {holder.get('agent')!r} "
-            f"(task {task!r}, status {status}, run_dir {holder.get('run_dir')}, claimed "
-            f"{holder.get('claimed')}). There is ONE slot per machine, so starting a report "
-            f"now would take it from that run and its later notes/asserts would be lost. "
-            f"Wait for it to finish, or -- only if you are sure it is abandoned -- pass "
-            f"--takeover, which closes it as `incomplete` and renders what it has so far."
+            f"this `report start` has no --agent token, and a report is already open for agent "
+            f"{holder.get('agent')!r} (task {task!r}, status {status}, run_dir "
+            f"{holder.get('run_dir')}, claimed {holder.get('claimed')}). Reports are one per "
+            f"--agent token, so pass --agent <your-token> and you can run alongside it. "
+            f"--takeover (tokenless start only) closes that run as `incomplete` instead -- use "
+            f"it only if you are sure it is abandoned."
         )
 
 
@@ -324,7 +447,7 @@ def _supersede(run_dir: Path, *, by_agent: str | None, by_task: str,
             return False
         old.superseded_by = {"agent": by_agent, "task": by_task,
                              "at": datetime.now().isoformat(timespec="seconds")}
-        old.add_note(f"SUPERSEDED: the machine-wide report slot was taken by a new "
+        old.add_note(f"SUPERSEDED: this agent's report slot was taken by a new "
                      f"`report start` (agent {by_agent!r}, task {by_task!r}). Everything below "
                      f"this line was never recorded against this run.")
         old.finish("incomplete", f"superseded by a new report start from agent {by_agent!r}")
@@ -376,46 +499,56 @@ def find_superseded_run(agent: str | None) -> dict[str, Any] | None:
 def start_session(*, task: str, project: str | None = None,
                   requires_screenshot: bool = True, agent: str | None = None,
                   takeover: bool = False) -> ReportSession:
-    """Claim the machine-wide report slot for a new run.
+    """Open a new report in THIS agent's slot.
 
-    Refuses when a RUNNING report is held by a different agent token, because taking the slot
-    silently is how one agent's evidence disappeared mid-session. With no token on either side
-    there is no identity to compare -- this harness has none -- so the take proceeds, but the
-    displaced run is closed as `incomplete` and rendered rather than left dangling.
+    Slots are per --agent token, so two tokened agents hold open reports at the same time and
+    never see each other's. Starting again under the SAME token closes that agent's previous
+    still-running report as `incomplete` (stamped, rendered) rather than abandoning it.
+
+    A tokenless start has no identity to compare, so it only ever replaces the anonymous slot.
+    If other agents' reports are open it is refused (ReportSlotConflict) instead of guessing;
+    `takeover=True` closes the one other open report instead.
     """
     global _active
     from unreal_agent_player.reporting.quotes import pick_quote
-    holder = get_active_owner()
-    holder_dir = str(holder["run_dir"]) if holder else None
-    # An in-process handle for a DIFFERENT run than the slot names is closed here; one for the
-    # SAME run is handed to _supersede, so the object the caller still holds is the object that
-    # gets closed. Two writers on one data.json is how the supersede stamp got erased. Only the
-    # long-lived MCP server ever has such a handle; every CLI call is a fresh process.
-    live_holder: ReportSession | None = None
-    if _active is not None and _active.status == "running":
-        if str(_active.run_dir) == holder_dir:
-            live_holder = _active
-        else:
-            _active.finish("incomplete", "superseded by a new report_start")
+    mine = (agent or "").strip()
+    slots = list_active_slots()
+    own = next((r for r in slots if (r.get("agent") or "").strip() == mine), None)
+    victims = [own] if own else []
+    if not mine:
+        others = [r for r in slots if r is not own]
+        if others:
+            if not takeover or len(others) > 1:
+                holder = others[0]
+                try:
+                    held_task = json.loads((Path(holder["run_dir"]) / "data.json")
+                                           .read_text(encoding="utf-8")).get("task", "")
+                except (OSError, json.JSONDecodeError):
+                    held_task = ""
+                raise ReportSlotConflict(holder, held_task, "running")
+            victims.extend(others)
     superseded: dict[str, Any] | None = None
-    if holder:
-        held_dir = Path(holder["run_dir"])
-        held_status, held_task = "missing", ""
+    for rec in victims:
+        held_dir = Path(rec["run_dir"])
         try:
-            data = json.loads((held_dir / "data.json").read_text(encoding="utf-8"))
-            held_status, held_task = data.get("status", "running"), data.get("task", "")
+            held_task = json.loads((held_dir / "data.json").read_text(encoding="utf-8")
+                                   ).get("task", "")
         except (OSError, json.JSONDecodeError):
-            pass
-        if held_status == "running":
-            hold_agent = (holder.get("agent") or "").strip()
-            mine = (agent or "").strip()
-            if hold_agent and mine and hold_agent != mine and not takeover:
-                raise ReportSlotConflict(holder, held_task, held_status)
-            if _supersede(held_dir, by_agent=agent, by_task=task, live=live_holder):
-                superseded = {"run_dir": str(held_dir), "task": held_task,
-                              "agent": holder.get("agent")}
+            held_task = ""
+        # An in-process handle for the SAME run is handed to _supersede, so the object the
+        # caller still holds is the object that gets closed. Two writers on one data.json is how
+        # the supersede stamp got erased. Only the long-lived MCP server has such a handle.
+        live = _active if (_active is not None and str(_active.run_dir) == str(held_dir)) else None
+        if _supersede(held_dir, by_agent=agent, by_task=task, live=live):
+            superseded = superseded or {"run_dir": str(held_dir), "task": held_task,
+                                        "agent": rec.get("agent")}
+        clear_active_run(run_dir=held_dir)
     started = datetime.now()
     run_dir = _reports_root() / f"{started:%Y%m%d-%H%M%S}__{_slug(task)}"
+    n = 1
+    while run_dir.exists():     # two agents opening the same question in the same second
+        n += 1
+        run_dir = _reports_root() / f"{started:%Y%m%d-%H%M%S}__{_slug(task)}-{n}"
     _active = ReportSession(task=task, project=project, run_dir=run_dir, agent=agent,
                             quote=pick_quote(), requires_screenshot=requires_screenshot)
     _active.displaced = superseded          # read by `report start` for its warning
