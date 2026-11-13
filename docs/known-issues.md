@@ -1439,3 +1439,20 @@ per channel was entirely fictitious; the real figure was 2.5). [ClickUp 17tm466f
   the old arity stop compiling and BlueprintCallable callers break when the asset is next compiled; the only callers
   in School's Out are `uap` itself (the CLI sends the parameter only with `--client`; RemoteControl zero-fills an
   omitted one to "", the default client). Every project needs a plugin re-sync + rebuild (`Restart-Editor.ps1`).
+
+## 44. `uap screenshot --client N` returned the HOST's view -- FIXED (17tm466zx5y)
+
+* **Symptom:** in a 2-client PIE, `uap screenshot <png> --client 1` wrote client 0's view; `--window "Client 1"`
+  was right. Found in Marble Race T6 testing.
+* **Cause:** `screenshot` never sent `Client` (`CaptureViewportWithUI` had no such parameter), and the plugin
+  captured the FIRST PIE world's game viewport, whatever was asked.
+* **Fix:** `CaptureViewportWithUI(Filename, Client)` resolves the client with `FAgentWorld::ResolveClients` and draws
+  THAT client's own game viewport. A client that does not exist or has no viewport returns false (the CLI reports
+  it); `--client all` is refused (one image); no flag keeps the first-viewport behaviour. A plugin copy without the
+  parameter is refused as skew.
+* **BREAKING (plugin):** `CaptureViewportWithUI` gained a trailing `FString Client` parameter (editor and runtime
+  subsystems). C++ callers on the old arity stop compiling and BlueprintCallable callers break when the asset is
+  next compiled; the only caller in School's Out is `uap` itself (it sends the parameter only with `--client`;
+  RemoteControl zero-fills an omitted one to "", the default). Every project needs a plugin re-sync + rebuild
+  (`Restart-Editor.ps1`).
+

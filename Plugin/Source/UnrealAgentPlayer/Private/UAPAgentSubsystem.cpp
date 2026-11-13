@@ -666,7 +666,7 @@ bool UUAPAgentSubsystem::NavigateUI(FString Direction)
     return bHandled;
 }
 
-bool UUAPAgentSubsystem::CaptureViewportWithUI(FString Filename)
+bool UUAPAgentSubsystem::CaptureViewportWithUI(FString Filename, FString Client)
 {
     UAP_ACTIVITY(TEXT("screenshot"), FPaths::GetCleanFilename(Filename));
     if (Filename.IsEmpty())
@@ -687,15 +687,49 @@ bool UUAPAgentSubsystem::CaptureViewportWithUI(FString Filename)
     // crops to just the game view (no editor chrome). TakeScreenshot composites 3D + UMG
     // + Slate (like bShowUI) and fills the bitmap synchronously, so the PNG exists on
     // return -- no next-frame polling race.
+    //
+    // With several PIE clients (PlayNumberOfClients > 1) each client owns its own game viewport.
+    // Taking the FIRST one returned the host's view for `--client 1`: a named Client now picks
+    // THAT client's viewport, and a name that matches nothing refuses rather than quietly
+    // capturing a different client.
     TSharedPtr<SViewport> ViewportWidget;
+    TArray<UWorld*> ClientWorlds;
+    FString ClientError;
+    if (!FAgentWorld::ResolveClients(Client, ClientWorlds, ClientError))
+    {
+        UE_LOG(LogUAP, Error, TEXT("CaptureViewportWithUI: %s"), *ClientError);
+        return false;
+    }
+    if (ClientWorlds.Num() > 1)
+    {
+        UE_LOG(LogUAP, Error, TEXT("CaptureViewportWithUI: Client 'all' makes no sense for a screenshot "
+                                   "(one image); name one client. Clients right now: %s."),
+               *FAgentWorld::DescribeClientsShort());
+        return false;
+    }
     if (GEngine)
     {
-        for (const FWorldContext& Ctx : GEngine->GetWorldContexts())
+        if (ClientWorlds.Num() == 1)
         {
-            if (Ctx.WorldType == EWorldType::PIE && Ctx.GameViewport)
+            const FWorldContext* Ctx = GEngine->GetWorldContextFromWorld(ClientWorlds[0]);
+            if (!Ctx || !Ctx->GameViewport || !Ctx->GameViewport->GetGameViewportWidget().IsValid())
             {
-                ViewportWidget = Ctx.GameViewport->GetGameViewportWidget();
-                if (ViewportWidget.IsValid()) { break; }
+                UE_LOG(LogUAP, Error, TEXT("CaptureViewportWithUI: client '%s' has no game viewport to "
+                                           "capture. Clients right now: %s."),
+                       *Client, *FAgentWorld::DescribeClientsShort());
+                return false;
+            }
+            ViewportWidget = Ctx->GameViewport->GetGameViewportWidget();
+        }
+        else
+        {
+            for (const FWorldContext& Ctx : GEngine->GetWorldContexts())
+            {
+                if (Ctx.WorldType == EWorldType::PIE && Ctx.GameViewport)
+                {
+                    ViewportWidget = Ctx.GameViewport->GetGameViewportWidget();
+                    if (ViewportWidget.IsValid()) { break; }
+                }
             }
         }
     }
@@ -718,6 +752,13 @@ bool UUAPAgentSubsystem::CaptureViewportWithUI(FString Filename)
             }
         }
         // Fall through to the legacy path on any failure above.
+    }
+
+    if (ClientWorlds.Num() == 1)
+    {
+        // A named client must never be answered with some other view (the level viewport).
+        UE_LOG(LogUAP, Error, TEXT("CaptureViewportWithUI: could not read back client '%s' viewport."), *Client);
+        return false;
     }
 
     // No live PIE game viewport -- an idle editor showing only the level view. This used to

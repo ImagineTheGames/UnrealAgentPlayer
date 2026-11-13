@@ -440,7 +440,7 @@ Everything it was for is done in-engine instead:
 
 ## Multi-client PIE (`--client`)
 
-With `PlayNumberOfClients > 1` the editor runs several game worlds in one process. Every input / hold / release / click / read-ui verb takes `--client <N|all>` (or `$UAP_CLIENT`): the PIE instance index, or every client. `uap input clients` lists them (index, net mode, window title, pawn). Without `--client` the first game world is used, as before. A hold belongs to the client it started on (the same key held on two clients is two holds). An older plugin copy that lacks the parameter is refused (it would silently drive client 0), never ignored.
+With `PlayNumberOfClients > 1` the editor runs several game worlds in one process. Every input / hold / release / click / read-ui verb takes `--client <N|all>` (or `$UAP_CLIENT`): the PIE instance index, or every client. `uap input clients` lists them (index, net mode, window title, pawn). Without `--client` the first game world is used, as before. **`screenshot --client N` captures that client's own game viewport** [17tm466zx5y] (`CaptureViewportWithUI` has a `Client` parameter; it used to always return the first client's, the host's, view). A client that does not exist, or `--client all`, is refused; no flag = first PIE viewport as before. A hold belongs to the client it started on (the same key held on two clients is two holds). An older plugin copy that lacks the parameter is refused (it would silently drive client 0), never ignored.
 
 ---
 

@@ -539,6 +539,9 @@ _CLIENT_VERBS = frozenset({
     # The injected XR hands are per client too [17tm466zwx5]: a pose with no --client reaches client 0
     # ONLY (it used to reach every PIE player).
     "InjectXRControllerPose", "ClearXRControllerOverride", "SetXRAimEmulation", "GetXRControllerState",
+    # `screenshot --client N` captures THAT client's own game viewport; it used to always return
+    # the first client's (the host's) view [17tm466zx5y].
+    "CaptureViewportWithUI",
 })
 
 
@@ -2645,8 +2648,19 @@ def _screenshot(args) -> int:
         if level:
             body = _screenshot_level_viewport(args, args.file)
         else:
-            _rc_require("CaptureViewportWithUI", {"Filename": args.file}, args.project,
-                        "capturing the viewport WITH its UMG/Slate UI")
+            if _client_tag() == "all":
+                raise AgentError(ErrorCode.SCHEMA_VALIDATION,
+                                 "--client all makes no sense for a screenshot: it is one image. "
+                                 "Name one client (--client 0 / 1; `uap input clients` lists them).")
+            sent = _rc_require("CaptureViewportWithUI", {"Filename": args.file}, args.project,
+                               "capturing the viewport WITH its UMG/Slate UI")
+            if _client_tag() and sent is False:
+                # The plugin refuses a client that does not exist (or has no viewport) rather
+                # than hand back another client's view; its log line names the clients.
+                raise AgentError(ErrorCode.SCHEMA_VALIDATION,
+                                 f"the plugin refused to capture client {_client_tag()!r} (no such "
+                                 f"PIE client, or it has no game viewport). `uap input clients` "
+                                 f"lists the clients; the editor log names the reason.")
             deadline = time.monotonic() + 8.0
             while time.monotonic() < deadline and not os.path.exists(args.file):
                 time.sleep(0.25)
@@ -3041,7 +3055,7 @@ every call. --task / $UAP_TASK is a short label of what you are doing; the overl
   DRIVING A SECOND CLIENT, IN-ENGINE (never through the OS -- real OS input and window focus are
   BANNED: they steal the human's mouse and keyboard):
     * several PIE clients in ONE process (PlayNumberOfClients > 1): `--client N|all` on input / xr /
-      click / read-ui / rc. `uap input clients` lists them. A hold belongs to the client it started on.
+      click / read-ui / rc, and `--client N` on screenshot (that client's own viewport). `uap input clients` lists them. A hold belongs to the client it started on.
     * a `-game` standalone client (launch_2p_standalone.ps1 starts each with -UAPRCPort=<n>):
       `--instance Context_2` (or pid:<n>) sends input / click / read-ui / rc to THAT process's own RC
       port. A client started without -UAPRCPort is refused with the fix, not driven another way.
@@ -3434,7 +3448,8 @@ def build_parser() -> argparse.ArgumentParser:
     proj.add_argument("--client", default=os.environ.get("UAP_CLIENT") or None, metavar="N|all",
                       help="which PIE client the input / click / read-ui verbs act on: its PIE "
                            "instance index (0, 1, ...; `uap input clients` lists them) or 'all'. "
-                           "Default $UAP_CLIENT, else the first game world (unchanged).")
+                           "Default $UAP_CLIENT, else the first game world (unchanged). "
+                           "`screenshot --client N` captures that client's own viewport.")
     # Output mode + harness-safe waiting, accepted by every verb like the flags above.
     proj.add_argument("--brief", action="store_true", default=False,
                       help="compact output (also $UAP_OUTPUT=brief). Opt-in; default unchanged.")
