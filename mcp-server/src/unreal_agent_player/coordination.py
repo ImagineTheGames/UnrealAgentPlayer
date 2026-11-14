@@ -905,6 +905,18 @@ def _evict_dead_editor(state: dict, project: str | None) -> dict | None:
     return rec
 
 
+# The rebuild broker's restart (rebuild_broker.py) takes its lease as `rebuild-<pid>` with this
+# `requested_by`. One broker restart serves EVERY pending rebuild request, so it goes to the head of
+# the waiter queue whether the editor is up or down -- behind the CURRENT holder only (a running
+# PIE is never preempted), not behind every queued verifier.
+BROKER_AGENT = "rebuild-broker"
+
+
+def _is_broker_waiter(w: dict) -> bool:
+    return (_is_rebuild_reason(w.get("reason"))
+            and str(w.get("requested_by") or "") == BROKER_AGENT)
+
+
 def _rebuild_first(state: dict, project: str | None) -> None:
     """With the editor down, move queued `rebuild*` requests ahead of pie/level (and other) waiters.
 
@@ -912,8 +924,15 @@ def _rebuild_first(state: dict, project: str | None) -> None:
     down, a rebuild is the only thing that can end the outage and every other waiter needs the
     editor back first, so letting an earlier pie waiter go ahead would just hand it a corpse.
     Stable within each group. Only acts on a positive "editor not running".
+
+    The rebuild broker's restart (`_is_broker_waiter`) goes first ALWAYS, editor up or down: it is
+    the one restart every pending code change is waiting for. It still waits for the holder.
     """
     q = state.get("waiters", [])
+    broker = [w for w in q if _is_broker_waiter(w)]
+    if broker and any(a is not b for a, b in zip(q, broker)):
+        q = broker + [w for w in q if not _is_broker_waiter(w)]
+        state["waiters"] = q
     first = [w for w in q if _is_rebuild_reason(w.get("reason"))]
     if not first or len(first) == len(q):
         return

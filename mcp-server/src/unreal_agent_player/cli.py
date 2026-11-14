@@ -3190,7 +3190,16 @@ PLAY-IN-EDITOR
   PBW aircraft flew unattended into a building on 2026-08-28.
 
 MULTI-AGENT COORDINATION (several agents sharing one editor; see docs/agent-coordination.md)
-  Rebuild ONLY via Restart-Editor.ps1 -- it self-locks; never bounce the editor by hand.
+  NEVER run the restart script (Restart-Editor.ps1) yourself, never bounce the editor by hand.
+  Ask the REBUILD BROKER: one restart serves every pending request (fires ~4 min after the first,
+  at once if the editor is down; waits for the current lease holder, never preempts PIE).
+  uap rebuild request --agent <tok> --task "<ticket> <title>" [--reason "..."]   returns at once
+  uap rebuild wait --agent <tok> [--seconds 110]   blocks until a rebuild that STARTED AFTER your
+                                            request finished: ok, or failed + `note` (file, line,
+                                            owning CL; editor_up:true = the compile preflight
+                                            stopped it and nobody lost the editor).
+                                            still_waiting = call again, nothing is lost.
+  uap rebuild status                        pending requests, runner, last runs
   Editor-touching verbs auto-wait through another agent's rebuild (block then resume, not fail).
   uap lease status                          who holds the editor + why (and their --task)
   --task "<what you are doing>" / $UAP_TASK   human label shown beside your --agent token in the
@@ -3488,8 +3497,8 @@ RULES THAT BITE
   * Run via this project's uap.ps1 (pins the editor). Pass the SAME --agent <tok> on every call.
   * Done = `uap report finish` wrote the HTML report (cite its path), with a screenshot taken
     by `uap screenshot <abs.png>` from THIS editor. Assert on state you read, not on pixels.
-  * One shared editor: rebuild ONLY via Restart-Editor.ps1. Editor verbs auto-wait through
-    another agent's rebuild or exclusive lease -- slow is not failed.
+  * Never restart the editor yourself: `uap rebuild request` + `wait`. Editor verbs
+    auto-wait through another agent's rebuild or exclusive lease -- slow is not failed.
   * <= 5 fps means the editor is NOT FOREGROUND (throttled); timings taken then are void.
   * Never tight-loop exec/rc while PIE is starting: it can hard-crash the editor.
 
@@ -3507,6 +3516,7 @@ VERBS (uap help <verb>)
   report start|assert|note|screenshot|diag|finish     the verification record
   pie start|stop|wait            play-in-editor; start blocks until the world is live
   lease acquire|wait|release|status|heartbeat|machine-status|machine-release
+  rebuild request|wait|status    one shared editor restart
   exec "<py>" | exec-file <p>    Python in the editor (read state; never drive RPCs from it)
                                   --client N runs it against client N's PIE world (UAP_WORLD, UAP_CLIENT;
                                   get_game_world() too); a missing client is REFUSED, never the host
@@ -3555,6 +3565,7 @@ _HELP_SECTIONS = {
     "pie": ("PLAY-IN-EDITOR",),
     "lease": ("MULTI-AGENT COORDINATION", "TWO PROJECTS", "NEW:"),
     "coordination": ("MULTI-AGENT COORDINATION", "NEW:"),
+    "rebuild": ("MULTI-AGENT COORDINATION",),
     "machine": ("TWO PROJECTS",),
     "rc": ("DRIVE + OBSERVE",), "exec": ("DRIVE + OBSERVE",),
     "exec-file": ("DRIVE + OBSERVE",), "read-ui": ("DRIVE + OBSERVE",),
@@ -3801,6 +3812,32 @@ def _lease_inner(args) -> int:
         res["machine"] = _coord.machine_status()
     _emit(res)
     return 0 if res.get("ok", True) else 1
+
+
+def _rebuild(args) -> int:
+    """Rebuild broker verbs. See rebuild_broker.py."""
+    from unreal_agent_player import rebuild_broker as _rb
+
+    proj = getattr(args, "project", "") or _env_project()
+    agent = getattr(args, "agent", None) or os.environ.get("UAP_AGENT_ID") or ""
+    cmd = args.rebuild_cmd
+    try:
+        if cmd == "request":
+            res = _rb.request(proj, agent=agent, task=_task_label(args, args.reason),
+                              reason=args.reason)
+        elif cmd == "wait":
+            mb = _max_block(args)
+            secs = args.seconds if args.seconds is not None else (mb if mb is not None else 110.0)
+            res = _rb.wait(proj, agent=agent, seconds=secs)
+        elif cmd == "status":
+            res = _rb.status(proj)
+        else:
+            res = _rb.serve(proj, window=args.window)
+    except _coord.CoordinationError as exc:
+        res = {"ok": False, "coordination_unsafe": True, "cmd": f"rebuild {cmd}",
+               "error": str(exc)}
+    _emit(res)
+    return 0 if res.get("ok") else 1
 
 
 def _lease_takes_machine(mode: str, reason: str) -> bool:
@@ -4345,6 +4382,30 @@ def build_parser() -> argparse.ArgumentParser:
                           "releasing and has not aged out yet -- check `lease machine-status` "
                           "first, because the other project may simply still be playing.")
     lzm.set_defaults(func=_lease)
+
+    # Rebuild broker: agents ask for a restart instead of running the project's restart script;
+    # ONE coalesced restart serves every pending request. See rebuild_broker.py.
+    rbp = sub.add_parser("rebuild", help="request / wait for a coalesced editor rebuild (one "
+                                         "restart serves every pending request)")
+    rbs = rbp.add_subparsers(dest="rebuild_cmd", required=True)
+    rbq = rbs.add_parser("request", parents=[proj],
+                         help="file a rebuild request and return at once (starts the runner)")
+    rbq.add_argument("--reason", default="", help="why (e.g. 'header change in SOMelee.h')")
+    rbq.set_defaults(func=_rebuild)
+    rbw = rbs.add_parser("wait", parents=[proj],
+                         help="block until a rebuild that started AFTER your latest request "
+                              "finished; returns ok / failed + the failure note")
+    rbw.add_argument("--seconds", "--wait", dest="seconds", type=float, default=None,
+                     help="max seconds to block this call (default --max-block, $UAP_MAX_BLOCK, "
+                          "else 110). still_waiting = call again; nothing is lost.")
+    rbw.set_defaults(func=_rebuild)
+    rbs.add_parser("status", parents=[proj],
+                   help="pending requests, the runner, the last runs").set_defaults(func=_rebuild)
+    rbv = rbs.add_parser("serve", parents=[proj],
+                         help="(internal) the coalescing runner; `rebuild request` starts it")
+    rbv.add_argument("--window", type=float, default=None,
+                     help="batching window seconds (default $UAP_REBUILD_WINDOW or 240)")
+    rbv.set_defaults(func=_rebuild)
 
     tm = sub.add_parser("timing", help="per-call timing log: summaries per agent")
     tms = tm.add_subparsers(dest="timing_cmd", required=True)
