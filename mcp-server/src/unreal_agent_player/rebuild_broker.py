@@ -316,6 +316,24 @@ def _creationflags(breakaway: bool) -> int:
     return f | _CREATE_BREAKAWAY_FROM_JOB if breakaway else f
 
 
+# The runner is spawned from whichever agent's `rebuild request` found no runner, so it inherits
+# THAT agent's shell. Two settings the agent docs recommend for an agent's own calls break the
+# restart's (2026-11-15, ClickUp 17tm46749ve):
+#   * $UAP_MAX_BLOCK made the restart's `lease acquire --wait 3600` return after 110 s, parked,
+#     so Restart-Editor gave up (exit 2) instead of waiting at the head of the queue;
+#   * $UAP_OUTPUT=brief drops `granted` and turns `holder` into a bare name, so Restart-Editor
+#     read its own successful preflight -> rebuild promotion as a failure.
+_RESTART_ENV_DROP = ("UAP_MAX_BLOCK", "UAP_OUTPUT")
+
+
+def restart_env() -> dict:
+    """The environment the restart command runs with: the runner's own, minus the requesting
+    agent's per-call preferences, plus the broker token (-> `requested_by` on its lease)."""
+    env = {k: v for k, v in os.environ.items() if k.upper() not in _RESTART_ENV_DROP}
+    env["UAP_AGENT_ID"] = BROKER_AGENT
+    return env
+
+
 def run_command(cmd, env: dict, log_path: pathlib.Path, heartbeat) -> int:
     """Run one restart, output to `log_path`, calling `heartbeat()` every few seconds.
     Replaced by tests (the mocked runner)."""
@@ -626,8 +644,7 @@ def serve(project: str | None, *, window: float | None = None, retry: float | No
             if cmd is None:
                 code, extra_err = -1, err
             else:
-                env = dict(os.environ)
-                env["UAP_AGENT_ID"] = BROKER_AGENT
+                env = restart_env()
                 tasks = [q.get("task") or q.get("agent") for q in pend]
                 env["UAP_TASK"] = _coord.sanitize_label(
                     f"rebuild broker: {len(batch)} request(s): " + ", ".join(tasks))

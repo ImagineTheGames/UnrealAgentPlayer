@@ -331,6 +331,80 @@ def test_ordinary_relaunch_keeps_fifo_while_the_editor_is_up():
     assert b["granted"] is False                           # not the broker: no queue jump
 
 
+# --- 2026-11-15: the broker never got the editor under a PIE queue (ClickUp 17tm46749ve) -------
+# The runner inherited the requesting agent's shell: $UAP_MAX_BLOCK=110 and $UAP_OUTPUT=brief,
+# both recommended by the agent docs. Restart-Editor's preflight acquire then returned after 110s
+# (parked) instead of waiting -LeaseWaitSeconds, and every retry ran under a NEW token
+# (rebuild-<pid>) whose dead predecessor still sat parked at the head of the queue.
+
+def test_restart_runs_without_the_callers_brief_output_or_max_block(proj_root, spawns, clock,
+                                                                     monkeypatch):
+    monkeypatch.setenv("UAP_MAX_BLOCK", "110")
+    monkeypatch.setenv("UAP_OUTPUT", "brief")
+    rb.request(P, agent="a1", task="one")
+    fake = FakeRestart(clock)
+    assert rb.serve(P, run=fake)["ok"] is True
+    env = fake.calls[0]["env"]
+    # A max-block makes the restart's lease wait return in seconds instead of holding its place;
+    # brief output drops the "granted" / holder-object keys the restart script parses.
+    assert "UAP_MAX_BLOCK" not in env
+    assert "UAP_OUTPUT" not in env
+    assert env["UAP_AGENT_ID"] == coord.BROKER_AGENT
+
+
+def _dead(monkeypatch, *pids):
+    real = coord._pid_alive
+    monkeypatch.setattr(coord, "_pid_alive", lambda pid: False if int(pid or 0) in pids
+                        else real(pid))
+
+
+def test_dead_restart_attempt_does_not_block_the_next_one(monkeypatch):
+    """Exactly the 01:18-01:27 runs: a parked broker waiter whose Restart-Editor has exited kept
+    the head of the queue for its whole park, so the NEXT attempt (new token) sat behind it, gave
+    up, and left its own corpse at the head for the attempt after that."""
+    proj = "LivelockProj"
+    assert coord.acquire(proj, "exclusive", reason="pie", agent="holder", wait=0)["granted"]
+    v = coord.acquire(proj, "exclusive", reason="pie", agent="verifier", wait=900, max_block=0)
+    assert v["still_waiting"] is True
+    first = coord.acquire(proj, "exclusive", reason="relaunch-preflight", agent="rebuild-111",
+                          pid=111, requested_by=coord.BROKER_AGENT, wait=3600, max_block=0)
+    assert first["still_waiting"] is True and first["queue_position"] == 1
+    _dead(monkeypatch, 111)                    # that Restart-Editor run exited (exit 2)
+    coord.release(proj, agent="holder")
+    nxt = coord.acquire(proj, "exclusive", reason="relaunch-preflight", agent="rebuild-222",
+                        requested_by=coord.BROKER_AGENT, wait=0)
+    assert nxt["granted"] is True, nxt          # ahead of the PIE waiter, never behind a corpse
+    st = coord.status(proj)
+    assert st["exclusive"]["agent"] == "rebuild-222"
+    assert st["queue"] == ["verifier"]
+    assert "rebuild-111" not in (st.get("lost_waiters") or {})   # nobody can resume a dead pid
+
+
+def test_pie_waiter_is_not_blocked_by_a_dead_parked_restart(monkeypatch):
+    proj = "CorpseProj"
+    assert coord.acquire(proj, "exclusive", reason="pie", agent="holder", wait=0)["granted"]
+    coord.acquire(proj, "exclusive", reason="relaunch-preflight", agent="rebuild-333", pid=333,
+                  requested_by=coord.BROKER_AGENT, wait=3600, max_block=0)
+    coord.acquire(proj, "exclusive", reason="pie", agent="verifier", wait=900, max_block=0)
+    _dead(monkeypatch, 333)
+    coord.release(proj, agent="holder")
+    w = coord.wait_turn(proj, agent="verifier", seconds=0)
+    assert w["granted"] is True, w
+
+
+def test_live_parked_restart_keeps_its_place(monkeypatch):
+    """The other side of the rule: a parked restart whose process is ALIVE still goes first."""
+    proj = "LiveParkProj"
+    assert coord.acquire(proj, "exclusive", reason="pie", agent="holder", wait=0)["granted"]
+    coord.acquire(proj, "exclusive", reason="pie", agent="verifier", wait=900, max_block=0)
+    coord.acquire(proj, "exclusive", reason="relaunch-preflight", agent="rebuild-444",
+                  pid=os.getpid(), requested_by=coord.BROKER_AGENT, wait=3600, max_block=0)
+    coord.release(proj, agent="holder")
+    w = coord.wait_turn(proj, agent="verifier", seconds=0)
+    assert w["granted"] is False
+    assert coord.status(proj)["queue"][0] == "rebuild-444"
+
+
 # --- CLI ---------------------------------------------------------------------------------------
 
 def test_cli_request_wait_status(proj_root, spawns, capsys, clock):
