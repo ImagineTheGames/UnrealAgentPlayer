@@ -158,10 +158,20 @@ namespace
             OutPackage = Hits[0];
         }
 
-        FText Reason;
-        if (!FPackageName::IsValidLongPackageName(OutPackage, /*bIncludeReadOnlyRoots=*/true, &Reason))
+        // Validate BEFORE mounting only what does not depend on the mount table: the path must
+        // be /Root/... with no invalid characters. IsValidLongPackageName also requires the root
+        // to be mounted, so it runs AFTER the Dream-plugin mount below (a fresh editor has not
+        // mounted /<Dream>/ until a PIE session did).
+        FString Root, Rest;
+        if (!OutPackage.StartsWith(TEXT("/")) || !OutPackage.RightChop(1).Split(TEXT("/"), &Root, &Rest) || Root.IsEmpty())
         {
-            OutError = FString::Printf(TEXT("'%s' is not a valid package path: %s"), *OutPackage, *Reason.ToString());
+            OutError = FString::Printf(TEXT("'%s' is not a valid package path: expected /<MountRoot>/<Path>"), *OutPackage);
+            return false;
+        }
+        FText InvalidChars;
+        if (FPackageName::DoesPackageNameContainInvalidCharacters(OutPackage, &InvalidChars))
+        {
+            OutError = FString::Printf(TEXT("'%s' is not a valid package path: %s"), *OutPackage, *InvalidChars.ToString());
             return false;
         }
 
@@ -169,12 +179,10 @@ namespace
         if (!FPackageName::TryConvertLongPackageNameToFilename(OutPackage, Converted, FPackageName::GetMapPackageExtension()))
         {
             // The root is not mounted. Handle the Dream-plugin case rather than failing.
-            FString Root, Rest;
-            OutPackage.RightChop(1).Split(TEXT("/"), &Root, &Rest);
             FString MountError;
-            if (Root.IsEmpty() || !UAPLevelMountContentPlugin(Root, MountError))
+            if (!UAPLevelMountContentPlugin(Root, MountError))
             {
-                OutError = MountError.IsEmpty() ? FString::Printf(TEXT("'%s' has no mount root"), *OutPackage) : MountError;
+                OutError = MountError;
                 return false;
             }
             OutMountedPlugin = Root;
@@ -183,6 +191,13 @@ namespace
                 OutError = FString::Printf(TEXT("plugin '%s' mounted but '%s' still does not resolve to a file"), *Root, *OutPackage);
                 return false;
             }
+        }
+
+        FText Reason;
+        if (!FPackageName::IsValidLongPackageName(OutPackage, /*bIncludeReadOnlyRoots=*/true, &Reason))
+        {
+            OutError = FString::Printf(TEXT("'%s' is not a valid package path: %s"), *OutPackage, *Reason.ToString());
+            return false;
         }
 
         if (!IFileManager::Get().FileExists(*Converted))
