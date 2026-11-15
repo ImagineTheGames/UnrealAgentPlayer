@@ -1031,7 +1031,24 @@ def _own_record(state: dict, mode: str, agent: str) -> dict | None:
     return None
 
 
+def _lease_pid_dead(w: dict) -> bool:
+    """Is the process this waiter's lease would be anchored to (`--pid`) gone?
+
+    Only an explicit anchor counts (0 = TTL-only, the default for a cross-call hold). A grant to a
+    dead anchor would be evicted by the very next `_evict_stale`, so nobody can ever use it.
+    """
+    lp = int(w.get("lease_pid", 0) or 0)
+    return bool(lp) and not _pid_alive(lp)
+
+
 def _waiter_alive(w: dict) -> bool:
+    # A parked waiter whose anchor process has exited is dead, park or not. 2026-11-15: every
+    # Restart-Editor attempt (`--pid $PID`, a new `rebuild-<pid>` token each run) parked at the
+    # head of the queue and exited; its corpse kept the head for the whole park, the next attempt
+    # queued behind it and parked in turn, and the free editor was granted to nobody for 30
+    # minutes -- neither the broker nor the PIE waiters (ClickUp 17tm46749ve).
+    if _lease_pid_dead(w):
+        return False
     # A parked waiter (see _park_ttl) has no process behind it between calls; its park is its
     # liveness until it expires.
     if _now() < float(w.get("parked_until", 0) or 0):
@@ -1047,9 +1064,10 @@ def _evict_stale_waiters(state: dict) -> dict:
     for w in state.get("waiters", []):
         if _waiter_alive(w):
             keep.append(w)
-        elif w.get("parked_until"):
+        elif w.get("parked_until") and not _lease_pid_dead(w):
             # Remember what a PARKED waiter was asking for, so its next `lease wait` can say it
-            # lost its place (and re-queue it) instead of answering a bare "not queued".
+            # lost its place (and re-queue it) instead of answering a bare "not queued". Not one
+            # whose anchor process is gone: there is nobody left to resume it.
             lost[str(w.get("agent"))] = {k: w.get(k) for k in
                                          ("mode", "reason", "task", "requested_by",
                                           "lease_pid", "lease_ttl", "give_up_at")}
