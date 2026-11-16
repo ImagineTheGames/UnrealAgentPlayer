@@ -1,6 +1,7 @@
 #include "AgentLogCapture.h"
 
 #include "HAL/PlatformTime.h"
+#include "Misc/OutputDeviceRedirector.h"
 
 FAgentLogCapture::FAgentLogCapture(int32 InCapacity)
     : Capacity(FMath::Max(256, InCapacity))
@@ -8,7 +9,17 @@ FAgentLogCapture::FAgentLogCapture(int32 InCapacity)
     Buffer.SetNum(Capacity);
 }
 
-FAgentLogCapture::~FAgentLogCapture() = default;
+FAgentLogCapture::~FAgentLogCapture()
+{
+    // Whoever owns this device may free it without having run its shutdown (a -game client's hand-made
+    // subsystem is destroyed at engine exit, after which nothing calls ShutdownRuntime). The log thread
+    // would then call Serialize on a dead object: "Pure virtual function being called". Removing is
+    // idempotent and takes the redirector write lock, so no flush is mid-call into this device afterwards.
+    if (GLog)
+    {
+        GLog->RemoveOutputDevice(this);
+    }
+}
 
 void FAgentLogCapture::Serialize(const TCHAR* V, ELogVerbosity::Type Verbosity, const FName& Category)
 {
