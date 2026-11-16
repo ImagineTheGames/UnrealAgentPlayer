@@ -17,6 +17,10 @@ _NET_EMULATION_RE = re.compile(
 NET_EMULATION_REFUSAL = ("refused: net emulation needs a live PIE world (crashes editor otherwise). "
                          "Start PIE first; the command was NOT run.")
 
+# Same commands anywhere inside a blob of Python (`execute_console_command("NetEmulation.Off")`).
+NET_EMULATION_SCAN_RE = re.compile(
+    r"\b(netemulation\.\w+|net\s+pkt\w+|pkt(lag|loss|dup|order)\w*)", re.IGNORECASE)
+
 
 def is_net_emulation_command(command: str) -> bool:
     return bool(_NET_EMULATION_RE.match(command or ""))

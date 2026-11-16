@@ -1019,6 +1019,12 @@ def _rc(args) -> int:
                 f"{', '.join(f'{k}: {v}' for k, v in types.items()) or '(none)'}.")})
             return 2
 
+    if func == "ExecuteConsoleCommand":
+        net = _net_emulation_refusal(str(params.get("Command", "")), args.project, scan=False)
+        if net:
+            _emit({"ok": False, "error": net})
+            return 1
+
     t0 = time.monotonic()
     body: dict = {"ok": True}
     twin = _RC_JSON_TWINS.get(func) if not params else None
@@ -1057,6 +1063,12 @@ def _exec(args) -> int:
         refusal = None
     if refusal:
         body = {"ok": False, "error": refusal}
+        _capture("exec", {"code": code[:200]}, body, int((time.monotonic() - t0) * 1000))
+        _emit(body)
+        return 1
+    net = _net_emulation_refusal(code, args.project, scan=True)
+    if net:
+        body = {"ok": False, "error": net}
         _capture("exec", {"code": code[:200]}, body, int((time.monotonic() - t0) * 1000))
         _emit(body)
         return 1
@@ -2988,6 +3000,22 @@ def _exec_level_load_refusal(code: str) -> str | None:
             "instead -- it loads outside Python, refuses during PIE and on a dirty map, and reads "
             "the result back. Override only on a throwaway editor with --unsafe-level-load. "
             "The script was NOT run.")
+
+
+def _net_emulation_refusal(text: str, project: str | None, *, scan: bool) -> str | None:
+    """Refusal for a net-emulation console command (NetEmulation.Off, PktLag ...) sent while no
+    PIE/game world is live: the engine asserts in HandleInvalidWorldContext and the SHARED editor
+    dies (2026-11-15). `scan` searches inside Python text; otherwise `text` is the command."""
+    from unreal_agent_player.tools import console as _console
+    rx = _console.NET_EMULATION_SCAN_RE if scan else _console._NET_EMULATION_RE
+    if not rx.search(text or ""):
+        return None
+    try:
+        if _rc_call("IsInPIE", {}, project):
+            return None
+    except (AgentError, json.JSONDecodeError):
+        return None  # editor unreachable: nothing to crash, the real call will report that
+    return _console.NET_EMULATION_REFUSAL
 
 
 _LEVEL_OPEN_TIMEOUT = 180.0
