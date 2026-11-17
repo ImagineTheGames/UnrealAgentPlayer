@@ -1491,6 +1491,26 @@ def release(project: str | None, *, agent: str | None = None) -> dict:
     return res
 
 
+def is_waiter_only(project: str | None, *, agent: str) -> bool:
+    """Is `agent` queued as a waiter and NOT a holder (exclusive or shared)? (Read-only.)
+
+    Waiter expiry, for reference: an unparked waiter ages out in _WAITER_TTL (15 s) once it stops
+    polling; a parked one in _park_ttl() (180 s, UAP_WAITER_PARK_TTL); a dead `--pid` anchor drops
+    either at once. To drop one NOW, `uap lease release --agent <tok>` (allowed during any PIE).
+    """
+    _acquire_filelock(project)
+    try:
+        state = _evict_stale(_load(project))
+    finally:
+        _release_filelock(project)
+    ex = state.get("exclusive")
+    if ex and ex.get("agent") == agent:
+        return False
+    if any(h.get("agent") == agent for h in state.get("shared", [])):
+        return False
+    return any(w.get("agent") == agent for w in state.get("waiters", []))
+
+
 def holds_exclusive(project: str | None, *, agent: str) -> bool:
     """Does `agent` hold `project`'s exclusive lease right now? (Read-only.)"""
     _acquire_filelock(project)
