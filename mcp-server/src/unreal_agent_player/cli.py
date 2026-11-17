@@ -1066,7 +1066,9 @@ def _exec(args) -> int:
         _capture("exec", {"code": code[:200]}, body, int((time.monotonic() - t0) * 1000))
         _emit(body)
         return 1
-    net = _net_emulation_refusal(code, args.project, scan=True)
+    from unreal_agent_player.tools import console as _console
+    net = _console.NONE_WORLD_REFUSAL if _console.none_world_console_call(code) else None
+    net = net or _net_emulation_refusal(code, args.project, scan=True)
     if net:
         body = {"ok": False, "error": net}
         _capture("exec", {"code": code[:200]}, body, int((time.monotonic() - t0) * 1000))
@@ -3007,7 +3009,7 @@ def _net_emulation_refusal(text: str, project: str | None, *, scan: bool) -> str
     PIE/game world is live: the engine asserts in HandleInvalidWorldContext and the SHARED editor
     dies (2026-11-15). `scan` searches inside Python text; otherwise `text` is the command."""
     from unreal_agent_player.tools import console as _console
-    rx = _console.NET_EMULATION_SCAN_RE if scan else _console._NET_EMULATION_RE
+    rx = _console.NET_EMULATION_SCAN_RE if scan else _console._WORLD_COMMAND_RE
     if not rx.search(text or ""):
         return None
     try:
@@ -3015,7 +3017,7 @@ def _net_emulation_refusal(text: str, project: str | None, *, scan: bool) -> str
             return None
     except (AgentError, json.JSONDecodeError):
         return None  # editor unreachable: nothing to crash, the real call will report that
-    return _console.NET_EMULATION_REFUSAL
+    return _console.NET_EMULATION_REFUSAL if scan else _console.WORLD_COMMAND_REFUSAL
 
 
 _LEVEL_OPEN_TIMEOUT = 180.0

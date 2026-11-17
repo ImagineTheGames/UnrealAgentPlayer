@@ -45,3 +45,12 @@ async def test_net_emulation_allowed_with_pie(httpx_mock: HTTPXMock):
     result = await exec_console(rc=rc, py_exec=None, command="NetEmulation.Off")
     assert result["ok"] is True
     await rc.aclose()
+
+
+@pytest.mark.asyncio
+async def test_open_refused_without_pie(httpx_mock: HTTPXMock):
+    _phase(httpx_mock, "NotPlaying")
+    rc = RemoteControlClient()
+    result = await exec_console(rc=rc, py_exec=None, command="open /Game/Maps/X")
+    assert result["ok"] is False and "live PIE world" in result["error"]
+    await rc.aclose()
