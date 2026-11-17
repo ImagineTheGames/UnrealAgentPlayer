@@ -233,3 +233,25 @@ def test_release_is_fail_open_when_the_editor_cannot_be_reached(tmp_path, monkey
                  "--project", "demo", "--wait", "0"]) == 0
     assert main(["lease", "release", "--agent", "A", "--project", "demo"]) == 0
     assert co._load("demo")["exclusive"] is None
+
+
+def test_waiter_release_succeeds_while_holders_pie_is_live(tmp_path, monkeypatch, capsys):
+    """A queued waiter owns no PIE; its release must drop the queue slot, not hit the holder's PIE."""
+    monkeypatch.setenv("UAP_REPORTS_DIR", str(tmp_path))
+    monkeypatch.delenv("UAP_AGENT_ID", raising=False)
+    _rc_table(monkeypatch, {"IsPIEInProgress": True})
+    assert main(["lease", "acquire", "exclusive", "--reason", "pie", "--agent", "A",
+                 "--project", "demo", "--wait", "0"]) == 0
+    # B joins the queue behind A (non-blocking acquire leaves it queued as a parked waiter).
+    main(["lease", "acquire", "exclusive", "--agent", "cl-harm", "--project", "demo",
+          "--wait", "5", "--max-block", "0.1"])
+    assert any(w["agent"] == "cl-harm" for w in co._load("demo")["waiters"])
+    capsys.readouterr()
+    assert main(["lease", "release", "--agent", "cl-harm", "--project", "demo"]) == 0
+    body = json.loads(capsys.readouterr().out.strip().splitlines()[-1])
+    assert body["ok"] is True and body["released_from_queue"] is True
+    st = co._load("demo")
+    assert not any(w["agent"] == "cl-harm" for w in st["waiters"])
+    assert st["exclusive"]["agent"] == "A"      # holder untouched
+    # ...and the holder's own release is still refused while PIE is live.
+    assert main(["lease", "release", "--agent", "A", "--project", "demo"]) == 1
