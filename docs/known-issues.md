@@ -1653,3 +1653,13 @@ PNG with `ok:true, exists:true`.
   `uap exec` now REFUSES inline Python that calls `load_level` / `load_map` / `new_level` ... (`--unsafe-level-load`
   overrides); `exec-file` warns only, since map-builder scripts open their own map.
 * Tests: `mcp-server/tests/test_cli_level.py`.
+
+## Injected input ran client Server RPCs locally -- FIXED
+
+* **Symptom:** a networked test that clicked UI through `uap click` (or injected a key / XR button) saw client
+  Server RPCs run locally on the client and never reach the host.
+* **Cause:** Remote Control wraps every object call in `FEditorScriptExecutionGuard` (RemoteControlModule.cpp:1387),
+  which sets `GAllowActorScriptExecutionInEditor`. While set, `AActor::GetFunctionCallspace` (Actor.cpp:5469)
+  returns Local for every RPC.
+* **Fix:** `FAgentInput::ForEachClientJson` and `FAgentInput::ForEachClient` (the funnel for every input verb,
+  JSON and bool) clear the flag for the duration of the injection with `TGuardValue`.
