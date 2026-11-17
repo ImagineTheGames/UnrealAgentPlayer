@@ -7,7 +7,7 @@ import pytest
 
 from unreal_agent_player import cli
 
-CODE = "unreal.SystemLibrary.execute_console_command(None, 'NetEmulation.Off')"
+CODE = "unreal.SystemLibrary.execute_console_command(w, 'NetEmulation.Off')"
 
 
 def _out(capsys):
