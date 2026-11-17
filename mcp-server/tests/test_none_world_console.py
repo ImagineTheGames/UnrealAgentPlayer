@@ -3,7 +3,38 @@
 
 
 import pytest
-from test_cli_net_emulation import _fake_exec, _out, _pie
+
+
+def _out(capsys):
+    return json.loads(capsys.readouterr().out.strip().splitlines()[-1])
+
+
+def _pie(monkeypatch, live):
+    seen = []
+
+    def fake(func, params, project=None):
+        seen.append((func, dict(params)))
+        return live if func == "IsInPIE" else "ok"
+
+    monkeypatch.setattr(cli, "_rc_call", fake)
+    return seen
+
+
+def _fake_exec(monkeypatch):
+    ran = []
+
+    class Fake:
+        last_target = None
+
+        def __init__(self, *a, **k):
+            pass
+
+        def exec_python(self, code):
+            ran.append(code)
+            return {"success": True, "result": "None", "output": []}
+
+    monkeypatch.setattr(cli, "PythonRemoteExecClient", Fake)
+    return ran
 
 from unreal_agent_player import cli
 from unreal_agent_player.tools.console import is_world_command, none_world_console_call
