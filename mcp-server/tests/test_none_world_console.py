@@ -2,7 +2,12 @@
 (UnrealEngine.cpp:16996 HandleInvalidWorldContext, 2026-11-15/16)."""
 
 
+import json
+
 import pytest
+
+from unreal_agent_player import cli
+from unreal_agent_player.tools.console import is_world_command, none_world_console_call
 
 
 def _out(capsys):
@@ -36,8 +41,6 @@ def _fake_exec(monkeypatch):
     monkeypatch.setattr(cli, "PythonRemoteExecClient", Fake)
     return ran
 
-from unreal_agent_player import cli
-from unreal_agent_player.tools.console import is_world_command, none_world_console_call
 
 
 @pytest.mark.parametrize("code", [
