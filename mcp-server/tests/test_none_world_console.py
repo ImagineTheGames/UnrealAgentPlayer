@@ -1,13 +1,12 @@
 """None-world execute_console_command and travel commands without PIE crashed the shared editor
 (UnrealEngine.cpp:16996 HandleInvalidWorldContext, 2026-11-15/16)."""
 
-import json
 
 import pytest
+from test_cli_net_emulation import _fake_exec, _out, _pie
 
 from unreal_agent_player import cli
-from unreal_agent_player.tools.console import none_world_console_call, is_world_command
-from test_cli_net_emulation import _fake_exec, _out, _pie
+from unreal_agent_player.tools.console import is_world_command, none_world_console_call
 
 
 @pytest.mark.parametrize("code", [
