@@ -3804,7 +3804,14 @@ def _lease_inner(args) -> int:
         # nothing in the system will ever tell either of them. So check, and refuse.
         # Fail-open on an unreachable editor (nothing to protect) and --force for a deliberate
         # handover of a live session.
-        live, how = (None, "skipped (--force)") if args.force else _pie_state_for_lease(proj)
+        # A WAITER (queued, not holding) owns no editor session: the live PIE is the holder's.
+        # Dropping its queue slot frees nothing, so it is never refused -- else a dead agent's slot
+        # sits ahead of live work until its heartbeat/park expires.
+        _waiter_only = _coord.is_waiter_only(proj, agent=args.agent or _coord.default_agent_id())
+        if _waiter_only:
+            live, how = None, "skipped (waiter, holds nothing)"
+        else:
+            live, how = (None, "skipped (--force)") if args.force else _pie_state_for_lease(proj)
         if live:
             res = {"ok": False, "released": False, "pie_live": True, "checked_with": how,
                    "agent": args.agent or _coord.default_agent_id(),
@@ -3815,6 +3822,9 @@ def _lease_inner(args) -> int:
         else:
             res = _coord.release(proj, agent=args.agent)
             res["pie_live"] = live
+            if _waiter_only:
+                res["released_from_queue"] = True
+                res["released"] = True
             res["checked_with"] = how
             # Releasing the editor also gives the machine back: the agent has just proved PIE is
             # down, which is the whole reason the other project was waiting. Project-wide only
