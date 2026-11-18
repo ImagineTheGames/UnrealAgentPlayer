@@ -1663,3 +1663,11 @@ PNG with `ok:true, exists:true`.
   returns Local for every RPC.
 * **Fix:** `FAgentInput::ForEachClientJson` and `FAgentInput::ForEachClient` (the funnel for every input verb,
   JSON and bool) clear the flag for the duration of the injection with `TGuardValue`.
+
+## 52. A tick callback registered through `uap exec` outlived PIE and wrote 2.4 M NameError lines -- FIXED (17tm4675e8t)
+
+* **Symptom:** 2026-11-18, School's Out editor log: a slate post-tick callback from an exec script kept firing after PIE ended; its handler read an exec-scope global that no longer existed; 2,399,222 Error lines in 1 h 43 min.
+* **Fix:** every exec preamble installs `_uap_cb_guard` (`exec_callbacks.py`), wrapping `unreal.register_slate_pre/post_tick_callback`. (`unreal.EditorDelegates` does not exist in the UE Python API: FEditorDelegates is an unreflected C++ struct, so PIE delegates cannot be wrapped.) A guarded callback unregisters on its first exception (one warning logged), and when PIE ends if it was registered during PIE (checked when it fires and at the start of every later exec). `_uap_cb_guard.release_all(owner)` drops the rest.
+* **Owner release:** each callback is tagged with the `--agent` token (or `$UAP_AGENT_ID`) of the exec that registered it. `uap lease release` and `uap pie stop` best-effort release that agent's callbacks (`exec_callbacks_released` in the answer). **Gap:** a tokenless exec has owner `""`, shared by every tokenless exec; only a tokenless release/stop drops those. Pass `--agent`.
+* **Handler reads an exec-scope global (non-fatal):** the exec namespace is rebuilt per call, so a callback reading e.g. `REC` after the exec ends raises NameError. The guard unregisters it and logs ONE warning that names the missing global and says callbacks must capture values via default args or closures (`def cb(dt, rec=REC)`).
+* **Still true:** callbacks registered with no PIE running are error-bounded and owner-released, not PIE-bounded. Python cannot register PIE delegates at all, so only slate ticks need the guard.

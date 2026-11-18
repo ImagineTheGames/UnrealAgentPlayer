@@ -92,3 +92,11 @@ def _no_live_editor_probe(monkeypatch):
     monkeypatch.setattr(_coordination, "_game_client_probe", lambda: None)
     monkeypatch.setenv("UAP_GAME_CLIENT_PROBE", "0")
     _coordination._GAME_CLIENT_CACHE.clear()
+
+
+@pytest.fixture(autouse=True)
+def _no_exec_callback_release(monkeypatch):
+    """`lease release` / `pie stop` best-effort release the agent exec callbacks through a real
+    Python-remote-exec client (UDP discovery). A test run must never go looking for an editor.
+    Tests of the release itself import the real function at module import time."""
+    monkeypatch.setattr(cli, "_release_exec_callbacks", lambda project, agent: None)
