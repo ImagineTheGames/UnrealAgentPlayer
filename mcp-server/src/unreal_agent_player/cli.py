@@ -1092,7 +1092,7 @@ def _exec(args) -> int:
         if not (auto and _standalone_instance_selected(args, None))                 and not _exec_client_is_noop(args, sel):
             from unreal_agent_player import exec_client as _xc
             try:
-                code = _xc.build_client_code(code, sel)
+                code = _xc.build_client_code(code, sel, _agent_token(getattr(args, "agent", None)))
             except ValueError as exc:
                 raise AgentError(ErrorCode.SCHEMA_VALIDATION, str(exc)) from exc
             wrapped = True
@@ -1186,6 +1186,21 @@ def _instances(args) -> int:
     return 0 if body["ok"] else 1
 
 
+def _release_exec_callbacks(project: str | None, agent: str | None) -> int | None:
+    """Drop the tick/delegate callbacks this agent's `uap exec` calls left in the editor
+    (exec_callbacks.py). Best effort: an unreachable editor or a missing guard is not an error.
+    Callbacks are keyed by the --agent token (or $UAP_AGENT_ID); tokenless execs share owner ""."""
+    try:
+        from unreal_agent_player import exec_callbacks as _ecb
+        client = PythonRemoteExecClient(node_project_substr=project)
+        res = client.exec_python(_ecb.release_code(_agent_token(agent)))
+        text = " ".join(str(o.get("output", "")) for o in (res.get("output") or []))
+        m = re.search(r"@@UAP_CB_RELEASED@@ (\d+)", text)
+        return int(m.group(1)) if m else None
+    except Exception:
+        return None
+
+
 def _exec_file(args) -> int:
     with open(args.path, encoding="utf-8") as f:
         code = f.read()
@@ -1196,7 +1211,7 @@ def _exec_file(args) -> int:
     return _exec(argparse.Namespace(code=code, project=args.project,
                                     instance=getattr(args, "instance", None),
                                     unsafe_level_load=getattr(args, "unsafe_level_load", False),
-                                    level_guard="warn"))
+                                    level_guard="warn", agent=getattr(args, "agent", None)))
 
 
 def _pie_start(mode: str, project: str | None) -> dict:
@@ -1507,6 +1522,9 @@ def _pie(args) -> int:
             timeout = getattr(args, "timeout", None)
             body.update(_pie_stop(args.project,
                                   _pie_stop_timeout() if timeout is None else timeout))
+            if body.get("ok"):
+                body["exec_callbacks_released"] = _release_exec_callbacks(
+                    args.project, getattr(args, "agent", None))
         elif sub == "wait":
             # The SAME implementation `pie start` blocks on -- see _pie_wait_for_live. `wait`
             # remains for the `--no-wait` path and for waiting on a session someone else started.
@@ -3860,6 +3878,8 @@ def _lease_inner(args) -> int:
         else:
             res = _coord.release(proj, agent=args.agent)
             res["pie_live"] = live
+            if not _waiter_only and res.get("ok", True):
+                res["exec_callbacks_released"] = _release_exec_callbacks(proj, args.agent)
             if _waiter_only:
                 res["released_from_queue"] = True
                 res["released"] = True

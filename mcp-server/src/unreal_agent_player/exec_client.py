@@ -24,7 +24,7 @@ from __future__ import annotations
 
 import re
 
-from unreal_agent_player.exec_callbacks import GUARD_SOURCE
+from unreal_agent_player.exec_callbacks import guard_source
 from unreal_agent_player.transport import guard_py_path_trigger
 
 MARK_WORLD = "@@UAP_CLIENT_WORLD@@"
@@ -138,7 +138,7 @@ def client_index(selector: str) -> int:
 AUTO = "auto"
 
 
-def build_client_code(code: str, selector: str) -> str:
+def build_client_code(code: str, selector: str, owner: str = "") -> str:
     """Wrap `code` so it runs against client `selector`'s PIE world. See the module docstring.
 
     `selector` AUTO (no --client given) targets the SERVER world (index 0) explicitly when any PIE
@@ -146,7 +146,9 @@ def build_client_code(code: str, selector: str) -> str:
     either way. Before, an unselected exec used whichever world the editor's get_game_world()
     answered, which in a multi-client PIE was the wrong one (CRASH-64FF6CF8)."""
     idx = -1 if str(selector).strip().lower() == AUTO else client_index(selector)
-    text = _PREAMBLE.replace("__UAP_SEL__", str(idx)).replace("__UAP_USER__", repr(code)).replace("__UAP_GUARD__", GUARD_SOURCE)
+    # Guard first: the user's code is substituted LAST so a marker inside it is never rewritten.
+    text = (_PREAMBLE.replace("__UAP_GUARD__", guard_source(owner))
+            .replace("__UAP_SEL__", str(idx)).replace("__UAP_USER__", repr(code)))
     return guard_py_path_trigger(text)
 
 

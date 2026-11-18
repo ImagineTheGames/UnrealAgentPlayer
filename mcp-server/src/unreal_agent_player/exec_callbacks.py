@@ -11,25 +11,44 @@ A guarded callback
   * unregisters itself the first time it raises, and logs ONE warning with the traceback tail;
   * unregisters itself once PIE ends, if PIE was running when it was registered (a PIE-scoped
     probe has nothing left to do afterwards);
-  * is tracked, so `_uap_cb_guard.release_all()` drops every one still live.
+  * is tracked, so `_uap_cb_guard.release_all()` drops every one still live;
+  * is tagged with its OWNER (the `--agent` token / $UAP_AGENT_ID of the exec that registered it,
+    "" when tokenless), so `release_all(owner)` drops just that agent's callbacks. `uap lease
+    release` and `uap pie stop` call it. GAP: a tokenless exec shares the owner "" with every other
+    tokenless exec, so its callbacks are only released by a tokenless release/stop. Pass --agent.
 
-Handlers must still not read exec-scope globals: the namespace is rebuilt per exec. The guard
-only bounds the damage when they do. The text avoids a literal dot-p-y, which UE's ExecuteFile
+Only the slate tick callbacks are wrapped. The UE Python API has no PIE delegate host
+(FEditorDelegates is a plain C++ struct, not reflected; there is no `unreal.EditorDelegates`), so
+there is nothing else to wrap. A tick callback registered during PIE is unregistered once PIE has
+ended (checked when it fires and at the start of every later exec).
+
+Handlers must still not read exec-scope globals: the namespace is rebuilt per exec, so capture
+values via default args or closures. The guard only bounds the damage when they do, and its single
+warning then names the missing global. The text avoids a literal dot-p-y, which UE's ExecuteFile
 mode would read as a script path.
 """
 
 from __future__ import annotations
 
 GUARD_SOURCE = r'''
-def _uap_guard_install(u):
+def _uap_guard_install(u, owner):
     # Self-contained: the preamble cleanup deletes every `_uap_*` global after each exec, so the
     # installed closures must hold everything they use themselves.
+    import re
     import sys
     import traceback
     import types
     m = sys.modules.get("_uap_cb_guard")
-    if m is not None and getattr(m, "VERSION", 0) >= 1:
+    if m is not None and getattr(m, "VERSION", 0) >= 2:
+        m.owner[0] = owner
+        m.sweep()
         return m
+    if m is not None:
+        m.release_all()  # v1 guard: drop its callbacks and unwrap below
+        for _n in ("register_slate_post_tick_callback", "register_slate_pre_tick_callback"):
+            _f = getattr(u, _n, None)
+            if getattr(_f, "_uap_orig", None) is not None:
+                setattr(u, _n, _f._uap_orig)
 
     def pie_live():
         try:
@@ -38,50 +57,68 @@ def _uap_guard_install(u):
             return False
 
     m = types.ModuleType("_uap_cb_guard")
-    m.VERSION = 1
+    m.VERSION = 2
     m.live = {}
     m.log = []
     m.seq = [0]
+    m.owner = [owner]
 
     def drop(rec, why):
         if rec["dead"]:
             return
         rec["dead"] = True
         m.live.pop(rec["id"], None)
-        un = getattr(u, rec["unreg"], None)
         try:
-            if un is not None and rec["handle"] is not None:
-                un(rec["handle"])
+            rec["undo"]()
         except Exception:
             pass
-        line = "uap: tick callback %s unregistered: %s" % (rec["name"], why)
+        line = "uap: %s callback %s unregistered: %s" % (rec["kind"], rec["name"], why)
         m.log.append(line)
         try:
             u.log_warning(line)
         except Exception:
             pass
 
+    def why_raised(exc):
+        last = traceback.format_exc().strip().splitlines()[-1]
+        if isinstance(exc, NameError):
+            gm = re.search(r"name '([^']+)' is not defined", str(exc))
+            gname = getattr(exc, "name", None) or (gm.group(1) if gm else "?")
+            return ("raised, first error: %s -- the handler read global '%s', which does not exist: "
+                    "each uap exec rebuilds its namespace, so callbacks must capture values via "
+                    "default args or closures (def cb(dt, %s=%s)), never read exec-scope globals"
+                    % (last, gname, gname, gname))
+        return "raised, first error: " + last
+
+    def make_guarded(rec, fn):
+        def guarded(*args, **kw):
+            if rec["dead"]:
+                return None
+            if rec["pie"] and not pie_live():
+                drop(rec, "PIE ended")
+                return None
+            try:
+                return fn(*args, **kw)
+            except BaseException as exc:
+                drop(rec, why_raised(exc))
+                return None
+        return guarded
+
+    def new_rec(kind, fn):
+        m.seq[0] += 1
+        return {"id": m.seq[0], "kind": kind, "name": getattr(fn, "__name__", repr(fn)),
+                "dead": False, "undo": None, "pie": pie_live(), "owner": m.owner[0], "fn": fn}
+
     def wrap(unreg_name, orig):
         def register(fn, *a, **k):
-            m.seq[0] += 1
-            rec = {"id": m.seq[0], "name": getattr(fn, "__name__", repr(fn)), "dead": False,
-                   "handle": None, "unreg": unreg_name, "pie": pie_live()}
-
-            def guarded(*args, **kw):
-                if rec["dead"]:
-                    return None
-                if rec["pie"] and not pie_live():
-                    drop(rec, "PIE ended")
-                    return None
-                try:
-                    return fn(*args, **kw)
-                except BaseException:
-                    drop(rec, "raised, first error: " + traceback.format_exc().strip().splitlines()[-1])
-                    return None
-            rec["handle"] = orig(guarded, *a, **k)
+            rec = new_rec("tick", fn)
+            guarded = make_guarded(rec, fn)
+            handle = orig(guarded, *a, **k)
+            rec["undo"] = lambda: getattr(u, unreg_name)(handle)
             m.live[rec["id"]] = rec
-            return rec["handle"]
+            return handle
         register._uap_guarded = True
+        register._uap_orig = orig
         return register
 
     for reg_name, unreg_name in (
@@ -91,13 +128,42 @@ def _uap_guard_install(u):
         if orig is not None and not getattr(orig, "_uap_guarded", False):
             setattr(u, reg_name, wrap(unreg_name, orig))
 
-    def release_all():
+    def release_all(owner=None):
+        # owner None = everyone's; otherwise only callbacks registered by that exec owner.
+        n = 0
         for rec in list(m.live.values()):
-            drop(rec, "released")
+            if owner is None or rec["owner"] == owner:
+                drop(rec, "released")
+                n += 1
+        return n
+
+    def sweep():
+        if not pie_live():
+            for rec in list(m.live.values()):
+                if rec["pie"]:
+                    drop(rec, "PIE ended")
+
     m.release_all = release_all
+    m.sweep = sweep
     sys.modules["_uap_cb_guard"] = m
     return m
 
 
-_uap_guard_install(_uap_u)
+_uap_guard_install(_uap_u, __UAP_OWNER__)
 '''
+
+
+def guard_source(owner: str = "") -> str:
+    """GUARD_SOURCE with the exec owner (agent token) baked in as a Python literal."""
+    return GUARD_SOURCE.replace("__UAP_OWNER__", repr(str(owner or "")))
+
+
+def release_code(owner: str = "") -> str:
+    """Editor-side snippet: drop every guarded callback `owner` registered. Prints a marker with
+    the count; a no-op when the guard was never installed in this editor process."""
+    return (
+        "import sys as _s\n"
+        "_m = _s.modules.get('_uap_cb_guard')\n"
+        "print('@@UAP_CB_RELEASED@@ %d' % (_m.release_all(" + repr(str(owner or "")) + ") "
+        "if _m is not None else 0))\n"
+    )
