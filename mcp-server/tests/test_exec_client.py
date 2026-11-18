@@ -223,11 +223,44 @@ def test_cli_exec_client_all_is_refused_before_anything_is_sent(_cli, capsys):
     assert all(not i.ran for i in _FakeExec.instances), "nothing may reach the editor"
 
 
-def test_cli_exec_without_client_is_unchanged(_cli, capsys):
-    rc, body = _exec_json(capsys, "print('plain')")
+def test_cli_exec_without_client_defaults_to_server_world_and_says_so(_cli, capsys):
+    """CRASH-64FF6CF8: an unselected exec in a multi-client PIE must not pick a world by luck."""
+    rc, body = _exec_json(capsys, "print('plain', UAP_CLIENT)")
     assert rc == 0 and body["ok"] is True
-    assert "client" not in body
-    assert _FakeExec.instances[0].ran == ["print('plain')"], "no preamble without --client"
+    assert body["client"]["index"] == 0
+    assert "default: server world" in body["client"]["world"]
+    assert "plain 0" in "".join(body["output"])
+    assert "@@UAP" not in json.dumps(body["output"])
+
+
+def test_auto_ignores_a_stale_duplicate_pie_world(monkeypatch):
+    live, stale = _World("Map", "/Game/Maps/UEDPIE_0_Map"), _World("Map", "/Game/Maps/UEDPIE_0_Map")
+    fake = _fake_unreal({0: live})
+    fake.ObjectIterator = lambda cls: iter([live, stale])
+    monkeypatch.setitem(sys.modules, "unreal", fake)
+    buf = io.StringIO()
+    g: dict = {}
+    with contextlib.redirect_stdout(buf):
+        exec(compile(xc.build_client_code("print('W', id(UAP_WORLD))", "auto"), "<t>", "exec"), g)
+    assert f"W {id(live)}" in buf.getvalue()
+    assert "duplicate index [0] ignored" in buf.getvalue()
+
+
+def test_auto_with_no_pie_runs_the_editor_script_as_written(monkeypatch):
+    fake = _fake_unreal({})
+    monkeypatch.setitem(sys.modules, "unreal", fake)
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        exec(compile(xc.build_client_code("print('ed', UAP_WORLD)", "auto"), "<t>", "exec"), {})
+    out = buf.getvalue()
+    assert "ed None" in out and "-1|none" in out
+
+
+def test_cli_exec_auto_on_standalone_is_passed_through(_cli, capsys, monkeypatch):
+    monkeypatch.setattr(cli, "_standalone_instance_selected", lambda a, t: True)
+    rc, body = _exec_json(capsys, "print('plain')")
+    assert rc == 0 and "client" not in body
+    assert _FakeExec.instances[0].ran == ["print('plain')"]
 
 
 def test_cli_exec_client_whose_preamble_never_reports_is_not_trusted(_cli, capsys, monkeypatch):
