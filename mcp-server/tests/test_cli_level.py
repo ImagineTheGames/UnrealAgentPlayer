@@ -188,6 +188,54 @@ def test_exec_refuses_python_that_swaps_the_level(monkeypatch, capsys, code):
     assert "uap level open" in err and "NOT run" in err
 
 
+@pytest.mark.parametrize("code", [
+    "unreal.SystemLibrary.execute_console_command(w, 'open /Game/Maps/X')",
+    "unreal.SystemLibrary.execute_console_command(w, \"servertravel /Game/Maps/X\")",
+    "unreal.SystemLibrary.execute_console_command(w, 'ServerTravel /Game/Maps/X?listen')",
+    "pc.client_travel('/Game/Maps/X')",
+    "gm.server_travel('/Game/Maps/X')",
+    "unreal.GameplayStatics.open_level_by_soft_object_ptr(w, p)",
+])
+def test_exec_refuses_open_and_servertravel(monkeypatch, capsys, code):
+    """CRASH-64FF6CF8: open / servertravel from exec ran in the wrong PIE world and asserted."""
+    class Boom:
+        def __init__(self, *a, **k):
+            raise AssertionError("the script must not reach the editor")
+
+    monkeypatch.setattr(cli, "PythonRemoteExecClient", Boom)
+    assert cli.main(["exec", code]) == 1
+    err = _out(capsys)["error"]
+    assert "uap level open" in err and "uap pie" in err and "NOT run" in err
+
+
+@pytest.mark.parametrize("code", [
+    "print('the file is open for reading')",
+    "x = opened_actors + reopen_count",
+    "unreal.SystemLibrary.execute_console_command(w, 'stat fps')",
+    "unreal.log('open_door called')",
+])
+def test_exec_travel_guard_has_no_false_positives(code):
+    assert cli._exec_travel_refusal(code) is None
+
+
+def test_exec_travel_override_is_explicit(monkeypatch, capsys):
+    ran = []
+
+    class Fake:
+        last_target = None
+
+        def __init__(self, *a, **k):
+            pass
+
+        def exec_python(self, code):
+            ran.append(code)
+            return {"success": True, "result": "None", "output": []}
+
+    monkeypatch.setattr(cli, "PythonRemoteExecClient", Fake)
+    assert cli.main(["exec", "x('servertravel /Game/X')", "--unsafe-level-load"]) == 0
+    assert ran
+
+
 def test_exec_override_is_explicit(monkeypatch, capsys):
     ran = []
 

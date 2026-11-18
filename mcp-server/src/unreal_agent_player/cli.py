@@ -1069,6 +1069,8 @@ def _exec(args) -> int:
     from unreal_agent_player.tools import console as _console
     net = _console.NONE_WORLD_REFUSAL if _console.none_world_console_call(code) else None
     net = net or _net_emulation_refusal(code, args.project, scan=True)
+    if not net and not getattr(args, "unsafe_level_load", False)             and getattr(args, "level_guard", "refuse") != "warn":
+        net = _exec_travel_refusal(code)
     if net:
         body = {"ok": False, "error": net}
         _capture("exec", {"code": code[:200]}, body, int((time.monotonic() - t0) * 1000))
@@ -1080,8 +1082,14 @@ def _exec(args) -> int:
         # --client N: run with client N's PIE world as the target world. It used to be IGNORED
         # here, so a 2-client "client reads" script read the host twice [17tm466zztw].
         sel = _client_tag()
+        auto = not sel
+        if auto:
+            # No --client: pick the server world explicitly (and log it) instead of whatever
+            # get_game_world() answers in a multi-client PIE [CRASH-64FF6CF8]. A standalone `-game`
+            # instance has no editor Python, so it is left alone.
+            sel = "auto"
         wrapped = False
-        if sel and not _exec_client_is_noop(args, sel):
+        if not (auto and _standalone_instance_selected(args, None))                 and not _exec_client_is_noop(args, sel):
             from unreal_agent_player import exec_client as _xc
             try:
                 code = _xc.build_client_code(code, sel)
@@ -1100,6 +1108,12 @@ def _exec(args) -> int:
             if refusal:
                 body["ok"] = False
                 body["error"] = f"--client {sel}: {refusal} The script was NOT run."
+            elif info is None and auto:
+                # Implicit default only: no preamble report (no editor Python, a fake node). The
+                # script ran as it always did; say the world was not pinned rather than fail.
+                level_warning = ((level_warning + " | ") if level_warning else "") + (
+                    "default server-world selection did not report; the script ran against the "
+                    "editor's own play world, not a pinned one.")
             elif info is None:
                 # The preamble never reported: it did not run (or its output was lost). Handing
                 # back the script's answer would be the silent host read this exists to stop.
@@ -1108,7 +1122,8 @@ def _exec(args) -> int:
                                  "did not report, so the script may have run against the wrong "
                                  "world. See output; do not trust this result.")
             else:
-                body["client"] = info
+                if info.get("index", 0) >= 0:
+                    body["client"] = info
     except AgentError as exc:
         body = _err(exc)
     # Always say WHICH process answered. The failure this exists for was an exec that landed on
@@ -2989,6 +3004,16 @@ _EXEC_LEVEL_LOAD_RE = re.compile(
     r"new_map_from_template|LoadLevel|LoadMap|OpenLevel|NewLevel|NewBlankMap)\b")
 
 
+# Console / Python spellings of a map change or server travel. `open <map>` and `servertravel` run
+# through execute_console_command against whichever world exec resolved, and in a multi-client PIE
+# that asserted the editor (CRASH-64FF6CF8). Matched inside string literals on purpose: the console
+# command is text.
+_EXEC_TRAVEL_RE = re.compile(
+    r"(?i)(?:[\"'`]\s*(?:open|servertravel|clienttravel|travel)\s+\S|"
+    r"\b(?:server_travel|client_travel|seamless_travel|open_level_by_soft_object_ptr)\b|"
+    r"\b(?:ServerTravel|ClientTravel|SeamlessTravel|OpenLevelBySoftObjectPtr)\b)")
+
+
 def _exec_level_load_refusal(code: str) -> str | None:
     """The refusal for Python that swaps the editor level, or None. A level swap from Python is the
     crash this verb exists to end, so it is refused BY DEFAULT -- a doc agents may not read does not
@@ -3001,6 +3026,19 @@ def _exec_level_load_refusal(code: str) -> str | None:
             "(World Memory Leaks / IsValidLowLevel, ClickUp 86akezbrp). Use `uap level open <map>` "
             "instead -- it loads outside Python, refuses during PIE and on a dirty map, and reads "
             "the result back. Override only on a throwaway editor with --unsafe-level-load. "
+            "The script was NOT run.")
+
+
+def _exec_travel_refusal(code: str) -> str | None:
+    """Refusal for `open <map>` / `servertravel` console commands and their Python spellings."""
+    tm = _EXEC_TRAVEL_RE.search(code or "")
+    if not tm:
+        return None
+    return ("refusing: this Python runs a level open / travel (`" + tm.group(0).strip() + "`). "
+            "`open <map>` / `servertravel` from editor Python lands in whichever PIE world exec "
+            "resolved and killed the SHARED editor in a multi-client PIE (CRASH-64FF6CF8). Use "
+            "`uap level open <map>` (editor level) or `uap pie` (PIE session) instead. "
+            "Override only on a throwaway editor with --unsafe-level-load. "
             "The script was NOT run.")
 
 

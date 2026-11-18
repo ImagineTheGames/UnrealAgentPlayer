@@ -45,9 +45,13 @@ def _uap_cleanup():
 
 
 _uap_sel = __UAP_SEL__
+_uap_auto = (_uap_sel < 0)
+if _uap_auto:
+    _uap_sel = 0
 _uap_err = None
 _uap_world = None
 _uap_found = {}
+_uap_dups = []
 for _uap_w in _uap_u.ObjectIterator(_uap_u.World):
     try:
         _uap_names = _uap_w.get_name() + "|" + _uap_w.get_outer().get_name()
@@ -55,8 +59,17 @@ for _uap_w in _uap_u.ObjectIterator(_uap_u.World):
         continue
     _uap_m = _uap_re.search(r"UEDPIE_(\d+)_", _uap_names)
     if _uap_m:
-        _uap_found[int(_uap_m.group(1))] = _uap_w
-if _uap_sel in _uap_found:
+        _uap_i = int(_uap_m.group(1))
+        if _uap_i in _uap_found:
+            # A stale PIE world of the same index (leaked from an earlier session) must not
+            # silently replace the live one: keep the first, report the duplicate.
+            _uap_dups.append(_uap_i)
+        else:
+            _uap_found[_uap_i] = _uap_w
+if _uap_auto and not _uap_found:
+    # No PIE running: an editor-only script. Nothing to select, run it as written.
+    _uap_world = None
+elif _uap_sel in _uap_found:
     _uap_world = _uap_found[_uap_sel]
 elif not _uap_found:
     _uap_err = ("no PIE world is running, so there is no client %d to target. Start PIE "
@@ -69,7 +82,7 @@ else:
                     "%d (%s)" % (_k, _uap_found[_k].get_outer().get_name()) for _k in sorted(_uap_found))))
 
 _uap_code = __UAP_USER__
-if _uap_err is None and "get_game_world" in _uap_code:
+if _uap_err is None and _uap_world is not None and "get_game_world" in _uap_code:
     # unreal's wrapped classes are immutable, so get_game_world() CANNOT be pointed at client N:
     # it answers the editor's own play world. If that is not client N's world, running the
     # script would read the wrong client while reporting success.
@@ -87,9 +100,17 @@ if _uap_err is not None:
     print("@@UAP_CLIENT_REFUSED@@ " + _uap_err)
     _uap_cleanup()
 else:
-    UAP_CLIENT = _uap_sel
+    UAP_CLIENT = _uap_sel if _uap_world is not None else None
     UAP_WORLD = _uap_world
-    print("@@UAP_CLIENT_WORLD@@ %d|%s" % (_uap_sel, _uap_world.get_outer().get_name()))
+    if _uap_world is None:
+        print("@@UAP_CLIENT_WORLD@@ -1|none (no PIE world running)")
+    else:
+        _uap_note = ""
+        if _uap_auto:
+            _uap_note = " (default: server world; %d PIE world(s) running)" % len(_uap_found)
+        if _uap_dups:
+            _uap_note += " (duplicate index %s ignored)" % sorted(set(_uap_dups))
+        print("@@UAP_CLIENT_WORLD@@ %d|%s%s" % (_uap_sel, _uap_world.get_outer().get_name(), _uap_note))
     try:
         exec(compile(_uap_code, "<uap exec --client>", "exec"))
     finally:
@@ -111,14 +132,22 @@ def client_index(selector: str) -> int:
     return int(sel)
 
 
+AUTO = "auto"
+
+
 def build_client_code(code: str, selector: str) -> str:
-    """Wrap `code` so it runs against client `selector`'s PIE world. See the module docstring."""
-    idx = client_index(selector)
+    """Wrap `code` so it runs against client `selector`'s PIE world. See the module docstring.
+
+    `selector` AUTO (no --client given) targets the SERVER world (index 0) explicitly when any PIE
+    world is running, and runs the script as written when none is; the chosen world is reported
+    either way. Before, an unselected exec used whichever world the editor's get_game_world()
+    answered, which in a multi-client PIE was the wrong one (CRASH-64FF6CF8)."""
+    idx = -1 if str(selector).strip().lower() == AUTO else client_index(selector)
     text = _PREAMBLE.replace("__UAP_SEL__", str(idx)).replace("__UAP_USER__", repr(code))
     return guard_py_path_trigger(text)
 
 
-_WORLD_RE = re.compile(re.escape(MARK_WORLD) + r"\s+(\d+)\|([^\n]*)")
+_WORLD_RE = re.compile(re.escape(MARK_WORLD) + r"\s+(-?\d+)\|([^\n]*)")
 _REFUSED_RE = re.compile(re.escape(MARK_REFUSED) + r"\s+(.*)")
 
 
