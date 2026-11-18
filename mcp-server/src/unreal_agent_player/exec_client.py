@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import re
 
+from unreal_agent_player.exec_callbacks import GUARD_SOURCE
 from unreal_agent_player.transport import guard_py_path_trigger
 
 MARK_WORLD = "@@UAP_CLIENT_WORLD@@"
@@ -34,6 +35,8 @@ MARK_REFUSED = "@@UAP_CLIENT_REFUSED@@"
 _PREAMBLE = r'''
 import re as _uap_re
 import unreal as _uap_u
+
+__UAP_GUARD__
 
 
 def _uap_cleanup():
@@ -143,7 +146,7 @@ def build_client_code(code: str, selector: str) -> str:
     either way. Before, an unselected exec used whichever world the editor's get_game_world()
     answered, which in a multi-client PIE was the wrong one (CRASH-64FF6CF8)."""
     idx = -1 if str(selector).strip().lower() == AUTO else client_index(selector)
-    text = _PREAMBLE.replace("__UAP_SEL__", str(idx)).replace("__UAP_USER__", repr(code))
+    text = _PREAMBLE.replace("__UAP_SEL__", str(idx)).replace("__UAP_USER__", repr(code)).replace("__UAP_GUARD__", GUARD_SOURCE)
     return guard_py_path_trigger(text)
 
 

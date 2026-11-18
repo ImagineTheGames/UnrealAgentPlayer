@@ -1663,3 +1663,9 @@ PNG with `ok:true, exists:true`.
   returns Local for every RPC.
 * **Fix:** `FAgentInput::ForEachClientJson` and `FAgentInput::ForEachClient` (the funnel for every input verb,
   JSON and bool) clear the flag for the duration of the injection with `TGuardValue`.
+
+## 52. A tick callback registered through `uap exec` outlived PIE and wrote 2.4 M NameError lines -- FIXED (17tm4675e8t)
+
+* **Symptom:** 2026-11-18, School's Out editor log: a slate post-tick callback from an exec script kept firing after PIE ended; its handler read an exec-scope global that no longer existed; 2,399,222 Error lines in 1 h 43 min.
+* **Fix:** every exec preamble installs `_uap_cb_guard` (`exec_callbacks.py`), wrapping `unreal.register_slate_pre/post_tick_callback`. A guarded callback unregisters on its first exception (one warning logged), and when PIE ends if it was registered during PIE. `_uap_cb_guard.release_all()` drops the rest.
+* **Still true:** handlers must not read exec-scope globals; the namespace is rebuilt per exec. Callbacks registered with no PIE running are only error-bounded, not PIE-bounded.
