@@ -60,7 +60,6 @@ def test_none_world_refused(monkeypatch, capsys, code, live):
 
 @pytest.mark.parametrize("code", [
     "unreal.SystemLibrary.execute_console_command(None, 'stat fps')",
-    "unreal.SystemLibrary.execute_console_command(world, 'open X')",
     "print(1)",
 ])
 def test_normal_exec_unaffected(monkeypatch, capsys, code):

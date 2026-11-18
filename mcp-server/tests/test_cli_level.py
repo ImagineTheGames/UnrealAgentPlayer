@@ -215,7 +215,7 @@ def test_exec_refuses_open_and_servertravel(monkeypatch, capsys, code):
     "unreal.log('open_door called')",
 ])
 def test_exec_travel_guard_has_no_false_positives(code):
-    assert cli._exec_level_load_refusal(code) is None
+    assert cli._exec_travel_refusal(code) is None
 
 
 def test_exec_travel_override_is_explicit(monkeypatch, capsys):

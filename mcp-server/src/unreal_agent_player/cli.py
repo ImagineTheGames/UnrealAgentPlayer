@@ -1069,6 +1069,8 @@ def _exec(args) -> int:
     from unreal_agent_player.tools import console as _console
     net = _console.NONE_WORLD_REFUSAL if _console.none_world_console_call(code) else None
     net = net or _net_emulation_refusal(code, args.project, scan=True)
+    if not net and not getattr(args, "unsafe_level_load", False)             and getattr(args, "level_guard", "refuse") != "warn":
+        net = _exec_travel_refusal(code)
     if net:
         body = {"ok": False, "error": net}
         _capture("exec", {"code": code[:200]}, body, int((time.monotonic() - t0) * 1000))
@@ -3017,14 +3019,6 @@ def _exec_level_load_refusal(code: str) -> str | None:
     crash this verb exists to end, so it is refused BY DEFAULT -- a doc agents may not read does not
     stop the next one."""
     m = _EXEC_LEVEL_LOAD_RE.search(code or "")
-    tm = None if m else _EXEC_TRAVEL_RE.search(code or "")
-    if tm:
-        return ("refusing: this Python runs a level open / travel (`" + tm.group(0).strip() + "`). "
-                "`open <map>` / `servertravel` from editor Python lands in whichever PIE world exec "
-                "resolved and killed the SHARED editor in a multi-client PIE (CRASH-64FF6CF8). Use "
-                "`uap level open <map>` (editor level) or `uap pie` (PIE session) instead. "
-                "Override only on a throwaway editor with --unsafe-level-load. "
-                "The script was NOT run.")
     if not m:
         return None
     return (f"refusing: this Python calls `{m.group(1)}`. Swapping the open level from editor "
@@ -3032,6 +3026,19 @@ def _exec_level_load_refusal(code: str) -> str | None:
             "(World Memory Leaks / IsValidLowLevel, ClickUp 86akezbrp). Use `uap level open <map>` "
             "instead -- it loads outside Python, refuses during PIE and on a dirty map, and reads "
             "the result back. Override only on a throwaway editor with --unsafe-level-load. "
+            "The script was NOT run.")
+
+
+def _exec_travel_refusal(code: str) -> str | None:
+    """Refusal for `open <map>` / `servertravel` console commands and their Python spellings."""
+    tm = _EXEC_TRAVEL_RE.search(code or "")
+    if not tm:
+        return None
+    return ("refusing: this Python runs a level open / travel (`" + tm.group(0).strip() + "`). "
+            "`open <map>` / `servertravel` from editor Python lands in whichever PIE world exec "
+            "resolved and killed the SHARED editor in a multi-client PIE (CRASH-64FF6CF8). Use "
+            "`uap level open <map>` (editor level) or `uap pie` (PIE session) instead. "
+            "Override only on a throwaway editor with --unsafe-level-load. "
             "The script was NOT run.")
 
 
