@@ -8,11 +8,13 @@ from typing import Any
 import httpx
 
 from unreal_agent_player import coordination as _coord
+from unreal_agent_player import launch_registry as _reg
 from unreal_agent_player.errors import ErrorCode, error_response, ok_response
 from unreal_agent_player.instances import InstanceRegistry
 from unreal_agent_player.tools import machine as _machine
 
 _PROCS: dict[str, subprocess.Popen] = {}
+_REG_FILES: dict[str, Any] = {}
 _RUNTIME_OBJ = "/Script/UnrealAgentPlayerRuntime.Default__UAPAgentRuntimeSubsystem"
 
 
@@ -89,6 +91,8 @@ async def game_launch(
         _machine.give_back(grant)
         raise
     pid = getattr(proc, "pid", None)
+    reg_file = _reg.register_launch(pid, (grant or {}).get("agent")) if pid else None
+    _reg.unregister_on_exit(proc, reg_file)
     if grant is not None and grant.get("acquired") and pid:
         try:
             _coord.track_machine_pids(_machine.machine_project(), agent=grant.get("agent"),
@@ -100,10 +104,13 @@ async def game_launch(
             proc.kill()
         except Exception:
             pass
+        _reg.unregister_launch(reg_file)
         _machine.give_back(grant)
         return error_response(ErrorCode.GAME_LAUNCH_FAILED, f"Instance on port {port} did not answer RemoteControl in time.")
     iid = registry.register(port=port, pid=pid)
     _track_proc(iid, proc)
+    if reg_file:
+        _REG_FILES[iid] = reg_file
     return ok_response({"instance_id": iid, "port": port, "pid": pid})
 
 
@@ -136,5 +143,6 @@ async def game_stop(
             proc.terminate()
         except Exception:
             pass
+    _reg.unregister_launch(_REG_FILES.pop(instance_id, None))
     registry.remove(instance_id)
     return ok_response({"stopped": instance_id})
