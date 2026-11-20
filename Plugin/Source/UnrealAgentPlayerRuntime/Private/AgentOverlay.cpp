@@ -659,6 +659,26 @@ namespace
     // Reinaldo asked for the overlay to appear in screenshots, so the PIE half is drawn as
     // Slate, which TakeScreenshot does capture.
     // =========================================================================================
+    /** Per-character advance and line height of the overlay's fixed-width font at `Font`'s size.
+        Measures two constant probe strings once per distinct size, never the live text. */
+    void GetMonoMetrics(const TSharedRef<FSlateFontMeasure>& Measure, const FSlateFontInfo& Font,
+                        float& OutCharW, float& OutLineH)
+    {
+        static float CachedSize = -1.0f;
+        static float CachedCharW = 0.0f;
+        static float CachedLineH = 0.0f;
+        if (!FMath::IsNearlyEqual(CachedSize, (float)Font.Size) || CachedCharW <= 0.0f)
+        {
+            static const FString WidthProbe(TEXT("MMMMMMMMMMMMMMMM"));   // 16 chars
+            static const FString HeightProbe(TEXT("Ag|"));
+            CachedCharW = (float)Measure->Measure(WidthProbe, Font).X / (float)WidthProbe.Len();
+            CachedLineH = (float)Measure->Measure(HeightProbe, Font).Y;
+            CachedSize = (float)Font.Size;
+        }
+        OutCharW = CachedCharW;
+        OutLineH = CachedLineH;
+    }
+
     class SUAPActivityOverlay : public SLeafWidget
     {
     public:
@@ -696,14 +716,22 @@ namespace
             const TSharedRef<FSlateFontMeasure> Measure =
                 FSlateApplication::Get().GetRenderer()->GetFontMeasureService();
 
-            float MaxW = 0.0f;
+            // NEVER Measure() the line text itself: it carries ticking seconds, so every paint is a
+            // new string and every new string is a new key in Slate's font-measure LRU (500 max,
+            // FontCacheUtils.h). ~10 unique keys/s per PIE window for an hour tripped
+            // `LookupSet.Num() < MaxNumElements` and crashed the editor (ticket 17tm4676445).
+            // "Mono" is fixed-width, so measure two constant probe strings once per font size and
+            // derive every line's width from its length. The key set is bounded by the number of
+            // distinct scales ever used, not by the text.
+            float CharW = 0.0f;
             float LineH = 0.0f;
+            GetMonoMetrics(Measure, Font, CharW, LineH);
+            int32 MaxChars = 0;
             for (const FLine& L : Lines)
             {
-                const FVector2D S = Measure->Measure(L.Text, Font);
-                MaxW = FMath::Max(MaxW, (float)S.X);
-                LineH = FMath::Max(LineH, (float)S.Y);
+                MaxChars = FMath::Max(MaxChars, L.Text.Len());
             }
+            const float MaxW = CharW * (float)MaxChars;
 
             const float Pad = 8.0f * Scale;
             const float Margin = 12.0f;
