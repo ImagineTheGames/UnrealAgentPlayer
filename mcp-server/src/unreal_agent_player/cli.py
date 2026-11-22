@@ -563,6 +563,9 @@ _CLIENT_VERBS = frozenset({
     "CaptureViewportWithUI",
     # An actor NAME is looked up in that client's world (it used to always be the host's).
     "StartPropertySample",
+    # A console command runs in THAT client's world on its own PlayerController, with or without
+    # a leading DEFER (which used to run on the host and, undeferred, in the editor world) [17tm4677wbv].
+    "ExecuteConsoleCommand",
 })
 
 

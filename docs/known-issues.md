@@ -1688,3 +1688,9 @@ PNG with `ok:true, exists:true`.
 * **Owner release:** each callback is tagged with the `--agent` token (or `$UAP_AGENT_ID`) of the exec that registered it. `uap lease release` and `uap pie stop` best-effort release that agent's callbacks (`exec_callbacks_released` in the answer). **Gap:** a tokenless exec has owner `""`, shared by every tokenless exec; only a tokenless release/stop drops those. Pass `--agent`.
 * **Handler reads an exec-scope global (non-fatal):** the exec namespace is rebuilt per call, so a callback reading e.g. `REC` after the exec ends raises NameError. The guard unregisters it and logs ONE warning that names the missing global and says callbacks must capture values via default args or closures (`def cb(dt, rec=REC)`).
 * **Still true:** callbacks registered with no PIE running are error-bounded and owner-released, not PIE-bounded. Python cannot register PIE delegates at all, so only slate ticks need the guard.
+
+## 53. `uap rc ExecuteConsoleCommand` ignored `--client` -- FIXED (17tm4677wbv)
+
+* **Symptom:** `uap rc ExecuteConsoleCommand ... --client N` (and `DEFER`) always ran in the editor/host world, whatever N was.
+* **Fix:** `ExecuteConsoleCommand(Command, Client)` runs `LocalPlayer->Exec` in client N world (`FAgentWorld::ExecConsoleOnClient`); `DEFER` is handled by its own next-tick ticker in that world. An unknown client is refused. No `--client` behaves as before.
+* **BREAKING(plugin):** `ExecuteConsoleCommand` gained a second `FString Client` parameter (editor and runtime subsystems). Old-arity callers break; re-sync the plugin and rebuild (Restart-Editor.ps1) in every project. The CLI refuses `--client` on an old plugin.

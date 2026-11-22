@@ -100,9 +100,10 @@ FString UUAPAgentRuntimeSubsystem::GetPluginVersion() const
     return TEXT("0.0.1");
 }
 
-FString UUAPAgentRuntimeSubsystem::ExecuteConsoleCommand(FString Command)
+FString UUAPAgentRuntimeSubsystem::ExecuteConsoleCommand(FString Command, FString Client)
 {
     UAP_ACTIVITY(TEXT("console"), Command);
+    if (!Client.TrimStartAndEnd().IsEmpty()) { return FAgentWorld::ExecConsoleOnClient(Client, Command); }
     UWorld* World = FAgentWorld::GetActiveGameWorld();
     if (!World) { return TEXT("ERROR: No active game world"); }
     FUAPStringOutputDevice Ar;

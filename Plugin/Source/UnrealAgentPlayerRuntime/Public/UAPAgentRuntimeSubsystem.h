@@ -20,7 +20,7 @@ public:
     void ShutdownRuntime();
 
     UFUNCTION(BlueprintCallable, Category="Agent|Status") FString GetPluginVersion() const;
-    UFUNCTION(BlueprintCallable, Category="Agent|Status") FString ExecuteConsoleCommand(FString Command);
+    UFUNCTION(BlueprintCallable, Category="Agent|Status") FString ExecuteConsoleCommand(FString Command, FString Client);
     // CLIENT (last parameter of every verb below that injects, holds, releases or reads UI):
     // which PIE client of a multi-client session the verb acts on. "" = the first game world (the
     // historical default, so an old caller is unchanged), "N" = PIE instance N, "all" = every

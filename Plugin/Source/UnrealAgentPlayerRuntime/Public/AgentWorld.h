@@ -47,6 +47,16 @@ public:
      */
     static bool ResolveClients(const FString& Client, TArray<UWorld*>& Out, FString& OutError);
 
+    /**
+     * Run a console command in ONE client's world, against that client's local PlayerController
+     * (ULocalPlayer::Exec), with that world current for the call [17tm4677wbv]. A leading `DEFER`
+     * is honoured HERE: UEngine::TickDeferredCommands runs deferred commands on the debug (first)
+     * local player, i.e. always the host, so the command is queued on a core ticker for the next
+     * tick instead and then run on the named client. Refuses (returns "ERROR: ...") for a
+     * selector that is empty, "all", or names no live client; never falls back to another world.
+     */
+    static FString ExecConsoleOnClient(const FString& Client, const FString& Command);
+
     /** JSON: every client's index, world, net mode, window title and which one is the default. */
     static FString DescribeClientsJson();
 

@@ -18,7 +18,7 @@ public:
     FString GetPluginVersion() const;
 
     UFUNCTION(BlueprintCallable, Category="Agent|Status")
-    FString ExecuteConsoleCommand(FString Command);
+    FString ExecuteConsoleCommand(FString Command, FString Client);
 
     // The RemoteControl HTTP port this editor's RC server actually bound. With two editors
     // open, the second auto-moves off the default 30010 to a free port; an agent CLI calls
