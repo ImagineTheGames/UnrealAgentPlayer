@@ -158,7 +158,7 @@ def test_release_all_is_the_recovery_path(monkeypatch, capsys):
     cannot silently corrupt every later test in the same PIE session."""
     seen = _stub_rc(monkeypatch, {"ReleaseHeldInput": json.dumps(
         {"ok": True, "released": 1, "controllers_flushed": 1, "flushed": True})})
-    assert cli.main(["input", "release"]) == 0
+    assert cli.main(["input", "release", "--all"]) == 0
     assert seen[0][1] == {"KeyName": ""}
     body = _out(capsys)
     assert body["released"] == 1
@@ -428,7 +428,7 @@ def test_every_verb_accepts_agent_and_project():
                  ["read-ui"], ["click", "x"], ["tab", "t"], ["nav", "up"],
                  ["screenshot", "f.png"], ["helpers"],
                  ["input", "hold", "W"], ["input", "axis", "K", "1"],
-                 ["input", "release"], ["input", "status"],
+                 ["input", "release", "--all"], ["input", "status"],
                  ["sample", "start", "PlayerPawn", "X"], ["sample", "read"],
                  ["log", "tail"], ["log", "since"], ["log", "cursor"],
                  ["report", "start", "q"], ["report", "assert", "l", "pass", "e"],
@@ -523,7 +523,7 @@ def test_pie_start_transport_failure_is_not_mistaken_for_skew(monkeypatch, capsy
 @pytest.mark.parametrize("argv,func", [
     (["input", "hold", "W", "--seconds", "1"], "HoldKey"),
     (["input", "axis", "Gamepad_LeftX", "1.0", "--seconds", "1"], "HoldAxis"),
-    (["input", "release"], "ReleaseHeldInput"),
+    (["input", "release", "--all"], "ReleaseHeldInput"),
     (["input", "status"], "GetHeldInput"),
     (["sample", "start", "/Obj", "Velocity", "--seconds", "1"], "StartPropertySample"),
     (["sample", "read"], "ReadPropertySample"),
