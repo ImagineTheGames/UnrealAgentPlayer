@@ -305,3 +305,23 @@ def test_no_world_reference_is_left_when_the_script_raises(monkeypatch):
     with contextlib.redirect_stdout(io.StringIO()), pytest.raises(RuntimeError, match="boom"):
         exec(compile(text, "<test>", "exec"), g)
     assert [k for k in g if k.startswith(("_uap_", "UAP_"))] == []
+
+
+def test_stale_leaked_world_listed_first_does_not_win(monkeypatch):
+    """2c349d36: a leaked UEDPIE_0_L_DevTest came first in ObjectIterator order and was picked as
+    client 0 while the live PIE ran Map_PhantomJanitor. The world sharing the editor play
+    world's map name must win, for every client index, whatever the iteration order."""
+    stale0 = _World("L_DevTest", "/Game/Levels/UEDPIE_0_L_DevTest")
+    stale1 = _World("L_DevTest", "/Game/Levels/UEDPIE_1_L_DevTest")
+    live0 = _World("Map_PhantomJanitor", "/P/Maps/UEDPIE_0_Map_PhantomJanitor")
+    live1 = _World("Map_PhantomJanitor", "/P/Maps/UEDPIE_1_Map_PhantomJanitor")
+    for sel, want in (("0", live0), ("1", live1), ("auto", live0)):
+        fake = _fake_unreal({0: live0})
+        fake.ObjectIterator = lambda cls: iter([stale0, stale1, live1, live0])
+        monkeypatch.setitem(sys.modules, "unreal", fake)
+        buf = io.StringIO()
+        g: dict = {}
+        with contextlib.redirect_stdout(buf):
+            exec(compile(xc.build_client_code("print('W', id(UAP_WORLD))", sel), "<t>", "exec"), g)
+        assert f"W {id(want)}" in buf.getvalue(), sel
+        assert "UEDPIE_0_Map_PhantomJanitor" in buf.getvalue() or sel == "1"
