@@ -19,7 +19,7 @@ public class UnrealAgentPlayerRuntime : ModuleRules
             "Json", "JsonUtilities",
             "RemoteControl", "RemoteControlCommon", "WebRemoteControl",
             "Sockets", "Networking",
-            "DeveloperSettings", "Projects",
+            "DeveloperSettings", "Projects", "EnhancedInput",
         });
     }
 }

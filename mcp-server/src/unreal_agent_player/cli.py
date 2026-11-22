@@ -814,6 +814,37 @@ def _rc_json(func: str, params: dict, project: str | None = None,
     return raw if isinstance(raw, dict) else {"ok": False, "error": f"{func}: unexpected result {raw!r}"}
 
 
+# Verbs that live on a class DEFAULT OBJECT rather than the subsystem preset (so no preset
+# re-expose is needed): called straight through /remote/object/call.
+_INPUT_ACTION_OBJ = "/Script/UnrealAgentPlayerRuntime.Default__UAPInputActionLibrary"
+
+
+def _rc_object_json(object_path: str, func: str, params: dict, project: str | None = None,
+                    *, needs: str) -> dict:
+    """Call a UFUNCTION on a CDO via /remote/object/call and decode its JSON-string result.
+    A 404 means this project's plugin copy predates the verb: named as skew, not leaked."""
+    target = _RC_TARGET[0]
+    port = target["port"] if target else _rc_port_for(project)
+
+    async def _go():
+        rc = RemoteControlClient(port=port)
+        try:
+            return await rc.call_function(object_path, func, parameters=params)
+        finally:
+            await rc.aclose()
+
+    try:
+        resp = asyncio.run(_go())
+    except AgentError as exc:
+        if _is_missing_verb(exc) or "404" in str(exc):
+            raise _skew_error(func, project, needs) from None
+        raise
+    raw = resp.get("ReturnValue") if isinstance(resp, dict) else None
+    if isinstance(raw, str):
+        return json.loads(raw)
+    return {"ok": False, "error": f"{func}: unexpected result {resp!r}"}
+
+
 def _capture(tool: str, args: dict, body: dict, ms: int) -> None:
     # Auto-capture records into THIS call's agent report only. Tokenless with several reports
     # open is ambiguous, so it records nowhere rather than into whichever is first.
@@ -1808,6 +1839,16 @@ def _input(args) -> int:
                     return 1
                 params["SlateUser"] = str(args.user)
             body.update(_rc_json("HoldAxis", params, args.project, needs=_NEEDS_HOLD))
+        elif sub == "action":
+            # The OpenXR path: Enhanced Input InjectInputForAction on the local player. A key
+            # (hold/axis) stops at the PlayerController's key mappings; an action-driven game
+            # (the VR pawn's jump stick) is only reachable this way.
+            body.update(_rc_object_json(
+                _INPUT_ACTION_OBJ, "InjectInputAction",
+                {"ActionPath": args.path, "Value": args.value,
+                 "Client": str(_CLIENT[0] or "").strip()},
+                args.project,
+                needs="driving an Enhanced Input action (uap input action); rebuild the plugin"))
         elif sub == "release":
             body.update(_rc_json("ReleaseHeldInput", {"KeyName": args.key or ""}, args.project,
                                  needs=_NEEDS_HOLD))
@@ -4225,6 +4266,15 @@ def build_parser() -> argparse.ArgumentParser:
                          "or any input pre-processor sees). Omit for the game-viewport route "
                          "(gameplay/Enhanced Input). Refuses loudly if Slate has no user N")
     ia.set_defaults(func=_input)
+    iact = inps.add_parser("action", parents=[proj],
+                           help="inject an Enhanced Input ACTION value (InjectInputForAction), the "
+                                "way an OpenXR controller does -- reaches action-driven logic a key "
+                                "injection cannot (e.g. the VR pawn jump stick)")
+    iact.add_argument("path", help="UInputAction path, e.g. /Game/VRE/Input/Actions/MotionControllerThumbRight_Y")
+    iact.add_argument("value", type=float, nargs="?", default=1.0,
+                      help="action value (bool actions: >0.5 = pressed). One injection lasts one "
+                           "input tick; feed 0 after to release / re-arm an edge gate")
+    iact.set_defaults(func=_input)
     ir = inps.add_parser("release", parents=[proj], help="end a hold early (default: all holds)")
     ir.add_argument("key", nargs="?", default="", help="FKey name; omit to release everything")
     ir.set_defaults(func=_input)
