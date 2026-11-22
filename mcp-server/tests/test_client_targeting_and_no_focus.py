@@ -565,3 +565,43 @@ def test_sampler_cpp_refuses_an_ambiguous_name_only_when_no_client_was_given():
     # and the per-client branch (ClientWorlds.Num() == 1) must not call it
     client_branch = start[start.index("ClientWorlds.Num() == 1"):start.index("UAPCheckNameAmbiguity")]
     assert "UAPCheckNameAmbiguity" not in client_branch.split("else")[0]
+
+
+# --- rc ExecuteConsoleCommand --client N runs in client N's world, DEFER or not [17tm4677wbv] ---
+
+def test_rc_console_command_is_per_client_and_keeps_the_defer_prefix(monkeypatch):
+    """`uap rc ExecuteConsoleCommand "Command=DEFER <cmd>" --client 1` ran in the host world:
+    the call carried no Client, and DEFER queues on GEngine->DeferredCommands, which the engine
+    runs on the FIRST local player. Client now rides along and the command text is untouched."""
+    monkeypatch.setattr(cli, "_live_contract", lambda project=None: None)
+    cli._CLIENT[0] = "1"
+    assert "ExecuteConsoleCommand" in cli._CLIENT_VERBS
+    sent = cli._with_client("ExecuteConsoleCommand", {"Command": "DEFER stat fps"}, None)
+    assert sent == {"Command": "DEFER stat fps", "Client": "1"}
+
+
+def test_rc_console_command_refuses_a_plugin_that_cannot_route_it(monkeypatch):
+    """An older plugin would drop Client and run the command on the host: refuse instead."""
+    cli._CLIENT[0] = "1"
+    monkeypatch.setattr(cli, "_live_contract", lambda project=None: {
+        "ExecuteConsoleCommand": {"Command": "FString"}})
+    with pytest.raises(cli.AgentError):
+        cli._with_client("ExecuteConsoleCommand", {"Command": "DEFER stat fps"}, "SchoolsOut")
+
+
+def test_rc_console_command_without_client_is_unchanged(monkeypatch):
+    cli._CLIENT[0] = None
+    assert cli._with_client("ExecuteConsoleCommand", {"Command": "stat fps"}, None) == {"Command": "stat fps"}
+
+
+def test_plugin_runs_a_client_console_command_on_that_clients_local_player_and_handles_defer_itself():
+    """C++ cannot run under pytest: pin the source. Both subsystems route a named Client through
+    FAgentWorld::ExecConsoleOnClient, which runs on the client's own LocalPlayer (so its
+    PlayerController and world) and queues DEFER on its own ticker, never GEngine->DeferredCommands."""
+    for rel in ("UnrealAgentPlayer/Private/UAPAgentSubsystem.cpp",
+                "UnrealAgentPlayerRuntime/Private/UAPAgentRuntimeSubsystem.cpp"):
+        assert "FAgentWorld::ExecConsoleOnClient(Client, Command)" in _plugin(rel), rel
+    cpp = _plugin("UnrealAgentPlayerRuntime/Private/AgentWorld.cpp")
+    assert "LP->Exec(World" in cpp and "GetLocalPlayer()" in cpp
+    assert 'TEXT("DEFER ")' in cpp and "FTSTicker" in cpp
+    assert "DeferredCommands" not in cpp.replace("GEngine->DeferredCommands.Add", "")

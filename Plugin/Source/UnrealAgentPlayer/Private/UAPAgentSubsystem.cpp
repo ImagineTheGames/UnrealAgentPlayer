@@ -124,9 +124,12 @@ int32 UUAPAgentSubsystem::GetRemoteControlPort() const
     return FUnrealAgentPlayerRuntimeModule::GetConfiguredRCPort();
 }
 
-FString UUAPAgentSubsystem::ExecuteConsoleCommand(FString Command)
+FString UUAPAgentSubsystem::ExecuteConsoleCommand(FString Command, FString Client)
 {
     UAP_ACTIVITY(TEXT("console"), Command);
+    // A named client runs the command in THAT PIE client's world on its own PlayerController; empty
+    // keeps the historical editor-world behaviour [17tm4677wbv].
+    if (!Client.TrimStartAndEnd().IsEmpty()) { return FAgentWorld::ExecConsoleOnClient(Client, Command); }
     if (!GEditor)
     {
         return TEXT("ERROR: GEditor not available");

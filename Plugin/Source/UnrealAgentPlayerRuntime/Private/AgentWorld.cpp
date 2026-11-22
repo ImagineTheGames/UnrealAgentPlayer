@@ -9,12 +9,37 @@
 #include "Serialization/JsonWriter.h"
 #include "GameFramework/PlayerController.h"
 #include "GameFramework/Pawn.h"
+#include "Engine/LocalPlayer.h"
+#include "Containers/Ticker.h"
+#include "Misc/OutputDevice.h"
 
 namespace
 {
     // The world an FScope made current. Weak: a PIE world torn down under a live scope must
     // read as "no override", never dangle. Game thread only, like every other caller here.
     TWeakObjectPtr<UWorld> GOverrideWorld;
+
+    class FUAPWorldConsoleBuffer : public FOutputDevice
+    {
+    public:
+        FString Buffer;
+        virtual void Serialize(const TCHAR* V, ELogVerbosity::Type, const FName&) override
+        {
+            Buffer += V;
+            Buffer += TEXT("\n");
+        }
+    };
+
+    // The console as the player's own: the client's LocalPlayer routes to ITS PlayerController
+    // and world, so PlayerController-dependent commands and GetWorld()-based handlers see this client.
+    void UAPExecInWorld(UWorld* World, const FString& Cmd, FOutputDevice& Ar)
+    {
+        FAgentWorld::FScope Scope(World);
+        APlayerController* PC = World->GetFirstPlayerController();
+        ULocalPlayer* LP = PC ? PC->GetLocalPlayer() : nullptr;
+        if (LP) { LP->Exec(World, *Cmd, Ar); }
+        else    { GEngine->Exec(World, *Cmd, Ar); }
+    }
 
     const TCHAR* UAPNetModeName(ENetMode Mode)
     {
@@ -197,4 +222,40 @@ FString FAgentWorld::DescribeClientsJson()
     TSharedRef<TJsonWriter<>> Writer = TJsonWriterFactory<>::Create(&Out);
     FJsonSerializer::Serialize(Root, Writer);
     return Out;
+}
+
+FString FAgentWorld::ExecConsoleOnClient(const FString& Client, const FString& Command)
+{
+    TArray<UWorld*> Worlds;
+    FString Error;
+    if (Client.TrimStartAndEnd().IsEmpty() || !ResolveClients(Client, Worlds, Error))
+    {
+        return FString::Printf(TEXT("ERROR: %s"), Error.IsEmpty() ? TEXT("no Client given") : *Error);
+    }
+    if (Worlds.Num() != 1)
+    {
+        return FString::Printf(TEXT("ERROR: Client 'all' makes no sense for a console command (one result); name one client. Clients right now: %s."),
+                               *DescribeClientsShort());
+    }
+    UWorld* World = Worlds[0];
+    FString Cmd = Command.TrimStart();
+    bool bDefer = false;
+    if (Cmd.StartsWith(TEXT("DEFER "), ESearchCase::IgnoreCase))
+    {
+        bDefer = true;
+        Cmd = Cmd.Mid(6).TrimStart();
+    }
+    if (bDefer)
+    {
+        const TWeakObjectPtr<UWorld> Weak(World);
+        FTSTicker::GetCoreTicker().AddTicker(FTickerDelegate::CreateLambda([Weak, Cmd](float)
+        {
+            if (UWorld* W = Weak.Get()) { UAPExecInWorld(W, Cmd, *GLog); }
+            return false;
+        }), 0.0f);
+        return FString::Printf(TEXT("deferred on client %d (%s): %s"), GetClientIndex(World), *World->GetName(), *Cmd);
+    }
+    FUAPWorldConsoleBuffer Ar;
+    UAPExecInWorld(World, Cmd, Ar);
+    return Ar.Buffer;
 }
