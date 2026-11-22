@@ -34,7 +34,7 @@ Use this first — it tells the agent whether the editor is up and which channel
 
 **`pie_status` returns:** `phase` (`NotPlaying` / `Playing` / `Paused` / `Ending`), `elapsed_seconds`.
 
-> PIE starts the level currently open in the editor. To play a specific map, load it first via `exec_python` (`LevelEditorSubsystem.load_level("/Game/...")`).
+> PIE starts the level currently open in the editor. To play a specific map, open it first with `uap level open /Game/...` -- NEVER `LevelEditorSubsystem.load_level` through `exec_python` (it runs the load nested inside a Python frame and has killed the shared editor, ClickUp 86akezbrp).
 
 **Starting PIE blocks by default** (CLI `uap pie start`, MCP `pie_start`). It returns once the play
 world is LIVE, reporting `playing: true` + `waited_seconds` -- the same vocabulary `pie_stop`

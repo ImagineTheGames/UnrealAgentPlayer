@@ -816,6 +816,37 @@ def _rc_json(func: str, params: dict, project: str | None = None,
     return raw if isinstance(raw, dict) else {"ok": False, "error": f"{func}: unexpected result {raw!r}"}
 
 
+# Verbs that live on a class DEFAULT OBJECT rather than the subsystem preset (so no preset
+# re-expose is needed): called straight through /remote/object/call.
+_INPUT_ACTION_OBJ = "/Script/UnrealAgentPlayerRuntime.Default__UAPInputActionLibrary"
+
+
+def _rc_object_json(object_path: str, func: str, params: dict, project: str | None = None,
+                    *, needs: str) -> dict:
+    """Call a UFUNCTION on a CDO via /remote/object/call and decode its JSON-string result.
+    A 404 means this project's plugin copy predates the verb: named as skew, not leaked."""
+    target = _RC_TARGET[0]
+    port = target["port"] if target else _rc_port_for(project)
+
+    async def _go():
+        rc = RemoteControlClient(port=port)
+        try:
+            return await rc.call_function(object_path, func, parameters=params)
+        finally:
+            await rc.aclose()
+
+    try:
+        resp = asyncio.run(_go())
+    except AgentError as exc:
+        if _is_missing_verb(exc) or "404" in str(exc):
+            raise _skew_error(func, project, needs) from None
+        raise
+    raw = resp.get("ReturnValue") if isinstance(resp, dict) else None
+    if isinstance(raw, str):
+        return json.loads(raw)
+    return {"ok": False, "error": f"{func}: unexpected result {resp!r}"}
+
+
 def _capture(tool: str, args: dict, body: dict, ms: int) -> None:
     # Auto-capture records into THIS call's agent report only. Tokenless with several reports
     # open is ambiguous, so it records nowhere rather than into whichever is first.
@@ -1021,6 +1052,12 @@ def _rc(args) -> int:
                 f"{', '.join(f'{k}: {v}' for k, v in types.items()) or '(none)'}.")})
             return 2
 
+    if func == "ExecuteConsoleCommand":
+        net = _net_emulation_refusal(str(params.get("Command", "")), args.project, scan=False)
+        if net:
+            _emit({"ok": False, "error": net})
+            return 1
+
     t0 = time.monotonic()
     body: dict = {"ok": True}
     twin = _RC_JSON_TWINS.get(func) if not params else None
@@ -1051,17 +1088,44 @@ def _exec(args) -> int:
     code = args.code
     t0 = time.monotonic()
     body: dict = {"ok": True}
+    refusal = None if getattr(args, "unsafe_level_load", False) else _exec_level_load_refusal(code)
+    level_warning = None
+    if refusal and getattr(args, "level_guard", "refuse") == "warn":
+        # exec-file: the map-builder scripts open their own map first, so it is a warning there.
+        level_warning = refusal.replace("refusing: ", "WARNING (ran anyway, exec-file): ")                                .replace(" The script was NOT run.", "")
+        refusal = None
+    if refusal:
+        body = {"ok": False, "error": refusal}
+        _capture("exec", {"code": code[:200]}, body, int((time.monotonic() - t0) * 1000))
+        _emit(body)
+        return 1
+    from unreal_agent_player.tools import console as _console
+    net = _console.NONE_WORLD_REFUSAL if _console.none_world_console_call(code) else None
+    net = net or _net_emulation_refusal(code, args.project, scan=True)
+    if not net and not getattr(args, "unsafe_level_load", False)             and getattr(args, "level_guard", "refuse") != "warn":
+        net = _exec_travel_refusal(code)
+    if net:
+        body = {"ok": False, "error": net}
+        _capture("exec", {"code": code[:200]}, body, int((time.monotonic() - t0) * 1000))
+        _emit(body)
+        return 1
     client = PythonRemoteExecClient(node_project_substr=args.project,
                                     node_instance=getattr(args, "instance", None))
     try:
         # --client N: run with client N's PIE world as the target world. It used to be IGNORED
         # here, so a 2-client "client reads" script read the host twice [17tm466zztw].
         sel = _client_tag()
+        auto = not sel
+        if auto:
+            # No --client: pick the server world explicitly (and log it) instead of whatever
+            # get_game_world() answers in a multi-client PIE [CRASH-64FF6CF8]. A standalone `-game`
+            # instance has no editor Python, so it is left alone.
+            sel = "auto"
         wrapped = False
-        if sel and not _exec_client_is_noop(args, sel):
+        if not (auto and _standalone_instance_selected(args, None))                 and not _exec_client_is_noop(args, sel):
             from unreal_agent_player import exec_client as _xc
             try:
-                code = _xc.build_client_code(code, sel)
+                code = _xc.build_client_code(code, sel, _agent_token(getattr(args, "agent", None)))
             except ValueError as exc:
                 raise AgentError(ErrorCode.SCHEMA_VALIDATION, str(exc)) from exc
             wrapped = True
@@ -1077,6 +1141,12 @@ def _exec(args) -> int:
             if refusal:
                 body["ok"] = False
                 body["error"] = f"--client {sel}: {refusal} The script was NOT run."
+            elif info is None and auto:
+                # Implicit default only: no preamble report (no editor Python, a fake node). The
+                # script ran as it always did; say the world was not pinned rather than fail.
+                level_warning = ((level_warning + " | ") if level_warning else "") + (
+                    "default server-world selection did not report; the script ran against the "
+                    "editor's own play world, not a pinned one.")
             elif info is None:
                 # The preamble never reported: it did not run (or its output was lost). Handing
                 # back the script's answer would be the silent host read this exists to stop.
@@ -1085,7 +1155,8 @@ def _exec(args) -> int:
                                  "did not report, so the script may have run against the wrong "
                                  "world. See output; do not trust this result.")
             else:
-                body["client"] = info
+                if info.get("index", 0) >= 0:
+                    body["client"] = info
     except AgentError as exc:
         body = _err(exc)
     # Always say WHICH process answered. The failure this exists for was an exec that landed on
@@ -1093,6 +1164,8 @@ def _exec(args) -> int:
     # subsystem; the reader had no way to tell that from a real editor answering `None`.
     if _target_of(client) is not None:
         body["target"] = _target_of(client)
+    if level_warning:
+        body["warning"] = level_warning
     _capture("exec", {"code": code[:200]}, body, int((time.monotonic() - t0) * 1000))
     _emit(body)
     return 0 if body["ok"] else 1
@@ -1146,6 +1219,21 @@ def _instances(args) -> int:
     return 0 if body["ok"] else 1
 
 
+def _release_exec_callbacks(project: str | None, agent: str | None) -> int | None:
+    """Drop the tick/delegate callbacks this agent's `uap exec` calls left in the editor
+    (exec_callbacks.py). Best effort: an unreachable editor or a missing guard is not an error.
+    Callbacks are keyed by the --agent token (or $UAP_AGENT_ID); tokenless execs share owner ""."""
+    try:
+        from unreal_agent_player import exec_callbacks as _ecb
+        client = PythonRemoteExecClient(node_project_substr=project)
+        res = client.exec_python(_ecb.release_code(_agent_token(agent)))
+        text = " ".join(str(o.get("output", "")) for o in (res.get("output") or []))
+        m = re.search(r"@@UAP_CB_RELEASED@@ (\d+)", text)
+        return int(m.group(1)) if m else None
+    except Exception:
+        return None
+
+
 def _exec_file(args) -> int:
     with open(args.path, encoding="utf-8") as f:
         code = f.read()
@@ -1154,7 +1242,9 @@ def _exec_file(args) -> int:
     from unreal_agent_player.transport import guard_py_path_trigger
     code = guard_py_path_trigger(code)
     return _exec(argparse.Namespace(code=code, project=args.project,
-                                    instance=getattr(args, "instance", None)))
+                                    instance=getattr(args, "instance", None),
+                                    unsafe_level_load=getattr(args, "unsafe_level_load", False),
+                                    level_guard="warn", agent=getattr(args, "agent", None)))
 
 
 def _pie_start(mode: str, project: str | None) -> dict:
@@ -1465,6 +1555,9 @@ def _pie(args) -> int:
             timeout = getattr(args, "timeout", None)
             body.update(_pie_stop(args.project,
                                   _pie_stop_timeout() if timeout is None else timeout))
+            if body.get("ok"):
+                body["exec_callbacks_released"] = _release_exec_callbacks(
+                    args.project, getattr(args, "agent", None))
         elif sub == "wait":
             # The SAME implementation `pie start` blocks on -- see _pie_wait_for_live. `wait`
             # remains for the `--no-wait` path and for waiting on a session someone else started.
@@ -1748,6 +1841,16 @@ def _input(args) -> int:
                     return 1
                 params["SlateUser"] = str(args.user)
             body.update(_rc_json("HoldAxis", params, args.project, needs=_NEEDS_HOLD))
+        elif sub == "action":
+            # The OpenXR path: Enhanced Input InjectInputForAction on the local player. A key
+            # (hold/axis) stops at the PlayerController's key mappings; an action-driven game
+            # (the VR pawn's jump stick) is only reachable this way.
+            body.update(_rc_object_json(
+                _INPUT_ACTION_OBJ, "InjectInputAction",
+                {"ActionPath": args.path, "Value": args.value,
+                 "Client": str(_CLIENT[0] or "").strip()},
+                args.project,
+                needs="driving an Enhanced Input action (uap input action); rebuild the plugin"))
         elif sub == "release":
             body.update(_rc_json("ReleaseHeldInput", {"KeyName": args.key or ""}, args.project,
                                  needs=_NEEDS_HOLD))
@@ -2941,6 +3044,170 @@ def _viewport(args) -> int:
     return 0 if body.get("ok") else 1
 
 
+# --- level: the SAFE way to change the open level --------------------------------------------
+#
+# `ULevelEditorSubsystem.load_level` (and load_map / new_level ...) called from editor Python runs the
+# whole map load, GC included, NESTED INSIDE a live Python frame. Whatever that frame holds -- locals,
+# temporaries, wrappers of the outgoing world -- is rooted by FPyReferenceCollector while the old world
+# is torn down. It has killed the SHARED editor repeatedly: "World Memory Leaks: 1 leaks objects and
+# packages" (EditorServer.cpp:1938) and, 2026-11-13, "Assertion failed: IsValidLowLevel()
+# [Obj.cpp:1312]" from the GC inside Map_Load with python311 frames on the stack. [ClickUp 86akezbrp]
+# `uap level open` hands the load to the plugin, which runs it from the editor's own ticker, outside any
+# Python frame, after sweeping the remote-exec globals and Python's garbage.
+
+_NEEDS_LEVEL = ("changing the open level SAFELY (the alternative, load_level from Python, has "
+                "killed the shared editor)")
+
+# The Python spellings of "swap the open level". Matched on the code an `exec` / `exec-file` is about
+# to run; `--unsafe-level-load` is the deliberate override.
+_EXEC_LEVEL_LOAD_RE = re.compile(
+    r"\b(load_level|load_map|open_level|new_level|new_level_from_template|new_blank_map|"
+    r"new_map_from_template|LoadLevel|LoadMap|OpenLevel|NewLevel|NewBlankMap)\b")
+
+
+# Console / Python spellings of a map change or server travel. `open <map>` and `servertravel` run
+# through execute_console_command against whichever world exec resolved, and in a multi-client PIE
+# that asserted the editor (CRASH-64FF6CF8). Matched inside string literals on purpose: the console
+# command is text.
+_EXEC_TRAVEL_RE = re.compile(
+    r"(?i)(?:[\"'`]\s*(?:open|servertravel|clienttravel|travel)\s+\S|"
+    r"\b(?:server_travel|client_travel|seamless_travel|open_level_by_soft_object_ptr)\b|"
+    r"\b(?:ServerTravel|ClientTravel|SeamlessTravel|OpenLevelBySoftObjectPtr)\b)")
+
+
+def _exec_level_load_refusal(code: str) -> str | None:
+    """The refusal for Python that swaps the editor level, or None. A level swap from Python is the
+    crash this verb exists to end, so it is refused BY DEFAULT -- a doc agents may not read does not
+    stop the next one."""
+    m = _EXEC_LEVEL_LOAD_RE.search(code or "")
+    if not m:
+        return None
+    return (f"refusing: this Python calls `{m.group(1)}`. Swapping the open level from editor "
+            "Python runs the map load nested inside a Python frame and has killed the SHARED editor "
+            "(World Memory Leaks / IsValidLowLevel, ClickUp 86akezbrp). Use `uap level open <map>` "
+            "instead -- it loads outside Python, refuses during PIE and on a dirty map, and reads "
+            "the result back. Override only on a throwaway editor with --unsafe-level-load. "
+            "The script was NOT run.")
+
+
+def _exec_travel_refusal(code: str) -> str | None:
+    """Refusal for `open <map>` / `servertravel` console commands and their Python spellings."""
+    tm = _EXEC_TRAVEL_RE.search(code or "")
+    if not tm:
+        return None
+    return ("refusing: this Python runs a level open / travel (`" + tm.group(0).strip() + "`). "
+            "`open <map>` / `servertravel` from editor Python lands in whichever PIE world exec "
+            "resolved and killed the SHARED editor in a multi-client PIE (CRASH-64FF6CF8). Use "
+            "`uap level open <map>` (editor level) or `uap pie` (PIE session) instead. "
+            "Override only on a throwaway editor with --unsafe-level-load. "
+            "The script was NOT run.")
+
+
+def _net_emulation_refusal(text: str, project: str | None, *, scan: bool) -> str | None:
+    """Refusal for a net-emulation console command (NetEmulation.Off, PktLag ...) sent while no
+    PIE/game world is live: the engine asserts in HandleInvalidWorldContext and the SHARED editor
+    dies (2026-11-15). `scan` searches inside Python text; otherwise `text` is the command."""
+    from unreal_agent_player.tools import console as _console
+    rx = _console.NET_EMULATION_SCAN_RE if scan else _console._WORLD_COMMAND_RE
+    if not rx.search(text or ""):
+        return None
+    try:
+        if _rc_call("IsInPIE", {}, project):
+            return None
+    except (AgentError, json.JSONDecodeError):
+        return None  # editor unreachable: nothing to crash, the real call will report that
+    return _console.NET_EMULATION_REFUSAL if scan else _console.WORLD_COMMAND_REFUSAL
+
+
+_LEVEL_OPEN_TIMEOUT = 180.0
+_LEVEL_POLL_PROBE_TIMEOUT = 3.0
+
+
+def _level_open(args) -> dict:
+    """Queue a safe level change, wait for it, read the open map back."""
+    project = args.project
+    t0 = time.monotonic()
+    queued = _rc_json("OpenLevel", {"Map": args.map, "bDiscard": bool(args.discard)}, project,
+                      needs=_NEEDS_LEVEL)
+    if not queued.get("ok"):
+        return queued
+    request = queued.get("request")
+    timeout = float(getattr(args, "timeout", None) or _LEVEL_OPEN_TIMEOUT)
+    deadline = t0 + timeout
+    status: dict | None = None
+    silent = 0
+    # The editor's game thread is busy for the whole load, so RemoteControl does not answer: a
+    # short probe timeout keeps each poll cheap and a timeout is "still loading", not a failure.
+    _RC_PROBE_TIMEOUT[0] = _LEVEL_POLL_PROBE_TIMEOUT
+    try:
+        time.sleep(0.5)
+        while time.monotonic() < deadline:
+            try:
+                st = _rc_json("GetLevelOpenStatus", {}, project, needs=_NEEDS_LEVEL)
+                silent = 0
+            except AgentError as exc:
+                if _is_timeout(exc):
+                    time.sleep(0.5)
+                    continue
+                silent += 1
+                if silent >= 6:
+                    return {"ok": False, "request": request, "map": queued.get("map"),
+                            "error": f"the editor stopped answering during the level open ({exc}). "
+                                     "It may have crashed: check Saved/Logs and Saved/Crashes. "
+                                     "Do not retry blindly."}
+                time.sleep(1.0)
+                continue
+            if st.get("request") == request and st.get("state") in ("done", "failed"):
+                status = st
+                break
+            time.sleep(0.5)
+    finally:
+        _RC_PROBE_TIMEOUT[0] = None
+    if status is None:
+        return {"ok": False, "request": request, "map": queued.get("map"), "pending": True,
+                "waited_seconds": round(time.monotonic() - t0, 1),
+                "error": f"the level load did not finish within {timeout:.0f}s. It may still "
+                         "complete: run `uap level current` before doing anything else."}
+
+    out: dict = {"ok": bool(status.get("ok")), "map": status.get("map"),
+                 "map_before": status.get("map_before"), "map_after": status.get("map_after"),
+                 "load_seconds": status.get("load_seconds"), "discard": bool(args.discard),
+                 "waited_seconds": round(time.monotonic() - t0, 1)}
+    if queued.get("mounted_plugin"):
+        out["mounted_plugin"] = queued["mounted_plugin"]
+    if status.get("cleared_globals"):
+        out["cleared_globals"] = status["cleared_globals"]
+    if status.get("error"):
+        out["error"] = status["error"]
+    # Read it back from the live editor rather than trusting the load's own report.
+    try:
+        cur = _rc_json("GetCurrentLevel", {}, project, needs=_NEEDS_LEVEL)
+    except AgentError as exc:
+        cur = {"ok": False, "error": str(exc)}
+    out["readback"] = cur
+    if out["ok"] and not (cur.get("ok") and str(cur.get("map", "")).lower() == str(out["map"]).lower()):
+        out["ok"] = False
+        out["error"] = (f"load reported success but the editor reads back "
+                        f"{cur.get('map')!r}, not {out['map']!r}")
+    return out
+
+
+def _level(args) -> int:
+    """`uap level open <map> [--discard]` / `uap level current`."""
+    t0 = time.monotonic()
+    try:
+        if args.level_cmd == "open":
+            body = _level_open(args)
+        else:
+            body = _rc_json("GetCurrentLevel", {}, args.project, needs=_NEEDS_LEVEL)
+    except AgentError as exc:
+        body = _err(exc)
+    _capture("level", {k: v for k, v in vars(args).items() if k not in ("func",)}, body,
+             int((time.monotonic() - t0) * 1000))
+    _emit(body)
+    return 0 if body.get("ok") else 1
+
+
 _HELP_CATALOG = r"""uap -- drive the Unreal editor for agent testing. Commands target the
 editor named by --project (default $UAP_PROJECT, pinned by this project's uap.ps1 launcher).
 
@@ -3052,7 +3319,16 @@ PLAY-IN-EDITOR
   PBW aircraft flew unattended into a building on 2026-08-28.
 
 MULTI-AGENT COORDINATION (several agents sharing one editor; see docs/agent-coordination.md)
-  Rebuild ONLY via Restart-Editor.ps1 -- it self-locks; never bounce the editor by hand.
+  NEVER run the restart script (Restart-Editor.ps1) yourself, never bounce the editor by hand.
+  Ask the REBUILD BROKER: one restart serves every pending request (fires ~4 min after the first,
+  at once if the editor is down; waits for the current lease holder, never preempts PIE).
+  uap rebuild request --agent <tok> --task "<ticket> <title>" [--reason "..."]   returns at once
+  uap rebuild wait --agent <tok> [--seconds 110]   blocks until a rebuild that STARTED AFTER your
+                                            request finished: ok, or failed + `note` (file, line,
+                                            owning CL; editor_up:true = the compile preflight
+                                            stopped it and nobody lost the editor).
+                                            still_waiting = call again, nothing is lost.
+  uap rebuild status                        pending requests, runner, last runs
   Editor-touching verbs auto-wait through another agent's rebuild (block then resume, not fail).
   uap lease status                          who holds the editor + why (and their --task)
   --task "<what you are doing>" / $UAP_TASK   human label shown beside your --agent token in the
@@ -3108,6 +3384,22 @@ DRIVE + OBSERVE
                                   unfocused/paused), stamped with its process/project/context;
                                   blank frames refused; counts as pass proof for its project
   uap helpers [--grep RE] [--names]   list the project's test helpers with their arg schemas
+
+LEVEL (change the open map SAFELY -- never load_level from `uap exec`)
+  uap level current                    the open map, dirty state, PIE state, read from the editor
+  uap level open <map> [--discard]     open a map and WAIT; ok:true means the editor reads the map back.
+                                       <map> = /Game/Maps/L_X | /Game/Maps/L_X.L_X | a unique bare name |
+                                       a Dream map /<Plugin>/Maps/<Map> (its content-only plugin is
+                                       mounted for you). Refuses during PIE, while another open is
+                                       pending, and on a DIRTY map unless --discard. It NEVER saves.
+  WHY: load_level / load_map from editor Python runs the map load (and its GC) nested inside a live
+  Python frame; whatever that frame references is rooted while the old world is destroyed, and the
+  SHARED editor dies ("World Memory Leaks", "Assertion failed: IsValidLowLevel()" -- ClickUp 86akezbrp).
+  `level open` queues the load in the plugin, which runs it from the editor ticker OUTSIDE any Python
+  frame after dropping the exec globals and collecting Python garbage. `uap exec` / `exec-file` now
+  REFUSE code that calls load_level / load_map / new_level (--unsafe-level-load overrides, throwaway
+  editors only). Hold the lease (`uap lease acquire exclusive --reason pie`) if others share the editor:
+  a level change takes the editor away from whatever they were doing.
 
 SUSTAINED INPUT (a single injected event CANNOT drive locomotion -- see below)
   uap input hold <Key> --seconds N     hold a digital key; returns at once, held in-engine
@@ -3340,8 +3632,8 @@ RULES THAT BITE
   * Run via this project's uap.ps1 (pins the editor). Pass the SAME --agent <tok> on every call.
   * Done = `uap report finish` wrote the HTML report (cite its path), with a screenshot taken
     by `uap screenshot <abs.png>` from THIS editor. Assert on state you read, not on pixels.
-  * One shared editor: rebuild ONLY via Restart-Editor.ps1. Editor verbs auto-wait through
-    another agent's rebuild or exclusive lease -- slow is not failed.
+  * Never restart the editor yourself: `uap rebuild request` + `wait`. Editor verbs
+    auto-wait through another agent's rebuild or exclusive lease -- slow is not failed.
   * <= 5 fps means the editor is NOT FOREGROUND (throttled); timings taken then are void.
   * Never tight-loop exec/rc while PIE is starting: it can hard-crash the editor.
 
@@ -3359,9 +3651,11 @@ VERBS (uap help <verb>)
   report start|assert|note|screenshot|diag|finish     the verification record
   pie start|stop|wait            play-in-editor; start blocks until the world is live
   lease acquire|wait|release|status|heartbeat|machine-status|machine-release
+  rebuild request|wait|status    one shared editor restart
   exec "<py>" | exec-file <p>    Python in the editor (read state; never drive RPCs from it)
                                   --client N runs it against client N's PIE world (UAP_WORLD, UAP_CLIENT;
                                   get_game_world() too); a missing client is REFUSED, never the host
+  level open <map> | level current   change/read the open level; never load_level via exec
   rc <Func> k=v ...              a plugin UFUNCTION over Remote Control
   read-ui | click <text> | tab <id> | nav <dir>     on-screen UMG / CommonUI
   screenshot <abs.png> [--window <client>]          3D + UI composite; standalone clients
@@ -3406,12 +3700,14 @@ _HELP_SECTIONS = {
     "pie": ("PLAY-IN-EDITOR",),
     "lease": ("MULTI-AGENT COORDINATION", "TWO PROJECTS", "NEW:"),
     "coordination": ("MULTI-AGENT COORDINATION", "NEW:"),
+    "rebuild": ("MULTI-AGENT COORDINATION",),
     "machine": ("TWO PROJECTS",),
     "rc": ("DRIVE + OBSERVE",), "exec": ("DRIVE + OBSERVE",),
     "exec-file": ("DRIVE + OBSERVE",), "read-ui": ("DRIVE + OBSERVE",),
     "click": ("DRIVE + OBSERVE",), "tab": ("DRIVE + OBSERVE",), "nav": ("DRIVE + OBSERVE",),
     "screenshot": ("DRIVE + OBSERVE",), "helpers": ("DRIVE + OBSERVE",),
     "viewport": ("DRIVE + OBSERVE",),
+    "level": ("LEVEL (",),
     "instances": ("DRIVE + OBSERVE", "FLAGS:"),
     "input": ("SUSTAINED INPUT", "MOUSE"),
     "mouse": ("MOUSE",),
@@ -3422,7 +3718,7 @@ _HELP_SECTIONS = {
     "output": ("NEW:",), "brief": ("NEW:",), "timing": ("NEW:",), "wait": ("NEW:",),
 }
 _HELP_HEADS = ("COMMON MISTAKES", "PREFLIGHT", "REPORT", "PLAY-IN-EDITOR",
-               "MULTI-AGENT COORDINATION", "TWO PROJECTS", "DRIVE + OBSERVE", "SUSTAINED INPUT",
+               "MULTI-AGENT COORDINATION", "TWO PROJECTS", "DRIVE + OBSERVE", "LEVEL (", "SUSTAINED INPUT",
                "MOUSE", "SAMPLING + LOGS", "RECIPES", "SPEED:", "FLAGS:", "MORE:", "NEW:")
 
 
@@ -3461,7 +3757,7 @@ def _help(args) -> int:
 
 
 # Editor-touching verbs auto-wait while another agent is rebuilding this editor (see main()).
-_REBUILD_GUARDED = {"status", "rc", "exec", "exec-file", "pie",
+_REBUILD_GUARDED = {"status", "rc", "exec", "exec-file", "pie", "level",
                     "read-ui", "click", "tab", "nav", "screenshot", "viewport",
                     "input", "xr", "sample", "log", "helpers"}
 
@@ -3523,9 +3819,14 @@ def _pie_state_for_lease(project: str | None) -> tuple[bool | None, str]:
     return None, "unreachable"
 
 
-def _task_label(args) -> str:
-    """The human task label for this call: --task, else $UAP_TASK, sanitised ("" if neither)."""
-    return _coord.sanitize_label(getattr(args, "task_label", None)) or _coord.default_task()
+def _task_label(args, reason=None) -> str:
+    """The human task label for this call: --task, else $UAP_TASK, else the agent's open report
+    title, else "<reason> (<agent>)" -- so the overlay never shows "none set" for a tokened agent."""
+    explicit = _coord.sanitize_label(getattr(args, "task_label", None)) or _coord.default_task()
+    if explicit:
+        return explicit
+    agent = getattr(args, "agent", None) or os.environ.get("UAP_AGENT_ID")
+    return _coord.fallback_task(agent, reason) if agent else ""
 
 
 def _requested_by(args, agent: str) -> str:
@@ -3562,7 +3863,9 @@ def _lease_inner(args) -> int:
     proj = getattr(args, "project", "") or _env_project()
     cmd = args.lease_cmd
     if cmd in ("acquire", "wait"):
-        task = _task_label(args)
+        if getattr(args, "progress", False):
+            os.environ["UAP_LEASE_PROGRESS"] = "1"
+        task = _task_label(args, getattr(args, "reason", None))
         mb = _max_block(args)
         if cmd == "acquire":
             res = _coord.acquire(proj, args.mode, reason=args.reason, agent=args.agent,
@@ -3606,7 +3909,14 @@ def _lease_inner(args) -> int:
         # nothing in the system will ever tell either of them. So check, and refuse.
         # Fail-open on an unreachable editor (nothing to protect) and --force for a deliberate
         # handover of a live session.
-        live, how = (None, "skipped (--force)") if args.force else _pie_state_for_lease(proj)
+        # A WAITER (queued, not holding) owns no editor session: the live PIE is the holder's.
+        # Dropping its queue slot frees nothing, so it is never refused -- else a dead agent's slot
+        # sits ahead of live work until its heartbeat/park expires.
+        _waiter_only = _coord.is_waiter_only(proj, agent=args.agent or _coord.default_agent_id())
+        if _waiter_only:
+            live, how = None, "skipped (waiter, holds nothing)"
+        else:
+            live, how = (None, "skipped (--force)") if args.force else _pie_state_for_lease(proj)
         if live:
             res = {"ok": False, "released": False, "pie_live": True, "checked_with": how,
                    "agent": args.agent or _coord.default_agent_id(),
@@ -3617,6 +3927,11 @@ def _lease_inner(args) -> int:
         else:
             res = _coord.release(proj, agent=args.agent)
             res["pie_live"] = live
+            if not _waiter_only and res.get("ok", True):
+                res["exec_callbacks_released"] = _release_exec_callbacks(proj, args.agent)
+            if _waiter_only:
+                res["released_from_queue"] = True
+                res["released"] = True
             res["checked_with"] = how
             # Releasing the editor also gives the machine back: the agent has just proved PIE is
             # down, which is the whole reason the other project was waiting. Project-wide only
@@ -3644,6 +3959,32 @@ def _lease_inner(args) -> int:
         res["machine"] = _coord.machine_status()
     _emit(res)
     return 0 if res.get("ok", True) else 1
+
+
+def _rebuild(args) -> int:
+    """Rebuild broker verbs. See rebuild_broker.py."""
+    from unreal_agent_player import rebuild_broker as _rb
+
+    proj = getattr(args, "project", "") or _env_project()
+    agent = getattr(args, "agent", None) or os.environ.get("UAP_AGENT_ID") or ""
+    cmd = args.rebuild_cmd
+    try:
+        if cmd == "request":
+            res = _rb.request(proj, agent=agent, task=_task_label(args, args.reason),
+                              reason=args.reason)
+        elif cmd == "wait":
+            mb = _max_block(args)
+            secs = args.seconds if args.seconds is not None else (mb if mb is not None else 110.0)
+            res = _rb.wait(proj, agent=agent, seconds=secs)
+        elif cmd == "status":
+            res = _rb.status(proj)
+        else:
+            res = _rb.serve(proj, window=args.window)
+    except _coord.CoordinationError as exc:
+        res = {"ok": False, "coordination_unsafe": True, "cmd": f"rebuild {cmd}",
+               "error": str(exc)}
+    _emit(res)
+    return 0 if res.get("ok") else 1
 
 
 def _lease_takes_machine(mode: str, reason: str) -> bool:
@@ -3803,10 +4144,32 @@ def build_parser() -> argparse.ArgumentParser:
     inst.set_defaults(func=_instances)
     ex = sub.add_parser("exec", parents=[proj])
     ex.add_argument("code")
+    ex.add_argument("--unsafe-level-load", action="store_true", default=False,
+                    help="run Python that swaps the editor level (load_level / load_map ...). "
+                         "Refused by default: it has killed the shared editor. Use `uap level open`.")
     ex.set_defaults(func=_exec)
     exf = sub.add_parser("exec-file", parents=[proj])
     exf.add_argument("path")
+    exf.add_argument("--unsafe-level-load", action="store_true", default=False,
+                     help="accepted for symmetry with `exec`; exec-file only WARNS about level "
+                          "swaps (builder scripts open their own map). Prefer `uap level open`.")
     exf.set_defaults(func=_exec_file)
+    lv = sub.add_parser("level", help="open / read the editor level SAFELY (never load_level from Python)")
+    lvs = lv.add_subparsers(dest="level_cmd", required=True)
+    lvo = lvs.add_parser("open", parents=[proj],
+                         help="open a map outside Python; refuses during PIE and on a dirty map")
+    lvo.add_argument("map", help="/Game/Maps/L_X, /Game/Maps/L_X.L_X, a unique bare map name, or a "
+                                 "Dream map (/MarbleRace/Maps/Map_MarbleRace: its content-only "
+                                 "plugin is mounted if needed)")
+    lvo.add_argument("--discard", action="store_true", default=False,
+                     help="open even if the current map has unsaved changes (they are LOST; "
+                          "nothing is ever saved)")
+    lvo.add_argument("--timeout", type=float, default=_LEVEL_OPEN_TIMEOUT, metavar="S",
+                     help=f"seconds to wait for the load (default {_LEVEL_OPEN_TIMEOUT:.0f})")
+    lvo.set_defaults(func=_level)
+    lvc = lvs.add_parser("current", parents=[proj],
+                         help="the open map, dirty state and PIE state, read from the live editor")
+    lvc.set_defaults(func=_level)
     pie = sub.add_parser("pie").add_subparsers(dest="pie_cmd", required=True)
     ps = pie.add_parser("start", parents=[proj])
     ps.add_argument("--mode", choices=["flat", "vr"], default="flat",
@@ -3911,6 +4274,15 @@ def build_parser() -> argparse.ArgumentParser:
                          "or any input pre-processor sees). Omit for the game-viewport route "
                          "(gameplay/Enhanced Input). Refuses loudly if Slate has no user N")
     ia.set_defaults(func=_input)
+    iact = inps.add_parser("action", parents=[proj],
+                           help="inject an Enhanced Input ACTION value (InjectInputForAction), the "
+                                "way an OpenXR controller does -- reaches action-driven logic a key "
+                                "injection cannot (e.g. the VR pawn jump stick)")
+    iact.add_argument("path", help="UInputAction path, e.g. /Game/VRE/Input/Actions/MotionControllerThumbRight_Y")
+    iact.add_argument("value", type=float, nargs="?", default=1.0,
+                      help="action value (bool actions: >0.5 = pressed). One injection lasts one "
+                           "input tick; feed 0 after to release / re-arm an edge gate")
+    iact.set_defaults(func=_input)
     ir = inps.add_parser("release", parents=[proj], help="end a hold early (default: all holds)")
     ir.add_argument("key", nargs="?", default="", help="FKey name; omit to release everything")
     ir.set_defaults(func=_input)
@@ -4122,6 +4494,9 @@ def build_parser() -> argparse.ArgumentParser:
     la.add_argument("--wait", type=float, default=_coord.DEFAULT_WAIT_CAP,
                     help="max seconds to block before returning busy (default 900)")
     la.add_argument("--ttl", type=int, default=None)
+    la.add_argument("--progress", action="store_true",
+                    help="print a 'waiting ... position n/m' line to stderr every 20s while "
+                         "blocked (default silent; also $UAP_LEASE_PROGRESS=1 or a TTY)")
     la.add_argument("--requested-by", dest="requested_by", default=None, metavar="AGENT",
                     help="the agent this token acts for, when --agent is a mechanical token such "
                          "as rebuild-<pid> (default: $UAP_AGENT_ID when it differs from --agent). "
@@ -4130,9 +4505,11 @@ def build_parser() -> argparse.ArgumentParser:
     lzw = lzs.add_parser("wait", parents=[proj],
                          help="resume a `lease acquire --max-block` wait WITHOUT losing your "
                               "queue place")
-    lzw.add_argument("--seconds", type=float, default=None,
+    lzw.add_argument("--seconds", "--wait", dest="seconds", type=float, default=None,
                      help="max seconds to block this call (default --max-block, "
                           "$UAP_MAX_BLOCK, else 110)")
+    lzw.add_argument("--progress", action="store_true",
+                     help="print wait progress to stderr (default silent; see `lease acquire`)")
     lzw.add_argument("--mode", choices=["exclusive", "shared"], default=None,
                      help="only needed if you were never queued (default: the parked request)")
     lzw.add_argument("--reason", default=None)
@@ -4161,6 +4538,30 @@ def build_parser() -> argparse.ArgumentParser:
                           "releasing and has not aged out yet -- check `lease machine-status` "
                           "first, because the other project may simply still be playing.")
     lzm.set_defaults(func=_lease)
+
+    # Rebuild broker: agents ask for a restart instead of running the project's restart script;
+    # ONE coalesced restart serves every pending request. See rebuild_broker.py.
+    rbp = sub.add_parser("rebuild", help="request / wait for a coalesced editor rebuild (one "
+                                         "restart serves every pending request)")
+    rbs = rbp.add_subparsers(dest="rebuild_cmd", required=True)
+    rbq = rbs.add_parser("request", parents=[proj],
+                         help="file a rebuild request and return at once (starts the runner)")
+    rbq.add_argument("--reason", default="", help="why (e.g. 'header change in SOMelee.h')")
+    rbq.set_defaults(func=_rebuild)
+    rbw = rbs.add_parser("wait", parents=[proj],
+                         help="block until a rebuild that started AFTER your latest request "
+                              "finished; returns ok / failed + the failure note")
+    rbw.add_argument("--seconds", "--wait", dest="seconds", type=float, default=None,
+                     help="max seconds to block this call (default --max-block, $UAP_MAX_BLOCK, "
+                          "else 110). still_waiting = call again; nothing is lost.")
+    rbw.set_defaults(func=_rebuild)
+    rbs.add_parser("status", parents=[proj],
+                   help="pending requests, the runner, the last runs").set_defaults(func=_rebuild)
+    rbv = rbs.add_parser("serve", parents=[proj],
+                         help="(internal) the coalescing runner; `rebuild request` starts it")
+    rbv.add_argument("--window", type=float, default=None,
+                     help="batching window seconds (default $UAP_REBUILD_WINDOW or 240)")
+    rbv.set_defaults(func=_rebuild)
 
     tm = sub.add_parser("timing", help="per-call timing log: summaries per agent")
     tms = tm.add_subparsers(dest="timing_cmd", required=True)

@@ -508,8 +508,10 @@ foreground lock queues the same way, for the same reason.
   exclusive waiter anywhere ahead still blocks shared traffic, so a queued rebuild cannot be
   starved by a stream of readers.
 - Holder TTL age-out and `uap lease release --agent <token>` are unchanged.
-- One exception to FIFO: with the project's editor verifiably down, `rebuild*` waiters go ahead of
-  the others (see "A dead editor voids its pie/level lease").
+- Two exceptions to FIFO: with the project's editor verifiably down, `rebuild*` waiters go ahead of
+  the others (see "A dead editor voids its pie/level lease"); and the rebuild broker's restart
+  (`rebuild*`/`relaunch*` reason with `requested_by: rebuild-broker`) always goes to the head, editor
+  up or down -- behind the current holder only (see "The rebuild broker").
 
 The `busy` response carries `queue_position`, `queue_ahead` and `queue_length`, and `uap lease
 status` / `lease machine-status` name the queue in order -- so an agent that gives up can report
@@ -556,6 +558,46 @@ each (measured 2026-11-10).
   one O_APPEND write, no lock; rotated at 10 MB; `$UAP_TIMING_LOG=0` disables). The gap since the
   same agent's previous call is read from the mtime of an empty marker file, not from the log.
   `uap timing report [--agent X] [--since 1h]` summarises calls, uap time, wait time and gaps.
+
+## The rebuild broker: one restart serves every pending request
+
+Measured on School's Out VR, 2026-11-13 (59 agents, one editor): every agent with a header change
+ran `Restart-Editor.ps1` for itself. Six editor kills in 41 minutes, 71 restart attempts in a day,
+six editor sessions that never ran a PIE; every kill ended the current holder's PIE session and sent
+every verifier to the back of a 9-13 deep queue. The relink inside a restart costs the same for one
+agent's code as for six, so agents now ASK for a restart and one restart serves them all
+(`rebuild_broker.py`):
+
+    uap rebuild request --agent <tok> --task "<ticket> <title>" [--reason "..."]   # returns at once
+    uap rebuild wait --agent <tok> [--seconds N]    # result of a rebuild that STARTED after the request
+    uap rebuild status                              # pending, runner, last runs
+
+- **Requests** live in `<reports>/.leases/<project>.rebuild.json` under their own O_EXCL lock.
+  `wait` finds the agent's LATEST request and returns once a run that started after it finished:
+  `{ok:true, result:"ok"}` or `{ok:false, result:"failed", note, note_excerpt, editor_up}`. It
+  returns `still_waiting` (exit 1) when its seconds run out; nothing is lost, call it again.
+- **One runner per project** (`uap rebuild serve`, started detached by the request that finds none
+  alive; liveness = pid alive AND heartbeat under 120 s, so a reused pid never counts). It fires
+  `$UAP_REBUILD_WINDOW` (default 240) seconds after the first pending request -- measured from the
+  end of the previous rebuild if that is later, so restarts never land back to back -- and at once
+  when the editor process is not running. It runs the restart ONCE for every request pending at
+  that moment and marks them all served. Requests that arrive during the run form the next batch.
+  It exits when nothing is pending; a dead runner is replaced by the next `request` or `wait`.
+- **The restart command** is the project's `Restart-Editor.ps1` next to `$UAP_UPROJECT` (pinned
+  by the project's `uap.ps1`), run with `-LeaseWaitSeconds 3600` and `UAP_AGENT_ID=rebuild-broker`;
+  `$UAP_REBUILD_COMMAND` overrides it. Its exit code is the result: 0 ok, 6 ok with a warning (slow
+  boot), 7 failed with the editor still up (compile preflight; note
+  `Saved/Logs/RestartEditor-PreflightFailure.txt`), 1 / 5 failed with the editor down (note
+  `Saved/Logs/RestartEditor-LastFailure.txt`). 2 / 3 / 4 left the editor untouched (lease held,
+  PIE live, DLL holders): not a result, the batch is retried after `$UAP_REBUILD_RETRY` (60) s, up
+  to 6 times, then failed.
+- **Lease.** The restart's lease carries `requested_by: rebuild-broker`; `_rebuild_first` moves
+  that waiter to the head of the queue. It still waits for the CURRENT holder -- a running PIE is
+  never preempted -- but not behind every queued verifier.
+- **No windows.** The runner and its children run with `CREATE_NO_WINDOW` (a hidden console the
+  restart's powershell / UBT inherit), never a visible or activated console.
+- Run logs: `<reports>/.leases/rebuild-logs/`. Tests: `tests/test_rebuild_broker.py` (restart
+  mocked; fake clock).
 
 ## Non-goals
 

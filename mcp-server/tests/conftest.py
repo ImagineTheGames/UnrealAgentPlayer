@@ -71,6 +71,10 @@ def _no_live_editor_probe(monkeypatch):
     `coordination._editor_probe` (or fake `_enumerate_editors`).
     """
     monkeypatch.setattr(_coordination, "_editor_probe", lambda project: None)
+    # Same for the hung-editor (Remote Control) probe: "cannot tell" never gates or evicts.
+    monkeypatch.setattr(_coordination, "_rc_probe", lambda project: None)
+    _coordination._RC_CACHE.clear()
+    monkeypatch.setenv("UAP_RC_LIVENESS", "0")      # child processes of a test inherit the stub
     # Same for the machine lock's live-PIE probe, which the CLI wires to a real RC call: with no
     # editor in a test it must not run (tests of it install `cli._machine_pie_probe` themselves).
     monkeypatch.setattr(_coordination, "_machine_pie_probe", None)
@@ -88,3 +92,11 @@ def _no_live_editor_probe(monkeypatch):
     monkeypatch.setattr(_coordination, "_game_client_probe", lambda: None)
     monkeypatch.setenv("UAP_GAME_CLIENT_PROBE", "0")
     _coordination._GAME_CLIENT_CACHE.clear()
+
+
+@pytest.fixture(autouse=True)
+def _no_exec_callback_release(monkeypatch):
+    """`lease release` / `pie stop` best-effort release the agent exec callbacks through a real
+    Python-remote-exec client (UDP discovery). A test run must never go looking for an editor.
+    Tests of the release itself import the real function at module import time."""
+    monkeypatch.setattr(cli, "_release_exec_callbacks", lambda project, agent: None)

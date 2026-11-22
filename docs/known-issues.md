@@ -1648,3 +1648,43 @@ PNG with `ok:true, exists:true`.
   slots (max 16) hung around into the next session. A series that watched a game world is now retired on
   `FWorldDelegates::OnWorldBeginTearDown` (samples stay readable, `world_ended:true`) and the next `sample start`
   purges them, so a new session starts with every slot free.
+
+## 51. No `level` verb, and swapping levels with `load_level` from `uap exec` KILLED the shared editor -- FIXED (86akezbrp)
+
+* **Symptom:** the editor died on a routine level swap done from editor Python, for every agent sharing it.
+  Three earlier deaths were `Fatal error: ... World Memory Leaks: 1 leaks objects and packages`
+  (EditorServer.cpp:1938); on 2026-11-13 04:57 it was `Assertion failed: IsValidLowLevel() [Obj.cpp:1312]`
+  (`LogUObjectArray: Warning: Other object in slot`, script stack `LevelEditorSubsystem.LoadLevel`, loading
+  `/MarbleRace/Maps/Map_MarbleRace`).
+* **Root cause (minidump, cdb):** `load_level` ran `FEditorFileUtils::LoadMap` -> `Map_Load` -> `CollectGarbage` ->
+  `UnhashUnreachableObjects` -> `ConditionalBeginDestroy` NESTED INSIDE the Python frame (python311 +
+  PythonScriptPlugin frames sit directly below `execLoadLevel` on the stack). The `OnMapLoad` guard
+  (`ClearRemoteExecGlobals`) fired and dropped three globals and the editor died anyway: it can only drop globals,
+  and it runs a second Python eval nested in the frame that is mid-call. The stack proves the shape; the exact
+  object was not nameable (no private engine symbols).
+* **Fix:** `uap level open <map> [--discard]` and `uap level current`. The plugin (`UUAPAgentLevelSubsystem`) only
+  QUEUES the request; a core-ticker callback then runs outside any Python frame, re-checks PIE/dirty, drops the
+  exec globals, runs Python's cycle collector and calls `FEditorFileUtils::LoadMap`. Refuses during PIE, refuses a
+  dirty map unless `--discard`, never saves; mounts an unmounted content-only plugin for a Dream map. The CLI polls
+  through the busy game thread and reads the map back from the live editor.
+  `uap exec` now REFUSES inline Python that calls `load_level` / `load_map` / `new_level` ... (`--unsafe-level-load`
+  overrides); `exec-file` warns only, since map-builder scripts open their own map.
+* Tests: `mcp-server/tests/test_cli_level.py`.
+
+## Injected input ran client Server RPCs locally -- FIXED
+
+* **Symptom:** a networked test that clicked UI through `uap click` (or injected a key / XR button) saw client
+  Server RPCs run locally on the client and never reach the host.
+* **Cause:** Remote Control wraps every object call in `FEditorScriptExecutionGuard` (RemoteControlModule.cpp:1387),
+  which sets `GAllowActorScriptExecutionInEditor`. While set, `AActor::GetFunctionCallspace` (Actor.cpp:5469)
+  returns Local for every RPC.
+* **Fix:** `FAgentInput::ForEachClientJson` and `FAgentInput::ForEachClient` (the funnel for every input verb,
+  JSON and bool) clear the flag for the duration of the injection with `TGuardValue`.
+
+## 52. A tick callback registered through `uap exec` outlived PIE and wrote 2.4 M NameError lines -- FIXED (17tm4675e8t)
+
+* **Symptom:** 2026-11-18, School's Out editor log: a slate post-tick callback from an exec script kept firing after PIE ended; its handler read an exec-scope global that no longer existed; 2,399,222 Error lines in 1 h 43 min.
+* **Fix:** every exec preamble installs `_uap_cb_guard` (`exec_callbacks.py`), wrapping `unreal.register_slate_pre/post_tick_callback`. (`unreal.EditorDelegates` does not exist in the UE Python API: FEditorDelegates is an unreflected C++ struct, so PIE delegates cannot be wrapped.) A guarded callback unregisters on its first exception (one warning logged), and when PIE ends if it was registered during PIE (checked when it fires and at the start of every later exec). `_uap_cb_guard.release_all(owner)` drops the rest.
+* **Owner release:** each callback is tagged with the `--agent` token (or `$UAP_AGENT_ID`) of the exec that registered it. `uap lease release` and `uap pie stop` best-effort release that agent's callbacks (`exec_callbacks_released` in the answer). **Gap:** a tokenless exec has owner `""`, shared by every tokenless exec; only a tokenless release/stop drops those. Pass `--agent`.
+* **Handler reads an exec-scope global (non-fatal):** the exec namespace is rebuilt per call, so a callback reading e.g. `REC` after the exec ends raises NameError. The guard unregisters it and logs ONE warning that names the missing global and says callbacks must capture values via default args or closures (`def cb(dt, rec=REC)`).
+* **Still true:** callbacks registered with no PIE running are error-bounded and owner-released, not PIE-bounded. Python cannot register PIE delegates at all, so only slate ticks need the guard.

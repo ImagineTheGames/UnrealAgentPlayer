@@ -13,7 +13,7 @@ Every loop starts the same way:
 **Goal:** the agent changed how a door opens and wants to prove it works in play.
 
 1. Compile the change (Live Coding for body-only edits, or a full build + editor restart for class-layout changes).
-2. `exec_python` → `LevelEditorSubsystem.load_level("/Game/Maps/L_DoorTest")`.
+2. `uap level open /Game/Maps/L_DoorTest` (never `load_level` through `exec_python`: it has killed the shared editor).
 3. `pie_start`.
 4. Grab a log cursor (`log_tail` with `max_lines: 1` → note the cursor).
 5. Move the player to the door: `input_key("W", pressed=true)`, wait, `input_key("W", pressed=false)`.

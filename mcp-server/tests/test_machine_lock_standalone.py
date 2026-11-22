@@ -392,7 +392,7 @@ def test_ordinary_exec_is_still_ungated(monkeypatch, capsys):
     _FakeExec.calls = []
     monkeypatch.setattr(cli, "PythonRemoteExecClient", _FakeExec)
     assert cli.main(["exec", "print(1)", "--project", "SchoolsOut", "--agent", "sprayhub"]) == 0
-    assert _FakeExec.calls == ["print(1)"]
+    assert len(_FakeExec.calls) == 1 and "print(1)" in _FakeExec.calls[0]
 
 
 def test_batch_steps_inherit_the_new_gates(monkeypatch, capsys):

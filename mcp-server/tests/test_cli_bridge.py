@@ -40,7 +40,7 @@ def test_exec_file_reads_and_runs(tmp_path, monkeypatch):
     f = tmp_path / "snippet.py"
     f.write_text("print('hi from file')", encoding="utf-8")
     assert cli.main(["exec-file", str(f)]) == 0
-    assert captured["code"] == "print('hi from file')"
+    assert "print('hi from file')" in captured["code"]
 
 
 def test_parse_rc_params_keyvalue_and_json():
@@ -110,6 +110,12 @@ def test_exec_file_with_py_comment_first_line_sends_no_path_trigger(tmp_path, mo
     f.write_text("# t9_check.py - drive the marble\nanswer = 6 * 7\n", encoding="utf-8")
     assert cli.main(["exec-file", str(f)]) == 0
     assert not _UE_TRIGGER.search(captured["code"])
+    import sys
+    import types
+    fake = types.ModuleType("unreal")
+    fake.World = type("World", (), {})
+    fake.ObjectIterator = lambda cls: iter([])  # no PIE: the default-world preamble is a no-op
+    monkeypatch.setitem(sys.modules, "unreal", fake)
     g: dict = {}
     exec(captured["code"], g)  # noqa: S102
     assert g["answer"] == 42

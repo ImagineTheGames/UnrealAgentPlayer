@@ -1561,6 +1561,12 @@ void FAgentInput::ShutdownHolds()
 bool FAgentInput::ForEachClient(const FString& Client, FString& OutError,
                                 TFunctionRef<bool(int32 ClientIndex)> Fn)
 {
+    // Remote Control invokes this UFUNCTION inside FEditorScriptExecutionGuard, which sets
+    // GAllowActorScriptExecutionInEditor. With it set AActor::GetFunctionCallspace returns Local
+    // for every RPC, so a Server RPC fired by the input we inject would run on the client instead
+    // of being sent. Injected input must behave like real input: clear the flag for its duration.
+    TGuardValue<bool> NoEditorScriptCallspace(GAllowActorScriptExecutionInEditor, false);
+
     TArray<UWorld*> Worlds;
     if (!FAgentWorld::ResolveClients(Client, Worlds, OutError)) { return false; }
     if (Worlds.Num() == 0)
@@ -1600,6 +1606,12 @@ bool FAgentInput::OnClients(const TCHAR* Verb, const FString& Client, TFunctionR
 
 FString FAgentInput::ForEachClientJson(const FString& Client, TFunctionRef<FString()> Fn)
 {
+    // Remote Control invokes this UFUNCTION inside FEditorScriptExecutionGuard, which sets
+    // GAllowActorScriptExecutionInEditor. With it set AActor::GetFunctionCallspace returns Local
+    // for every RPC, so a Server RPC fired by the input we inject would run on the client instead
+    // of being sent. Injected input must behave like real input: clear the flag for its duration.
+    TGuardValue<bool> NoEditorScriptCallspace(GAllowActorScriptExecutionInEditor, false);
+
     auto Refuse = [](const FString& Error)
     {
         TSharedRef<FJsonObject> O = MakeShared<FJsonObject>();
