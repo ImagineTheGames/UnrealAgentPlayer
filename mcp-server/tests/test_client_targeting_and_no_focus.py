@@ -17,6 +17,7 @@ import json
 import os
 import re
 from pathlib import Path
+from typing import ClassVar
 
 import pytest
 
@@ -476,3 +477,91 @@ def test_sample_start_is_per_client_so_an_actor_name_resolves_in_that_clients_wo
         "StartPropertySample": {"ObjectPath": "FString", "PropertyPath": "FString"}})
     with pytest.raises(cli.AgentError):
         cli._with_client("StartPropertySample", {"ObjectPath": "Cube"}, "SchoolsOut")
+
+
+# --- sample start: per-client name resolution + ambiguity refusal [17tm4677g3n] ---------------
+
+class _FakeSamplerRC:
+    """Stands in for the plugin's StartPropertySample: two PIE worlds, an actor named `Chair_1` in
+    BOTH, and a PlayerPawn in each. Records every call so a test can see what the CLI sent."""
+
+    calls: ClassVar[list] = []
+
+    def __init__(self, *a, **k):
+        pass
+
+    async def call_preset(self, func, params, preset=None):
+        _FakeSamplerRC.calls.append((func, dict(params)))
+        if func != "StartPropertySample":
+            return json.dumps({"ok": True, "samples": []})
+        client = params.get("Client")
+        obj = params["ObjectPath"]
+        if client is None and obj == "Chair_1":
+            return json.dumps({"ok": False, "error": (
+                "actor name 'Chair_1' is ambiguous: it matches actors in 2 PIE worlds -- client 0 "
+                "(UEDPIE_0_L_DevTest): Chair_1; client 1 (UEDPIE_1_L_DevTest): Chair_1. Pass "
+                "--client N to choose the world")})
+        world = f"UEDPIE_{client or 0}_L_DevTest"
+        return json.dumps({"ok": True, "name": "", "replaced": False, "object": obj, "world": world})
+
+    async def aclose(self):
+        pass
+
+
+def _sample_args(obj):
+    return type("A", (), {"object": obj, "property": "WorldLocation", "seconds": 1.0,
+                          "max_samples": 100, "no_wait": True, "summary": False, "name": None,
+                          "project": None})()
+
+
+@pytest.fixture
+def _fake_sampler(monkeypatch):
+    _FakeSamplerRC.calls = []
+    monkeypatch.setattr(cli, "RemoteControlClient", _FakeSamplerRC)
+    monkeypatch.setattr(cli, "_live_contract", lambda project=None: None)
+    monkeypatch.setattr(cli, "_capture", lambda *a, **k: None)
+    return _FakeSamplerRC
+
+
+def test_sample_client_1_player_pawn_is_resolved_in_client_1s_world(_fake_sampler, capsys):
+    """`uap sample start --client 1 PlayerPawn` read client 0's pawn: the CLI must send Client=1
+    so the plugin resolves PlayerPawn inside that client's world, and the reply names the world."""
+    cli._CLIENT[0] = "1"
+    assert cli._sample(_sample_args("PlayerPawn")) == 0
+    (_func, params), = [c for c in _fake_sampler.calls if c[0] == "StartPropertySample"]
+    assert params["Client"] == "1" and params["ObjectPath"] == "PlayerPawn"
+    assert json.loads(capsys.readouterr().out)["ok"] is True
+
+
+def test_sample_bare_actor_name_in_two_worlds_without_client_is_refused_not_guessed(_fake_sampler, capsys):
+    """No --client and the name exists in more than one PIE world: the plugin refuses and the CLI
+    relays it (ok:false, exit 1, both worlds listed) instead of silently sampling one."""
+    assert cli._CLIENT[0] is None
+    assert cli._sample(_sample_args("Chair_1")) == 1
+    body = json.loads(capsys.readouterr().out)
+    assert body["ok"] is False
+    assert "ambiguous" in body["error"]
+    assert "UEDPIE_0_L_DevTest" in body["error"] and "UEDPIE_1_L_DevTest" in body["error"]
+    assert "--client" in body["error"]
+
+
+def test_sample_bare_actor_name_with_client_resolves_that_world_not_ambiguous(_fake_sampler, capsys):
+    cli._CLIENT[0] = "1"
+    assert cli._sample(_sample_args("Chair_1")) == 0
+    sent = next(p for f, p in _fake_sampler.calls if f == "StartPropertySample")
+    assert sent["Client"] == "1"
+
+
+def test_sampler_cpp_refuses_an_ambiguous_name_only_when_no_client_was_given():
+    """The world logic is C++ pytest cannot run, so pin its shape in source: the ambiguity check
+    scans every game world, lists them, and runs only on the no-client path before resolving."""
+    src = (REPO / "Plugin/Source/UnrealAgentPlayerRuntime/Private/AgentSampler.cpp").read_text()
+    assert "UAPCheckNameAmbiguity" in src
+    check = src[src.index("bool UAPCheckNameAmbiguity"):src.index("FString UAPNameLabel")]
+    assert "GetAllGameWorlds" in check and "is ambiguous" in check and "--client N" in check
+    start = src[src.index("FString FAgentSampler::Start"):]
+    no_client = start[start.index("else\r\n" if "else\r\n" in start else "else\n"):]
+    assert no_client.index("UAPCheckNameAmbiguity") < no_client.index("UAPResolveObject")
+    # and the per-client branch (ClientWorlds.Num() == 1) must not call it
+    client_branch = start[start.index("ClientWorlds.Num() == 1"):start.index("UAPCheckNameAmbiguity")]
+    assert "UAPCheckNameAmbiguity" not in client_branch.split("else")[0]

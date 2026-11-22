@@ -3228,7 +3228,9 @@ SAMPLING + LOGS (sub-second truth; a ~1s exec round-trip cannot see judder or a 
   uap sample start <actor name> ... --client N     an actor NAME (or PlayerPawn etc) is looked up in
       PIE client N's world, not the host's; the reply carries `world` (e.g. UEDPIE_1_L_DevTest) so
       you can see which world was read. --client all is refused (a series watches one object). A
-      full /Game/... path is not world-scoped. A plugin copy without `Client` is refused as skew.
+      full /Game/... path is not world-scoped. With NO --client, an actor name found in 2+ PIE worlds
+      is refused as ambiguous (worlds listed), never resolved to the first. A plugin copy without
+      `Client` is refused as skew.
   uap log cursor                       grab a cursor BEFORE driving the condition
   uap log since <cursor> --grep RE     what the editor logged since then
   uap log tail 200 [--grep RE]         the last N captured lines (or --lines 200)

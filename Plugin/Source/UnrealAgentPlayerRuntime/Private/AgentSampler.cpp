@@ -314,6 +314,49 @@ namespace
         }
     }
 
+    /**
+     * A bare actor name with NO client selector, in a multi-client PIE: if the name matches an actor
+     * in more than one game world, refuse (listing the worlds) instead of silently reading the first
+     * one. Same match rule as UAPResolveObject: exact name, else substring. Object paths and the
+     * PlayerPawn / PlayerController / PlayerCameraManager shortcuts are not names, so not checked.
+     */
+    bool UAPCheckNameAmbiguity(const FString& Path, FString& OutError)
+    {
+        if (Path.StartsWith(TEXT("/"))
+            || Path.Equals(TEXT("PlayerPawn"), ESearchCase::IgnoreCase)
+            || Path.Equals(TEXT("PlayerController"), ESearchCase::IgnoreCase)
+            || Path.Equals(TEXT("PlayerCameraManager"), ESearchCase::IgnoreCase))
+        {
+            return true;
+        }
+        TArray<UWorld*> Worlds;
+        FAgentWorld::GetAllGameWorlds(Worlds);
+        if (Worlds.Num() < 2) { return true; }
+
+        TArray<FString> Hits;
+        for (UWorld* W : Worlds)
+        {
+            FString Match;
+            for (TActorIterator<AActor> It(W); It; ++It)
+            {
+                const FString Name = It->GetName();
+                if (Name.Equals(Path, ESearchCase::IgnoreCase)) { Match = Name; break; }
+                if (Match.IsEmpty() && Name.Contains(Path)) { Match = Name; }
+            }
+            if (!Match.IsEmpty())
+            {
+                Hits.Add(FString::Printf(TEXT("client %d (%s): %s"),
+                                         FAgentWorld::GetClientIndex(W), *W->GetName(), *Match));
+            }
+        }
+        if (Hits.Num() < 2) { return true; }
+        OutError = FString::Printf(
+            TEXT("actor name '%s' is ambiguous: it matches actors in %d PIE worlds -- %s. Pass "
+                 "--client N to choose the world (picking one silently would sample the wrong client)."),
+            *Path, Hits.Num(), *FString::Join(Hits, TEXT("; ")));
+        return false;
+    }
+
     FString UAPNameLabel(const FString& SeriesName)
     {
         return SeriesName.IsEmpty() ? TEXT("(default)") : SeriesName;
@@ -346,6 +389,7 @@ FString FAgentSampler::Start(const FString& ObjectPath, const FString& PropertyP
     }
     else
     {
+        if (!UAPCheckNameAmbiguity(ObjectPath, Error)) { return UAPError(Error); }
         Obj = UAPResolveObject(ObjectPath, Error);
     }
     if (!Obj) { return UAPError(Error); }
