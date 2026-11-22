@@ -55,6 +55,18 @@ _uap_err = None
 _uap_world = None
 _uap_found = {}
 _uap_dups = []
+_uap_cands = {}
+# The live play world's map name. PIE worlds leaked from EARLIER sessions (a World Memory Leak the
+# editor has not collected) keep their UEDPIE_<N>_ package prefix; ObjectIterator order is
+# arbitrary, so "first wins" answered a dead L_DevTest while the real PIE ran another map
+# (2c349d36: client 0 -> L_DevTest, live world Map_PhantomJanitor). Every live client of one
+# session runs the same map, so prefer the candidate that shares the editor play world's name.
+try:
+    _uap_live = _uap_u.get_editor_subsystem(_uap_u.UnrealEditorSubsystem).get_game_world()
+    _uap_live_name = _uap_live.get_name() if _uap_live is not None else None
+except Exception:
+    _uap_live_name = None
+_uap_live = None
 for _uap_w in _uap_u.ObjectIterator(_uap_u.World):
     try:
         _uap_names = _uap_w.get_name() + "|" + _uap_w.get_outer().get_name()
@@ -62,13 +74,16 @@ for _uap_w in _uap_u.ObjectIterator(_uap_u.World):
         continue
     _uap_m = _uap_re.search(r"UEDPIE_(\d+)_", _uap_names)
     if _uap_m:
-        _uap_i = int(_uap_m.group(1))
-        if _uap_i in _uap_found:
-            # A stale PIE world of the same index (leaked from an earlier session) must not
-            # silently replace the live one: keep the first, report the duplicate.
-            _uap_dups.append(_uap_i)
-        else:
-            _uap_found[_uap_i] = _uap_w
+        _uap_cands.setdefault(int(_uap_m.group(1)), []).append(_uap_w)
+for _uap_i, _uap_l in _uap_cands.items():
+    _uap_pick = _uap_l[0]
+    for _uap_c in _uap_l:
+        if _uap_live_name is not None and _uap_c.get_name() == _uap_live_name:
+            _uap_pick = _uap_c
+            break
+    _uap_found[_uap_i] = _uap_pick
+    # A stale PIE world of the same index must not silently replace the live one: report it.
+    _uap_dups.extend([_uap_i] * (len(_uap_l) - 1))
 if _uap_auto and not _uap_found:
     # No PIE running: an editor-only script. Nothing to select, run it as written.
     _uap_world = None
