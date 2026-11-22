@@ -1632,6 +1632,23 @@ PNG with `ok:true, exists:true`.
   spray can with its cloud; late-joined client 2 hands against a cream wall) that were opened and described.
 * Tests: `mcp-server/tests/test_screenshot_blank_frame.py`.
 
+## 51. `uap sample start --client N <actor name>` ignored N and read the HOST world's actor -- FIXED (17tm466zz8x)
+
+* **Symptom:** in a 2-client PIE, sampling a same-named actor with `--client 1` returned the host's values; only a
+  full `/Game/...` object path (not world-scoped) was right. Found 2026-11-13 by a Marble Race agent.
+* **Cause:** `StartPropertySample` had no `Client` parameter, so `FAgentSampler` looked the name (and the
+  `PlayerPawn` / `PlayerController` / `PlayerCameraManager` shortcuts) up in the FIRST game world.
+* **Fix:** `Client` is the last parameter of `StartPropertySample` on both subsystems; the object is resolved inside
+  `FAgentWorld::FScope` for that client; `all` is refused (a series watches one object); the reply carries `world`
+  (e.g. `UEDPIE_1_L_DevTest`). The CLI sends it via `_CLIENT_VERBS`; a plugin copy without `Client` is refused as
+  skew. With NO `--client` a bare actor name that matches actors in more than one PIE world is REFUSED
+  (`ambiguous`, every matching world listed) rather than resolved to the first world; `PlayerPawn` /
+  object paths are not names and are unaffected (17tm4677g3n). BREAKING(plugin): the UFUNCTION gained a parameter, so re-sync the plugin and `Restart-Editor.ps1`.
+* **Also (Detention Express, same ticket):** sample series from a finished PIE session were never freed, so their
+  slots (max 16) hung around into the next session. A series that watched a game world is now retired on
+  `FWorldDelegates::OnWorldBeginTearDown` (samples stay readable, `world_ended:true`) and the next `sample start`
+  purges them, so a new session starts with every slot free.
+
 ## 51. No `level` verb, and swapping levels with `load_level` from `uap exec` KILLED the shared editor -- FIXED (86akezbrp)
 
 * **Symptom:** the editor died on a routine level swap done from editor Python, for every agent sharing it.

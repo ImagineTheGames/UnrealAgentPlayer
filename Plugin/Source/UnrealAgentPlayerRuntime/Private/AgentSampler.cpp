@@ -6,6 +6,7 @@
 #include "Dom/JsonObject.h"
 #include "Dom/JsonValue.h"
 #include "Engine/World.h"
+#include "Engine/Engine.h"
 #include "EngineUtils.h"
 #include "GameFramework/Actor.h"
 #include "GameFramework/PlayerController.h"
@@ -23,6 +24,9 @@ namespace
     {
         TWeakObjectPtr<UObject> Object;
         FString ObjectLabel;
+        FString World;   // world the object lives in (proves which client was sampled)
+        TWeakObjectPtr<UWorld> WorldPtr;
+        bool    bWorldEnded = false;   // its PIE world has been torn down; samples are kept for a read
         FString PropertyPath;
         double  StartRealTime = 0.0;
         double  EndRealTime = 0.0;
@@ -284,6 +288,75 @@ namespace
         return true;
     }
 
+    FDelegateHandle GTearDownHandle;
+
+    /** A finished PIE session must not leave live slots behind: stop the series that watched the
+     *  world being torn down (samples stay readable), and let the next Start free them. */
+    void UAPOnWorldTearDown(UWorld* World)
+    {
+        for (TPair<FString, FUAPSeries>& Pair : GSeries)
+        {
+            FUAPSeries& S = Pair.Value;
+            if (S.WorldPtr.Get() == World)
+            {
+                S.bActive = false;
+                S.bWorldEnded = true;
+            }
+        }
+    }
+
+    /** Drop every series whose world is gone, so a new session starts with all 16 slots free. */
+    void UAPPurgeEndedWorldSeries()
+    {
+        for (auto It = GSeries.CreateIterator(); It; ++It)
+        {
+            if (It.Value().bWorldEnded) { It.RemoveCurrent(); }
+        }
+    }
+
+    /**
+     * A bare actor name with NO client selector, in a multi-client PIE: if the name matches an actor
+     * in more than one game world, refuse (listing the worlds) instead of silently reading the first
+     * one. Same match rule as UAPResolveObject: exact name, else substring. Object paths and the
+     * PlayerPawn / PlayerController / PlayerCameraManager shortcuts are not names, so not checked.
+     */
+    bool UAPCheckNameAmbiguity(const FString& Path, FString& OutError)
+    {
+        if (Path.StartsWith(TEXT("/"))
+            || Path.Equals(TEXT("PlayerPawn"), ESearchCase::IgnoreCase)
+            || Path.Equals(TEXT("PlayerController"), ESearchCase::IgnoreCase)
+            || Path.Equals(TEXT("PlayerCameraManager"), ESearchCase::IgnoreCase))
+        {
+            return true;
+        }
+        TArray<UWorld*> Worlds;
+        FAgentWorld::GetAllGameWorlds(Worlds);
+        if (Worlds.Num() < 2) { return true; }
+
+        TArray<FString> Hits;
+        for (UWorld* W : Worlds)
+        {
+            FString Match;
+            for (TActorIterator<AActor> It(W); It; ++It)
+            {
+                const FString Name = It->GetName();
+                if (Name.Equals(Path, ESearchCase::IgnoreCase)) { Match = Name; break; }
+                if (Match.IsEmpty() && Name.Contains(Path)) { Match = Name; }
+            }
+            if (!Match.IsEmpty())
+            {
+                Hits.Add(FString::Printf(TEXT("client %d (%s): %s"),
+                                         FAgentWorld::GetClientIndex(W), *W->GetName(), *Match));
+            }
+        }
+        if (Hits.Num() < 2) { return true; }
+        OutError = FString::Printf(
+            TEXT("actor name '%s' is ambiguous: it matches actors in %d PIE worlds -- %s. Pass "
+                 "--client N to choose the world (picking one silently would sample the wrong client)."),
+            *Path, Hits.Num(), *FString::Join(Hits, TEXT("; ")));
+        return false;
+    }
+
     FString UAPNameLabel(const FString& SeriesName)
     {
         return SeriesName.IsEmpty() ? TEXT("(default)") : SeriesName;
@@ -291,7 +364,8 @@ namespace
 }
 
 FString FAgentSampler::Start(const FString& ObjectPath, const FString& PropertyPath,
-                             float Seconds, int32 MaxSamples, const FString& SeriesName)
+                             float Seconds, int32 MaxSamples, const FString& SeriesName,
+                             const FString& Client)
 {
     if (Seconds <= 0.f) { return UAPError(TEXT("Seconds must be > 0")); }
     // Bounded on purpose: this holds every sample in memory and is meant for short windows.
@@ -299,11 +373,36 @@ FString FAgentSampler::Start(const FString& ObjectPath, const FString& PropertyP
     const int32 ClampedMax = FMath::Clamp(MaxSamples <= 0 ? 5000 : MaxSamples, 1, 20000);
 
     FString Error;
-    UObject* Obj = UAPResolveObject(ObjectPath, Error);
+    // Resolve the object in the CLIENT'S world: an actor name used to be looked up in the first
+    // game world whatever --client said, so client 1 silently sampled the host's actor.
+    TArray<UWorld*> ClientWorlds;
+    if (!FAgentWorld::ResolveClients(Client, ClientWorlds, Error)) { return UAPError(Error); }
+    if (ClientWorlds.Num() > 1)
+    {
+        return UAPError(TEXT("a sample series watches one object: name one client, not \"all\""));
+    }
+    UObject* Obj = nullptr;
+    if (ClientWorlds.Num() == 1)
+    {
+        FAgentWorld::FScope Scope(ClientWorlds[0]);
+        Obj = UAPResolveObject(ObjectPath, Error);
+    }
+    else
+    {
+        if (!UAPCheckNameAmbiguity(ObjectPath, Error)) { return UAPError(Error); }
+        Obj = UAPResolveObject(ObjectPath, Error);
+    }
     if (!Obj) { return UAPError(Error); }
 
     TSharedPtr<FJsonValue> Probe;
     if (!UAPReadPath(Obj, PropertyPath, Probe, Error)) { return UAPError(Error); }
+
+    // Series left by a finished PIE session are freed now, so a new session starts clean.
+    UAPPurgeEndedWorldSeries();
+    if (!GTearDownHandle.IsValid())
+    {
+        GTearDownHandle = FWorldDelegates::OnWorldBeginTearDown.AddStatic(&UAPOnWorldTearDown);
+    }
 
     // Only a series of the SAME name is replaced; any other named series keeps recording.
     const bool bReplaced = GSeries.Contains(SeriesName);
@@ -318,6 +417,9 @@ FString FAgentSampler::Start(const FString& ObjectPath, const FString& PropertyP
     Series = FUAPSeries();
     Series.Object = Obj;
     Series.ObjectLabel = Obj->GetName();
+    Series.World = Obj->GetWorld() ? Obj->GetWorld()->GetName() : FString();
+    // Only a game/PIE world's end retires a series; a /Game path object (editor world) lives on.
+    if (Obj->GetWorld() && Obj->GetWorld()->IsGameWorld()) { Series.WorldPtr = Obj->GetWorld(); }
     Series.PropertyPath = PropertyPath;
     Series.StartRealTime = FPlatformTime::Seconds();
     Series.EndRealTime = Series.StartRealTime + ClampedSeconds;
@@ -335,6 +437,7 @@ FString FAgentSampler::Start(const FString& ObjectPath, const FString& PropertyP
     O->SetStringField(TEXT("name"), SeriesName);
     O->SetBoolField(TEXT("replaced"), bReplaced);
     O->SetStringField(TEXT("object"), Series.ObjectLabel);
+    O->SetStringField(TEXT("world"), Series.World);
     O->SetStringField(TEXT("property"), Series.PropertyPath);
     O->SetNumberField(TEXT("seconds"), ClampedSeconds);
     O->SetNumberField(TEXT("max_samples"), ClampedMax);
@@ -366,6 +469,7 @@ FString FAgentSampler::Read(const FString& SeriesName)
     O->SetBoolField(TEXT("ok"), true);
     O->SetStringField(TEXT("name"), SeriesName);
     O->SetBoolField(TEXT("active"), Series.bActive);
+    if (Series.bWorldEnded) { O->SetBoolField(TEXT("world_ended"), true); }
     O->SetStringField(TEXT("object"), Series.ObjectLabel);
     O->SetStringField(TEXT("property"), Series.PropertyPath);
     O->SetNumberField(TEXT("count"), Series.Values.Num());
@@ -400,6 +504,11 @@ void FAgentSampler::Stop(const FString& SeriesName)
 
 void FAgentSampler::Shutdown()
 {
+    if (GTearDownHandle.IsValid())
+    {
+        FWorldDelegates::OnWorldBeginTearDown.Remove(GTearDownHandle);
+        GTearDownHandle.Reset();
+    }
     if (GSampleTicker.IsValid())
     {
         FTSTicker::RemoveTicker(GSampleTicker);

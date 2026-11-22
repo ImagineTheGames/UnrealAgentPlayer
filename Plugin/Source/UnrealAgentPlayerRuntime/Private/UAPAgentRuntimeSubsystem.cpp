@@ -237,10 +237,10 @@ FString UUAPAgentRuntimeSubsystem::GetHeldInput(FString Client)
 }
 
 FString UUAPAgentRuntimeSubsystem::StartPropertySample(FString ObjectPath, FString PropertyPath,
-    float Seconds, int32 MaxSamples, FString SeriesName)
+    float Seconds, int32 MaxSamples, FString SeriesName, FString Client)
 {
     UAP_ACTIVITY(TEXT("sample start"), PropertyPath);
-    return FAgentSampler::Start(ObjectPath, PropertyPath, Seconds, MaxSamples, SeriesName);
+    return FAgentSampler::Start(ObjectPath, PropertyPath, Seconds, MaxSamples, SeriesName, Client);
 }
 
 FString UUAPAgentRuntimeSubsystem::ReadPropertySample(FString SeriesName)
