@@ -166,7 +166,7 @@ def test_release_clears_the_ledger(capsys, monkeypatch):
     assert cli.main(["input", "hold", "W", "--seconds", "30"]) == 0
     capsys.readouterr()
     _wire(monkeypatch)
-    assert cli.main(["input", "release"]) == 0
+    assert cli.main(["input", "release", "--all"]) == 0
     capsys.readouterr()
     seen = _wire(monkeypatch)
     assert cli.main(["input", "hold", "A", "--seconds", "1"]) == 0

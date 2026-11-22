@@ -1704,7 +1704,7 @@ def _hold_conflict(key: str, project, *, allow: bool) -> dict | None:
                   f"itself keeps running in-engine -- so a hold issued back-to-back with "
                   f"another one runs ON TOP of it and the pawn keeps moving after you think "
                   f"it stopped. Wait for it (`--wait` blocks for the duration, `uap input "
-                  f"status` shows remaining_seconds), end it (`uap input release`), or say "
+                  f"status` shows remaining_seconds), end it (`uap input release <Key>`), or say "
                   f"you meant them simultaneous with `--overlap`."),
     }
 
@@ -1855,6 +1855,17 @@ def _input(args) -> int:
                 args.project,
                 needs="driving an Enhanced Input action (uap input action); rebuild the plugin"))
         elif sub == "release":
+            if not (args.key or getattr(args, "all", False)):
+                # A bare release used to drop EVERY hold and flush every pressed key, so a caller
+                # that meant "let go of the left trigger" also dropped the right grip.
+                body = {"ok": False, "action": "release", "released": 0,
+                        "error": "name the key to release (`uap input release <Key>`, or "
+                                 "`uap xr release <hand> grip|trigger`). Releasing EVERYTHING "
+                                 "(every hold + a flush of every pressed key, the stuck-key "
+                                 "recovery) now needs an explicit `uap input release --all`."}
+                _capture("input:release", {"key": ""}, body, int((time.monotonic() - t0) * 1000))
+                _emit(body)
+                return 1
             body.update(_rc_json("ReleaseHeldInput", {"KeyName": args.key or ""}, args.project,
                                  needs=_NEEDS_HOLD))
             _hold_ledger_clear(args.project, args.key or "")
@@ -1966,6 +1977,19 @@ def _xr_rotation(args) -> tuple[float, float, float]:
 def _xr(args) -> int:
     """`uap xr pose|clear|aim|state|grip|trigger`. See the block comment above."""
     sub = args.xr_cmd
+    if sub == "release":
+        # ONE hand's squeeze: its axis key and its click key, nothing else (the bare `input
+        # release` used to drop every hold, the other hand's grip included).
+        rc = 0
+        for tbl in (_XR_AXES, _XR_CLICKS):
+            ns = argparse.Namespace(**vars(args))
+            ns.input_cmd = "release"
+            ns.key = f"OculusTouch_{_XR_HANDS[args.hand]}_{tbl[args.control]}"
+            ns.all = False
+            rc = _input(ns) or rc
+        return rc
+    if sub == "reach":
+        return _xr_reach(args)
     if sub in ("grip", "trigger"):
         # Delegate wholesale to `input axis`: one hold implementation, one ledger, one refusal
         # rule. Only the key name is derived here.
@@ -2051,6 +2075,119 @@ def _xr(args) -> int:
              body, int((time.monotonic() - t0) * 1000))
     _emit(body)
     return 0 if body.get("ok") else 1
+
+
+def _exec_probe(code: str, args) -> dict:
+    """Run an editor-side probe (xr_reach) in the --client world and return its JSON."""
+    from unreal_agent_player import exec_client as _xc
+    from unreal_agent_player import xr_reach as _xrr
+    client = PythonRemoteExecClient(node_project_substr=args.project,
+                                    node_instance=getattr(args, "instance", None))
+    wrapped = _xc.build_client_code(code, _client_tag() or "auto",
+                                    _agent_token(getattr(args, "agent", None)))
+    res = client.exec_python(wrapped)
+    lines = [o.get("output", "") for o in (res.get("output") or [])]
+    lines, _info, refusal = _xc.parse_client_output(lines)
+    if refusal:
+        return {"ok": False, "error": refusal}
+    return _xrr.parse_probe(lines)
+
+
+_REACH_SETTLE_S = 0.4
+
+
+def _xr_reach(args) -> int:
+    """`uap xr reach <hand> <actor[.component]>`: put the hand's GRAB SPHERE on the item.
+
+    Closed loop: probe (item grip/socket point or bounds centre, the grab sphere, the tracking
+    transform), pose the controller, wait a frame or two, read the sphere back, move the pose by
+    the remaining error. A following `uap xr grip` then grabs it. Returns distance hand->target."""
+    from unreal_agent_player import xr_reach as _xrr
+    t0 = time.monotonic()
+    body: dict = {"ok": True, "action": "xr reach", "hand": args.hand, "target": args.target}
+    try:
+        hand = _XR_HANDS[args.hand]
+        probe = _exec_probe(_xrr.reach_code(args.hand, args.target), args)
+        if not probe.get("ok"):
+            body.update({"ok": False, "error": probe.get("error", "probe failed")})
+        else:
+            pose = list(probe["ctrl_rel_loc"])
+            rot = _xr_rotation(args) if getattr(args, "rotation", None) else probe["ctrl_rel_rot"]
+            tried = 0
+            while True:
+                dist = sum(c * c for c in (a - b for a, b in zip(probe["target"], probe["grab"]))) ** 0.5
+                done = dist <= args.tolerance
+                if tried and (done or tried >= args.iterations):
+                    break
+                if not tried and done and getattr(args, "rotation", None) is None:
+                    break
+                pose = [p + d for p, d in zip(pose, probe["delta_tracking"])]
+                ok = _rc_call("InjectXRControllerPose",
+                              {"Hand": hand,
+                               "Position": {"X": pose[0], "Y": pose[1], "Z": pose[2]},
+                               "Orientation": {"Pitch": rot[0], "Yaw": rot[1], "Roll": rot[2]},
+                               "bTracked": True}, args.project)
+                if not ok:
+                    body.update({"ok": False, "error": "InjectXRControllerPose returned false "
+                                 "(no such PIE client, or the agent motion controller is missing)"})
+                    break
+                tried += 1
+                time.sleep(_REACH_SETTLE_S)
+                probe = _exec_probe(_xrr.reach_code(args.hand, args.target), args)
+                if not probe.get("ok"):
+                    body.update({"ok": False, "error": probe.get("error", "probe failed")})
+                    break
+            if body["ok"]:
+                dist = sum(c * c for c in (a - b for a, b in zip(probe["target"], probe["grab"]))) ** 0.5
+                body.update({"distance_cm": round(dist, 2), "reached": dist <= args.tolerance,
+                             "iterations": tried, "pose": [round(p, 2) for p in pose],
+                             "target_point": probe["target"], "target_how": probe["target_how"],
+                             "actor": probe["actor"], "grab_point": probe["grab"],
+                             "grab_component": probe["grab_component"],
+                             "grab_radius_cm": probe["grab_radius"],
+                             "note": "grab sphere moved onto the item; now `uap xr grip "
+                                     f"{args.hand}`. Read the grip back from the pawn, not from "
+                                     "this result."})
+                if not body["reached"]:
+                    body["ok"] = False
+                    body["error"] = (f"grab sphere is still {dist:.1f} cm from the target after "
+                                     f"{tried} correction(s) (tolerance {args.tolerance} cm): "
+                                     "something is clamping the hand (arm reach / collision).")
+    except (AgentError, json.JSONDecodeError, ValueError) as exc:
+        body = _err(exc) if isinstance(exc, AgentError) else {"ok": False, "error": str(exc)}
+    _capture("xr:reach", {"hand": args.hand, "target": args.target}, body,
+             int((time.monotonic() - t0) * 1000))
+    _emit(body)
+    return 0 if body.get("ok") else 1
+
+
+def _screenshot_head(args) -> dict | None:
+    """--look-at / --head: place the HEAD before a VR-pawn capture (else it shows the floor)."""
+    from unreal_agent_player import xr_reach as _xrr
+    target = getattr(args, "head_at", None) or ""
+    if not (target or getattr(args, "head", False)):
+        return None
+    # Level the head first: the probe reads the camera world position and the pawn yaw.
+    _xr_require_head_support(args.project)
+    _rc_call("InjectXRControllerPose",
+             {"Hand": "Head", "Position": {"X": 0.0, "Y": 0.0, "Z": args.eye_height},
+              "Orientation": {"Pitch": 0.0, "Yaw": 0.0, "Roll": 0.0}, "bTracked": True}, args.project)
+    time.sleep(_REACH_SETTLE_S)
+    probe = _exec_probe(_xrr.look_code(target, args.eye_height), args)
+    if not probe.get("ok"):
+        raise AgentError(ErrorCode.SCHEMA_VALIDATION,
+                         f"--head-at/--head: {probe.get('error')}", recoverable=False)
+    _xr_require_head_support(args.project)
+    ok = _rc_call("InjectXRControllerPose",
+                  {"Hand": "Head", "Position": {"X": 0.0, "Y": 0.0, "Z": args.eye_height},
+                   "Orientation": {"Pitch": probe["pitch"], "Yaw": probe["yaw"], "Roll": 0.0},
+                   "bTracked": True}, args.project)
+    if not ok:
+        raise AgentError(ErrorCode.SCHEMA_VALIDATION,
+                         "head pose refused (no such PIE client / no VR pawn)", recoverable=False)
+    time.sleep(_REACH_SETTLE_S)
+    return {"eye_height_cm": args.eye_height, "pitch": round(probe["pitch"], 1),
+            "yaw": round(probe["yaw"], 1), "looking_at": probe.get("actor")}
 
 
 _NEEDS_MOUSE = ("positioning the mouse INSIDE a captured PIE viewport; the OS cursor cannot be "
@@ -2987,6 +3124,9 @@ def _screenshot(args) -> int:
         # relative to ITS OWN: a relative path is checked in the wrong place and reads as "no
         # frame rendered" (ClickUp 17tm466ft2k, Prom report). Always hand the engine an absolute path.
         args.file = os.path.abspath(args.file)
+        head_info = None
+        if getattr(args, "head_at", None) or getattr(args, "head", False):
+            head_info = _screenshot_head(args)
         level = _wants_level_viewport(args)
         if not level:
             # No flags: PIE -> the PIE game viewport (unchanged). No PIE -> the level viewport,
@@ -3018,6 +3158,8 @@ def _screenshot(args) -> int:
             if body.get("exists"):
                 body = _refuse_blank_frame(body, args.file, bool(getattr(args, "allow_blank", False)))
         body["caption"] = args.caption
+        if head_info:
+            body["head_pose"] = head_info
         if body.get("exists"):
             # Stamp which editor this shot came from, so report finish can reject a pass whose
             # proof is a screenshot of a DIFFERENT editor.
@@ -3440,10 +3582,14 @@ SUSTAINED INPUT (a single injected event CANNOT drive locomotion -- see below)
                                        Needs a plugin build that has RunInputSequence.
   uap input sequence-status            when each step of recent scripts ACTUALLY fired: world time,
                                        frame, start_error_ms (0 .. one frame, never early)
-  uap input release                    RECOVERY: release every hold AND flush any key the
+  uap input release --all              RECOVERY: release every hold AND flush any key the
                                        engine still has down (clears a stuck key without a
                                        PIE restart). Run it if input starts behaving oddly.
-  uap input release <Key>              force-release one key, held or not
+  uap input release <Key>              force-release ONLY that key, held or not (bare
+                                       `release` is refused: it used to drop every hold)
+  uap xr release <hand> grip|trigger   release one hand's axis + click keys, nothing else
+  uap xr reach <hand> <actor[.comp]>   pose the hand so its grab sphere sits on the item
+  uap screenshot f.png --head-at <actor>|--head   VR pawn: set a head pose first
   uap input status                     what is held, for how long, and whether it is really
                                        down in the engine (`down`)
   Why: `rc InjectKey bPressed=true` is ONE event. The CLI round-trip is ~1s, so re-injecting
@@ -3582,7 +3728,7 @@ RECIPES
     uap log since $C --grep "Janitor|Catch"
   Input acting up (pawn stuck crouched, movement that won't stop)? Clear it without a restart:
     uap input status               # what the registry thinks is held + engine `down` truth
-    uap input release              # release all holds AND flush any key still down
+    uap input release --all        # release all holds AND flush any key still down
   Select a CommonUI tab / move focus:
     uap tab "VRTraining"            # select tab by id
     uap nav down ; uap nav accept   # focus nav + activate
@@ -4229,6 +4375,14 @@ def build_parser() -> argparse.ArgumentParser:
                     help="keep a PIE frame that rendered all black / one flat colour. Default: such "
                          "a frame is NOT returned as a screenshot (ok:false, blank:true) because a "
                          "picture of nothing is not proof [17tm466zztw]")
+    sc.add_argument("--head-at", dest="head_at", default=None, metavar="ACTOR",
+                    help="VR pawn: first place the injected HEAD at --eye-height looking at ACTOR "
+                         "(name or label), then capture. Without a head pose a VR pawn's camera "
+                         "sits at the tracking origin and the shot is the floor.")
+    sc.add_argument("--head", action="store_true",
+                    help="VR pawn: place the injected HEAD at --eye-height looking straight ahead")
+    sc.add_argument("--eye-height", dest="eye_height", type=float, default=170.0,
+                    help="eye height for --head-at/--head, tracking-space cm (default 170)")
     _add_level_pose_args(sc)
     sc.add_argument("--interval-ms", dest="interval_ms", type=int, default=500,
                     help="with --window --frames: milliseconds between frames (default 500)")
@@ -4286,8 +4440,11 @@ def build_parser() -> argparse.ArgumentParser:
                       help="action value (bool actions: >0.5 = pressed). One injection lasts one "
                            "input tick; feed 0 after to release / re-arm an edge gate")
     iact.set_defaults(func=_input)
-    ir = inps.add_parser("release", parents=[proj], help="end a hold early (default: all holds)")
-    ir.add_argument("key", nargs="?", default="", help="FKey name; omit to release everything")
+    ir = inps.add_parser("release", parents=[proj],
+                         help="end ONE named hold early (--all: every hold + flush, recovery)")
+    ir.add_argument("key", nargs="?", default="", help="FKey name to release (only that key)")
+    ir.add_argument("--all", action="store_true",
+                    help="release EVERY hold and flush every pressed key (stuck-key recovery)")
     ir.set_defaults(func=_input)
     isq = inps.add_parser("sequence", parents=[proj],
                           help="play a whole TIMED input script in-engine (exact timing)")
@@ -4351,6 +4508,21 @@ def build_parser() -> argparse.ArgumentParser:
     xrs.add_parser("state", parents=[proj],
                    help="what the injected controllers answer now: grip pose, aim pose, emulation"
                    ).set_defaults(func=_xr)
+    xrl = xrs.add_parser("release", parents=[proj],
+                         help="release ONE hand's grip or trigger (axis + click), nothing else")
+    xrl.add_argument("hand", choices=["left", "right"])
+    xrl.add_argument("control", choices=["grip", "trigger"])
+    xrl.set_defaults(func=_xr)
+    xre = xrs.add_parser("reach", parents=[proj],
+                         help="pose a hand so its GRAB SPHERE sits on an item (then `xr grip`); "
+                              "returns the distance hand->target")
+    xre.add_argument("hand", choices=["left", "right"])
+    xre.add_argument("target", help="actor name/label, or Actor.Component")
+    xre.add_argument("--tolerance", type=float, default=2.0, help="cm, default 2 (sphere radius ~4)")
+    xre.add_argument("--iterations", type=int, default=4, help="max pose corrections (default 4)")
+    xre.add_argument("--rotation", default=None, metavar="PITCH,YAW,ROLL",
+                     help="controller orientation (default: keep what it has)")
+    xre.set_defaults(func=_xr)
     for verb in ("grip", "trigger"):
         xg = xrs.add_parser(verb, parents=[proj],
                             help=f"hold OculusTouch_<Hand>_{_XR_AXES[verb]} (+ _{_XR_CLICKS[verb]} at >= 0.5) for N seconds "
