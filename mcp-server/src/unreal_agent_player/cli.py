@@ -1102,6 +1102,12 @@ def _exec(args) -> int:
         _capture("exec", {"code": code[:200]}, body, int((time.monotonic() - t0) * 1000))
         _emit(body)
         return 1
+    nav = _exec_nav_cdo_refusal(code)
+    if nav:
+        body = {"ok": False, "error": nav}
+        _capture("exec", {"code": code[:200]}, body, int((time.monotonic() - t0) * 1000))
+        _emit(body)
+        return 1
     if getattr(args, "allow_pie_writes", False):
         if _EXEC_PIE_WRITE_RE.search(code) and (_client_tag() or _EXEC_PIE_WORLD_RE.search(code)):
             print("!!! WARNING: --allow-pie-writes: running property/transform writes on a live PIE "
@@ -3293,6 +3299,29 @@ def _exec_pie_write_refusal(code: str, client_tag: str = "") -> str | None:
             f"Use {_PIE_WRITE_SAFE} instead; reads (get_*) stay allowed. "
             "Override only for a rare, understood case with --allow-pie-writes. "
             "The script was NOT run.")
+
+
+# NavigationSystemV1 world-context statics called with no world. Python then passes the class
+# default object as the context; the CDO has no world -> ensure `!HasAnyFlags(RF_ClassDefaultObject)`
+# [NavigationSystem.h:293] -> crash report + editor incident (2026-11-23, verify job e0072e28).
+_EXEC_NAV_CDO_RE = re.compile(
+    r"\bNavigationSystemV1\s*\.\s*(?P<fn>find_path_to_(?:location|actor)_(?:a)?synchronously|"
+    r"project_point_to_navigation|get_random_(?:reachable_)?point_in_(?:navigable_)?radius|"
+    r"k2_\w+|is_navigation_being_built(?:_or_locked)?|get_navigation_system|navigation_raycast|"
+    r"get_path_(?:cost|length))\s*\(\s*(?:\)|None\b|,)")
+
+
+def _exec_nav_cdo_refusal(code: str) -> str | None:
+    """Refusal for `unreal.NavigationSystemV1.<static>(` with an empty or None world context."""
+    m = _EXEC_NAV_CDO_RE.search(code or "")
+    if not m:
+        return None
+    return (f"refusing: `NavigationSystemV1.{m.group('fn')}(` has no world context. Python then "
+            "invokes it on the class default object, which has no world -> ensure "
+            "`!HasAnyFlags(RF_ClassDefaultObject)` [NavigationSystem.h:293] and a crash report on "
+            "the SHARED editor (2026-11-23). Pass the PIE world as the FIRST argument "
+            "(`unreal.NavigationSystemV1.find_path_to_location_synchronously(pie_world, a, b)`), "
+            "or resolve `get_navigation_system(pie_world)` first. The script was NOT run.")
 
 
 def _exec_travel_refusal(code: str) -> str | None:
