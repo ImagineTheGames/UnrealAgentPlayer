@@ -130,8 +130,29 @@ def test_reach_probe_failure_is_reported(monkeypatch, capsys):
     assert "matched 0" in _out(capsys)["error"]
 
 
+def test_reach_offset_goes_into_the_probe_script(monkeypatch, capsys):
+    hand = _FakeHand([100.0, 0.0, 95.0])
+    _reach_wire(monkeypatch, hand)
+    seen = []
+    monkeypatch.setattr(cli, "_exec_probe", lambda code, args: seen.append(code) or hand.probe())
+    assert cli.main(["xr", "reach", "left", "Tablet.Mesh", "--offset", "0,-24,11.7"]) == 0
+    assert seen and all("_off = (0.0, -24.0, 11.7)" in c for c in seen)
+
+
+def test_reach_without_offset_keeps_the_old_probe(monkeypatch, capsys):
+    assert "_off = None" in xr_reach.reach_code("left", "Cap")
+
+
+@pytest.mark.parametrize("bad", ["1,2", "a,b,c", "1,2,3,4"])
+def test_reach_offset_must_be_three_numbers(monkeypatch, capsys, bad):
+    _wire(monkeypatch)
+    monkeypatch.setattr(cli, "_exec_probe", lambda c, a: pytest.fail("probe must not run"))
+    assert cli.main(["xr", "reach", "left", "Cap", "--offset", bad]) == 1
+    assert "--offset" in capsys.readouterr().out
+
+
 def test_probe_scripts_are_safe_for_remote_exec():
-    for code in (xr_reach.reach_code("left", 'Actor.Comp"x'), xr_reach.look_code("A", 170)):
+    for code in (xr_reach.reach_code("left", 'Actor.Comp"x', (1, 2, 3)), xr_reach.look_code("A", 170)):
         compile(code, "probe", "exec")
         assert ".py" not in code.replace("UAP_XR_PROBE", "")
 

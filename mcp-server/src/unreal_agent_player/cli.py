@@ -2096,6 +2096,21 @@ def _exec_probe(code: str, args) -> dict:
 _REACH_SETTLE_S = 0.4
 
 
+def _reach_offset(args) -> tuple[float, float, float] | None:
+    """--offset X,Y,Z (cm, target component local space), or None."""
+    raw = getattr(args, "offset", None)
+    if raw is None:
+        return None
+    parts = [p for p in re.split(r"[,\s]+", str(raw).strip()) if p]
+    try:
+        if len(parts) == 3:
+            return float(parts[0]), float(parts[1]), float(parts[2])
+    except ValueError:
+        pass
+    raise AgentError(ErrorCode.SCHEMA_VALIDATION,
+                     f"--offset wants X,Y,Z (three numbers, cm), got {raw!r}", recoverable=False)
+
+
 def _xr_reach(args) -> int:
     """`uap xr reach <hand> <actor[.component]>`: put the hand's GRAB SPHERE on the item.
 
@@ -2107,7 +2122,8 @@ def _xr_reach(args) -> int:
     body: dict = {"ok": True, "action": "xr reach", "hand": args.hand, "target": args.target}
     try:
         hand = _XR_HANDS[args.hand]
-        probe = _exec_probe(_xrr.reach_code(args.hand, args.target), args)
+        offset = _reach_offset(args)
+        probe = _exec_probe(_xrr.reach_code(args.hand, args.target, offset), args)
         if not probe.get("ok"):
             body.update({"ok": False, "error": probe.get("error", "probe failed")})
         else:
@@ -2133,7 +2149,7 @@ def _xr_reach(args) -> int:
                     break
                 tried += 1
                 time.sleep(_REACH_SETTLE_S)
-                probe = _exec_probe(_xrr.reach_code(args.hand, args.target), args)
+                probe = _exec_probe(_xrr.reach_code(args.hand, args.target, offset), args)
                 if not probe.get("ok"):
                     body.update({"ok": False, "error": probe.get("error", "probe failed")})
                     break
@@ -3588,7 +3604,8 @@ SUSTAINED INPUT (a single injected event CANNOT drive locomotion -- see below)
   uap input release <Key>              force-release ONLY that key, held or not (bare
                                        `release` is refused: it used to drop every hold)
   uap xr release <hand> grip|trigger   release one hand's axis + click keys, nothing else
-  uap xr reach <hand> <actor[.comp]>   pose the hand so its grab sphere sits on the item
+  uap xr reach <hand> <actor[.comp]> [--offset x,y,z]   pose the hand so its grab sphere sits on
+                                       the item (offset: cm in the component's local space)
   uap screenshot f.png --head-at <actor>|--head   VR pawn: set a head pose first
   uap input status                     what is held, for how long, and whether it is really
                                        down in the engine (`down`)
@@ -4522,6 +4539,9 @@ def build_parser() -> argparse.ArgumentParser:
     xre.add_argument("--iterations", type=int, default=4, help="max pose corrections (default 4)")
     xre.add_argument("--rotation", default=None, metavar="PITCH,YAW,ROLL",
                      help="controller orientation (default: keep what it has)")
+    xre.add_argument("--offset", default=None, metavar="X,Y,Z",
+                     help="cm, in the target component's LOCAL space: reach this point instead of the "
+                          "socket / bounds centre (a handle that is not at the origin)")
     xre.set_defaults(func=_xr)
     for verb in ("grip", "trigger"):
         xg = xrs.add_parser(verb, parents=[proj],
