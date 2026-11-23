@@ -1102,6 +1102,18 @@ def _exec(args) -> int:
         _capture("exec", {"code": code[:200]}, body, int((time.monotonic() - t0) * 1000))
         _emit(body)
         return 1
+    if getattr(args, "allow_pie_writes", False):
+        if _EXEC_PIE_WRITE_RE.search(code) and (_client_tag() or _EXEC_PIE_WORLD_RE.search(code)):
+            print("!!! WARNING: --allow-pie-writes: running property/transform writes on a live PIE "
+                  "world. This can crash the SHARED editor (CRASH-0BD72FF1). You own the fallout.",
+                  file=sys.stderr)
+    else:
+        pw = _exec_pie_write_refusal(code, _client_tag())
+        if pw:
+            body = {"ok": False, "error": pw}
+            _capture("exec", {"code": code[:200]}, body, int((time.monotonic() - t0) * 1000))
+            _emit(body)
+            return 1
     from unreal_agent_player.tools import console as _console
     net = _console.NONE_WORLD_REFUSAL if _console.none_world_console_call(code) else None
     net = net or _net_emulation_refusal(code, args.project, scan=True)
@@ -1247,7 +1259,8 @@ def _exec_file(args) -> int:
     return _exec(argparse.Namespace(code=code, project=args.project,
                                     instance=getattr(args, "instance", None),
                                     unsafe_level_load=getattr(args, "unsafe_level_load", False),
-                                    level_guard="warn", agent=getattr(args, "agent", None)))
+                                    level_guard="warn", agent=getattr(args, "agent", None),
+                                    allow_pie_writes=getattr(args, "allow_pie_writes", False)))
 
 
 def _pie_start(mode: str, project: str | None) -> dict:
@@ -3251,6 +3264,37 @@ def _exec_level_load_refusal(code: str) -> str | None:
             "The script was NOT run.")
 
 
+# Property / transform / attach WRITES on a live PIE object. A Python `set_editor_property` fires
+# PostEditChange on the PIE component; on a camera/scene component that runs RerunConstructionScripts
+# on the owning PIE actor, and with items attached the engine asserts
+# (AttachedActor->ParentComponent->GetOwner()==this) -> SHARED EDITOR CRASH 0BD72FF1, 2026-11-23.
+_EXEC_PIE_WRITE_RE = re.compile(
+    r"\b(set_editor_propert(?:y|ies)|set_relative_(?:location|rotation|scale3d|transform)|"
+    r"set_world_\w+|set_actor_(?:location|rotation|transform|scale3d)\w*|k2_set_\w+|"
+    r"(?:k2_)?attach_to_(?:component|actor)|rerun_construction_scripts)\s*\(")
+# Code that itself resolves a PIE world (no --client needed to be aimed at one).
+_EXEC_PIE_WORLD_RE = re.compile(r"UEDPIE_|\bget_game_world\b|\b_uap_world\b|\bpie_world\b|\bclient_world\b")
+
+_PIE_WRITE_SAFE = ("`uap input` (in-engine input injection), `uap xr pose` (HMD/controller pose), "
+                   "or a dev console command (`uap console ...`) that the game owns")
+
+
+def _exec_pie_write_refusal(code: str, client_tag: str = "") -> str | None:
+    """Refusal for Python that WRITES properties/transforms/attachments while aimed at a PIE world
+    (any --client exec, or code that resolves a UEDPIE_ world), or None. Reads (get_*) pass."""
+    m = _EXEC_PIE_WRITE_RE.search(code or "")
+    if not m:
+        return None
+    if not (client_tag or _EXEC_PIE_WORLD_RE.search(code or "")):
+        return None
+    return (f"refusing: this Python calls `{m.group(1)}(` while targeting a live PIE world. A write "
+            "on a PIE component fires PostEditChange -> RerunConstructionScripts on the PIE actor "
+            "and asserted the SHARED editor with attached items (CRASH-0BD72FF1, 2026-11-23). "
+            f"Use {_PIE_WRITE_SAFE} instead; reads (get_*) stay allowed. "
+            "Override only for a rare, understood case with --allow-pie-writes. "
+            "The script was NOT run.")
+
+
 def _exec_travel_refusal(code: str) -> str | None:
     """Refusal for `open <map>` / `servertravel` console commands and their Python spellings."""
     tm = _EXEC_TRAVEL_RE.search(code or "")
@@ -3561,6 +3605,14 @@ LEVEL (change the open map SAFELY -- never load_level from `uap exec`)
   REFUSE code that calls load_level / load_map / new_level (--unsafe-level-load overrides, throwaway
   editors only). Hold the lease (`uap lease acquire exclusive --reason pie`) if others share the editor:
   a level change takes the editor away from whatever they were doing.
+
+PIE WRITES FROM EXEC (refused -- CRASH-0BD72FF1, 2026-11-23)
+  `uap exec` / `exec-file` REFUSE set_editor_property(ies), set_relative_*, set_world_*, set_actor_*,
+  k2_set_*, attach_to_component/actor and rerun_construction_scripts when the run targets PIE (any
+  --client exec, or code naming UEDPIE_ / get_game_world). A write fires PostEditChange ->
+  RerunConstructionScripts on the PIE actor and asserts the SHARED editor when items are attached.
+  Use `uap input`, `uap xr pose`, or a game dev console command. Reads (get_*) are fine.
+  Rare, understood case only: --allow-pie-writes (prints a loud warning to stderr).
 
 SUSTAINED INPUT (a single injected event CANNOT drive locomotion -- see below)
   uap input hold <Key> --seconds N     hold a digital key; returns at once, held in-engine
@@ -4313,12 +4365,20 @@ def build_parser() -> argparse.ArgumentParser:
     ex.add_argument("--unsafe-level-load", action="store_true", default=False,
                     help="run Python that swaps the editor level (load_level / load_map ...). "
                          "Refused by default: it has killed the shared editor. Use `uap level open`.")
+    ex.add_argument("--allow-pie-writes", action="store_true", default=False,
+                    help="run Python that writes properties/transforms/attachments on a live PIE "
+                         "world (set_editor_property, set_actor_*, k2_set_*, attach_to_*). Refused by "
+                         "default: it crashed the shared editor (0BD72FF1). Prints a loud warning.")
     ex.set_defaults(func=_exec)
     exf = sub.add_parser("exec-file", parents=[proj])
     exf.add_argument("path")
     exf.add_argument("--unsafe-level-load", action="store_true", default=False,
                      help="accepted for symmetry with `exec`; exec-file only WARNS about level "
                           "swaps (builder scripts open their own map). Prefer `uap level open`.")
+    exf.add_argument("--allow-pie-writes", action="store_true", default=False,
+                    help="run Python that writes properties/transforms/attachments on a live PIE "
+                         "world (set_editor_property, set_actor_*, k2_set_*, attach_to_*). Refused by "
+                         "default: it crashed the shared editor (0BD72FF1). Prints a loud warning.")
     exf.set_defaults(func=_exec_file)
     lv = sub.add_parser("level", help="open / read the editor level SAFELY (never load_level from Python)")
     lvs = lv.add_subparsers(dest="level_cmd", required=True)
