@@ -76,7 +76,7 @@ def test_unrelated_passes(code):
 
 def test_editor_unreachable_allows(monkeypatch):
     def boom(*a, **k):
-        raise cli.AgentError(cli.ErrorCode.EDITOR_UNREACHABLE if hasattr(cli.ErrorCode, "EDITOR_UNREACHABLE") else list(cli.ErrorCode)[0], "down")
+        raise cli.AgentError(next(iter(cli.ErrorCode)), "down")
     monkeypatch.setattr(cli, "_rc_call", boom)
     assert cli._exec_nav_cdo_refusal(WITH_WORLD[0]) is None
 
