@@ -1102,7 +1102,7 @@ def _exec(args) -> int:
         _capture("exec", {"code": code[:200]}, body, int((time.monotonic() - t0) * 1000))
         _emit(body)
         return 1
-    nav = _exec_nav_cdo_refusal(code)
+    nav = _exec_nav_cdo_refusal(code, args.project)
     if nav:
         body = {"ok": False, "error": nav}
         _capture("exec", {"code": code[:200]}, body, int((time.monotonic() - t0) * 1000))
@@ -3301,27 +3301,36 @@ def _exec_pie_write_refusal(code: str, client_tag: str = "") -> str | None:
             "The script was NOT run.")
 
 
-# NavigationSystemV1 world-context statics called with no world. Python then passes the class
-# default object as the context; the CDO has no world -> ensure `!HasAnyFlags(RF_ClassDefaultObject)`
-# [NavigationSystem.h:293] -> crash report + editor incident (2026-11-23, verify job e0072e28).
-_EXEC_NAV_CDO_RE = re.compile(
-    r"\bNavigationSystemV1\s*\.\s*(?P<fn>find_path_to_(?:location|actor)_(?:a)?synchronously|"
-    r"project_point_to_navigation|get_random_(?:reachable_)?point_in_(?:navigable_)?radius|"
-    r"k2_\w+|is_navigation_being_built(?:_or_locked)?|get_navigation_system|navigation_raycast|"
-    r"get_path_(?:cost|length))\s*\(\s*(?:\)|None\b|,)")
+# ANY `NavigationSystemV1.<static>(` call from Python while PIE is live ensures, whatever the
+# arguments. Engine PlayLevel.cpp:2296: UEditorEngine::OnScriptExecutionStart calls
+# GetWorldFromContextObject on the object ProcessEvent runs on (the class default object for a static),
+# and UNavigationSystemV1::GetWorld ensures on its CDO (`!HasAnyFlags(RF_ClassDefaultObject)`,
+# NavigationSystem.h:293) -> crash report + editor incident (2026-11-23, jobs e0072e28 / 022041e5).
+# Passing a PIE world does NOT help. The no-world spelling is refused even with no PIE (always wrong).
+_EXEC_NAV_STATIC_RE = re.compile(r"\bNavigationSystemV1\s*\.\s*(?P<fn>[A-Za-z_]\w*)\s*\(")
+_EXEC_NAV_NOWORLD_RE = re.compile(r"\bNavigationSystemV1\s*\.\s*[A-Za-z_]\w*\s*\(\s*(?:\)|None\b|,)")
 
 
-def _exec_nav_cdo_refusal(code: str) -> str | None:
-    """Refusal for `unreal.NavigationSystemV1.<static>(` with an empty or None world context."""
-    m = _EXEC_NAV_CDO_RE.search(code or "")
+def _exec_nav_cdo_refusal(code: str, project: str | None = None) -> str | None:
+    """Refusal for `unreal.NavigationSystemV1.<static>(` while PIE is live (any arguments), or with
+    an empty/None world at any time. Points at `unreal.SONavDevLibrary`."""
+    m = _EXEC_NAV_STATIC_RE.search(code or "")
     if not m:
         return None
-    return (f"refusing: `NavigationSystemV1.{m.group('fn')}(` has no world context. Python then "
-            "invokes it on the class default object, which has no world -> ensure "
-            "`!HasAnyFlags(RF_ClassDefaultObject)` [NavigationSystem.h:293] and a crash report on "
-            "the SHARED editor (2026-11-23). Pass the PIE world as the FIRST argument "
-            "(`unreal.NavigationSystemV1.find_path_to_location_synchronously(pie_world, a, b)`), "
-            "or resolve `get_navigation_system(pie_world)` first. The script was NOT run.")
+    if not _EXEC_NAV_NOWORLD_RE.search(code or ""):
+        try:
+            if not _rc_call("IsInPIE", {}, project):
+                return None
+        except (AgentError, json.JSONDecodeError):
+            return None  # editor unreachable: nothing to crash, the real call will report that
+    return (f"refusing: `NavigationSystemV1.{m.group('fn')}(` from Python ensures while PIE is live, "
+            "whatever the arguments (PIE runs it on the class default object; "
+            "`UNavigationSystemV1::GetWorld` ensures `!HasAnyFlags(RF_ClassDefaultObject)` "
+            "[NavigationSystem.h:293]) and writes a crash report on the SHARED editor. Passing a "
+            "world does not help. Use the game-side helper instead: "
+            "`unreal.SONavDevLibrary.find_nav_path(pie_world, start, end)`, "
+            "`.project_point_to_nav(pie_world, point, extent)`, `.get_nav_data_summary(pie_world)`. "
+            "The script was NOT run.")
 
 
 def _exec_travel_refusal(code: str) -> str | None:
