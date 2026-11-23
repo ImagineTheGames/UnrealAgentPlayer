@@ -61,6 +61,7 @@ def _find_actor(spec):
 _REACH = r'''
 _hand = "__HAND__"
 _spec = "__TARGET__"
+_off = __OFFSET__
 if _pawn is None:
     _emit({"ok": False, "error": "client has no controlled pawn (no PIE, or the VR pawn is not possessed)"})
 else:
@@ -95,6 +96,10 @@ else:
             if _tp is None and _cn and _comp is not None:
                 _tp = _u.SystemLibrary.get_component_bounds(_comp)[0]
                 _how = "component bounds centre"
+            if _off is not None:
+                _btf = _comp.get_world_transform() if _comp is not None else _act.get_actor_transform()
+                _tp = _u.MathLibrary.transform_location(_btf, _u.Vector(_off[0], _off[1], _off[2]))
+                _how = "component local offset %s" % (_off,)
             if _tp is None:
                 _tp = _act.get_actor_location()
             _ctrl = None
@@ -171,8 +176,12 @@ def _lit(s: str) -> str:
     return json.dumps(str(s))[1:-1]
 
 
-def reach_code(hand: str, target: str) -> str:
-    return _COMMON + _REACH.replace("__HAND__", _lit(hand.lower())).replace("__TARGET__", _lit(target))
+def reach_code(hand: str, target: str, offset: tuple[float, float, float] | None = None) -> str:
+    """`offset` (cm) is in the target component's LOCAL space (actor root when no component is
+    named); it replaces the socket / bounds-centre point so a handle off the origin can be reached."""
+    off = "None" if offset is None else repr(tuple(float(v) for v in offset))
+    return (_COMMON + _REACH.replace("__HAND__", _lit(hand.lower())).replace("__TARGET__", _lit(target))
+            .replace("__OFFSET__", off))
 
 
 def look_code(target: str, eye: float) -> str:
