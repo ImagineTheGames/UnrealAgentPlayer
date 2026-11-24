@@ -599,7 +599,7 @@ _INSTANCE_TARGET: list = [None]
 _RUNTIME_PRESET = "UAP_RuntimePreset"
 _UAPRCPORT_RE = re.compile(r"-UAPRCPort=(\d+)", re.IGNORECASE)
 # The verbs the runtime subsystem serves, i.e. the ones a standalone client can be driven with.
-_INSTANCE_RC_CMDS = frozenset({"input", "xr", "click", "tab", "nav", "read-ui", "rc", "sample", "log", "screenshot"})
+_INSTANCE_RC_CMDS = frozenset({"input", "xr", "pawn", "click", "tab", "nav", "read-ui", "rc", "sample", "log", "screenshot"})
 
 
 def _resolve_instance_target(instance: str | None, project: str | None) -> dict | None:
@@ -1114,7 +1114,12 @@ def _exec(args) -> int:
                   "world. This can crash the SHARED editor (CRASH-0BD72FF1). You own the fallout.",
                   file=sys.stderr)
     else:
-        pw = _exec_pie_write_refusal(code, _client_tag())
+        allow = _pie_write_allowlisted(getattr(args, "script_path", None))
+        if allow and _EXEC_PIE_WRITE_RE.search(code):
+            print("note: PIE-write guard relaxed for allowlisted script "
+                  f"{getattr(args, 'script_path', '')} (attach/rebuild calls still refused)",
+                  file=sys.stderr)
+        pw = _exec_pie_write_refusal(code, _client_tag(), allowlisted=allow)
         if pw:
             body = {"ok": False, "error": pw}
             _capture("exec", {"code": code[:200]}, body, int((time.monotonic() - t0) * 1000))
@@ -1266,6 +1271,7 @@ def _exec_file(args) -> int:
                                     instance=getattr(args, "instance", None),
                                     unsafe_level_load=getattr(args, "unsafe_level_load", False),
                                     level_guard="warn", agent=getattr(args, "agent", None),
+                                    script_path=args.path,
                                     allow_pie_writes=getattr(args, "allow_pie_writes", False)))
 
 
@@ -2091,6 +2097,39 @@ def _xr(args) -> int:
         body = _err(exc)
     _capture(f"xr:{sub}", {k: v for k, v in vars(args).items()
                            if k in ("hand", "x", "y", "z", "pitch", "yaw", "roll", "rotation", "mode")},
+             body, int((time.monotonic() - t0) * 1000))
+    _emit(body)
+    return 0 if body.get("ok") else 1
+
+
+def _pawn(args) -> int:
+    """`uap pawn teleport <x> <y> <z> [--yaw D] [--player N]` / `uap pawn place <actor> --dist CM`.
+
+    Moves a PIE pawn IN-ENGINE (K2_TeleportTo on the pawn, controller rotation for yaw) from an
+    internal probe, in the PIE world of --client only. It is the PIE-safe replacement for
+    `set_actor_location` in `uap exec`, which the PIE-write guard refuses (CRASH-0BD72FF1). No
+    property is written, so no PostEditChange fires. Refuses outside a PIE world; logs to the UE log."""
+    from unreal_agent_player import pawn_move as _pm
+    t0 = time.monotonic()
+    sub = args.pawn_cmd
+    body: dict = {"ok": True, "action": f"pawn {sub}"}
+    try:
+        if sub == "teleport":
+            code = _pm.teleport_code(args.x, args.y, args.z, args.yaw, args.player)
+        else:
+            code = _pm.place_code(args.actor, args.dist, args.bearing, args.player)
+        res = _exec_probe(code, args)
+        body.update(res)
+        if str(res.get("error", "")).startswith("the editor-side probe printed nothing"):
+            body["error"] = ("no PIE world to move a pawn in (start PIE first: `uap pie start`); probe said: "
+                             + str(res["error"])[:200])
+        if not res.get("ok"):
+            body["ok"] = False
+            body.setdefault("error", "pawn move failed")
+    except (AgentError, json.JSONDecodeError) as exc:
+        body = _err(exc)
+    _capture(f"pawn:{sub}", {k: v for k, v in vars(args).items()
+                             if k in ("x", "y", "z", "yaw", "player", "actor", "dist", "bearing")},
              body, int((time.monotonic() - t0) * 1000))
     _emit(body)
     return 0 if body.get("ok") else 1
@@ -3285,10 +3324,31 @@ _PIE_WRITE_SAFE = ("`uap input` (in-engine input injection), `uap xr pose` (HMD/
                    "or a dev console command (`uap console ...`) that the game owns")
 
 
-def _exec_pie_write_refusal(code: str, client_tag: str = "") -> str | None:
+# Scripts that may run property/transform writes against PIE from `uap exec-file`, matched by the
+# END of their path (forward slashes, lower case). Grip View's editor half is the one entry: it writes
+# only to the VR pawn it possessed, actors it summoned itself, the match clock and the pawn's
+# movement mode, and has no set_editor_property on a scene component (the CRASH-0BD72FF1 trigger).
+# Add a project script with $UAP_PIE_WRITE_ALLOW (os.pathsep-separated path suffixes), not by
+# editing this tuple. An allowlisted script is STILL refused attach_* / rerun_construction_scripts.
+_PIE_WRITE_ALLOWLIST = ("/scripts/gripview/gv_rig.py",)
+_EXEC_PIE_ATTACH_RE = re.compile(r"\b((?:k2_)?attach_to_(?:component|actor)|rerun_construction_scripts)\s*\(")
+
+
+def _pie_write_allowlisted(path: str | None) -> bool:
+    """True when `path` (an exec-file script) ends with an allowlisted suffix."""
+    if not path:
+        return False
+    norm = os.path.abspath(path).replace("\\", "/").lower()
+    extra = [e.strip().replace("\\", "/").lower()
+             for e in os.environ.get("UAP_PIE_WRITE_ALLOW", "").split(os.pathsep) if e.strip()]
+    return any(norm.endswith(sfx) for sfx in (*_PIE_WRITE_ALLOWLIST, *extra))
+
+
+def _exec_pie_write_refusal(code: str, client_tag: str = "", allowlisted: bool = False) -> str | None:
     """Refusal for Python that WRITES properties/transforms/attachments while aimed at a PIE world
-    (any --client exec, or code that resolves a UEDPIE_ world), or None. Reads (get_*) pass."""
-    m = _EXEC_PIE_WRITE_RE.search(code or "")
+    (any --client exec, or code that resolves a UEDPIE_ world), or None. Reads (get_*) pass.
+    `allowlisted` (an exec-file script on the allowlist) narrows it to attach / rebuild calls."""
+    m = (_EXEC_PIE_ATTACH_RE if allowlisted else _EXEC_PIE_WRITE_RE).search(code or "")
     if not m:
         return None
     if not (client_tag or _EXEC_PIE_WORLD_RE.search(code or "")):
@@ -3651,6 +3711,10 @@ PIE WRITES FROM EXEC (refused -- CRASH-0BD72FF1, 2026-11-23)
   RerunConstructionScripts on the PIE actor and asserts the SHARED editor when items are attached.
   Use `uap input`, `uap xr pose`, or a game dev console command. Reads (get_*) are fine.
   Rare, understood case only: --allow-pie-writes (prints a loud warning to stderr).
+  Move the PIE pawn with `uap pawn teleport <x> <y> <z> [--yaw D] [--player N]` or
+  `uap pawn place <actor> --dist CM [--bearing D]` (in-engine K2_TeleportTo, PIE world only, logged).
+  Allowlist: `exec-file` of Scripts/GripView/gv_rig.py (Grip View's rig) may write; more scripts via
+  $UAP_PIE_WRITE_ALLOW (path suffixes). attach_* / rerun_construction_scripts stay refused there.
 
 SUSTAINED INPUT (a single injected event CANNOT drive locomotion -- see below)
   uap input hold <Key> --seconds N     hold a digital key; returns at once, held in-engine
@@ -4015,7 +4079,7 @@ def _help(args) -> int:
 # Editor-touching verbs auto-wait while another agent is rebuilding this editor (see main()).
 _REBUILD_GUARDED = {"status", "rc", "exec", "exec-file", "pie", "level",
                     "read-ui", "click", "tab", "nav", "screenshot", "viewport",
-                    "input", "xr", "sample", "log", "helpers"}
+                    "input", "xr", "pawn", "sample", "log", "helpers"}
 
 # ...and additionally wait out ANY other agent's exclusive lease (pie / level / rebuild).
 # `status` is deliberately exempt: it is the health probe you reach for WHILE diagnosing a
@@ -4034,7 +4098,7 @@ _LEASE_GUARDED = _REBUILD_GUARDED - {"status"}
 # behaviour change than the clash being fixed. They remain governed by the per-project lease --
 # except for the `rc` functions and `exec` Python that ARE one of these verbs by another name
 # (start / stop PIE, inject input); see `_machine_guard`.
-_MACHINE_GUARDED = {"pie", "input", "xr", "screenshot", "click", "tab", "nav", "read-ui"}
+_MACHINE_GUARDED = {"pie", "input", "xr", "pawn", "screenshot", "click", "tab", "nav", "read-ui"}
 
 # `uap rc <func>` reaches the same plugin verbs the guarded verbs use, so the functions that start
 # PIE, stop it, or inject input / need the foreground are gated exactly like `pie start`,
@@ -4655,6 +4719,28 @@ def build_parser() -> argparse.ArgumentParser:
                         help=f"do not also hold OculusTouch_<Hand>_{_XR_CLICKS[verb]} (a real controller "
                              f"sends the _Click with the axis once it passes {_XR_CLICK_THRESHOLD})")
         xg.set_defaults(func=_xr)
+
+    # PIE pawn placement: the PIE-safe way to put the pawn next to a test object.
+    pw = sub.add_parser("pawn", help="move the PIE pawn in-engine (teleport / place next to an actor)")
+    pws = pw.add_subparsers(dest="pawn_cmd", required=True)
+    pt = pws.add_parser("teleport", parents=[proj],
+                        help="teleport the PIE pawn to world x y z (cm); optional --yaw faces it. "
+                             "PIE world only; no property write (safe vs the exec PIE-write guard)")
+    pt.add_argument("x", type=float)
+    pt.add_argument("y", type=float)
+    pt.add_argument("z", type=float)
+    pt.add_argument("--yaw", type=float, default=None, help="world yaw in degrees (pawn + control rotation)")
+    pt.add_argument("--player", type=int, default=0, help="player controller index (default 0)")
+    pt.set_defaults(func=_pawn)
+    pp = pws.add_parser("place", parents=[proj],
+                        help="put the PIE pawn --dist cm from an actor (name/label), facing it; "
+                             "keeps the pawn's current height")
+    pp.add_argument("actor", help="actor name or label (unique match)")
+    pp.add_argument("--dist", type=float, required=True, help="horizontal distance to the actor, cm")
+    pp.add_argument("--bearing", type=float, default=180.0,
+                    help="world direction FROM the actor TO the pawn, degrees (0 = +X, 90 = +Y; default 180)")
+    pp.add_argument("--player", type=int, default=0, help="player controller index (default 0)")
+    pp.set_defaults(func=_pawn)
 
     # Mouse position inside a CAPTURED viewport. Not a hold -- a position, which is a different
     # problem: while PIE holds the mouse the pointer cannot be moved at all (Win32 SetCursorPos
