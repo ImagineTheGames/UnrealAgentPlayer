@@ -53,6 +53,18 @@ for you unless you pass `--keep-pie`. And never poll PIE with a tight `exec` loo
 the game thread, and re-entering it during a PIE transition hard-crashes the editor (known-issues
 #12). The blocking verbs poll the plugin over RemoteControl instead, which is a separate channel.
 
+### Multi-client layout (`ConfigurePIENet`, `uap pie start --clients N --net-mode standalone|listen|client`)
+
+The editor's multiplayer layout (`ULevelEditorPlaySettings`: `PlayNetMode`, `PlayNumberOfClients`, `RunUnderOneProcess`) cannot be set from editor Python (the enum is not exposed), RemoteControl treats the property as private, and `Set` console commands are refused in the editor. The plugin sets them in-engine: `ConfigurePIENet(NetMode, Clients, bRunUnderOneProcess)` runs before the start, and the **stop restores the previous layout** (`StopPIEEx` returns `net_restored`; a refused start restores it too). The settings are changed in memory only, never `SaveConfig`, so the user's ini is not dirtied and a crash comes back with the old layout.
+
+- `--net-mode standalone`: every client is its **own standalone game**. Each runs its own login flow, so Photon / EOS sign-in happens per client. A listen-server *client* is a net client that never runs it, which is why a hub test cannot use `listen`.
+- `--net-mode listen`: listen server + clients. `--net-mode client`: in-process dedicated server + clients.
+- `--clients N` (1..16). Alone it means `listen`; `--net-mode` alone means 2 clients.
+- `--separate-processes` clears "Run Under One Process" (one OS process per client). Default is one process, which `--client N` on input/screenshot/exec can address.
+- Refused with `--mode vr` (one HMD) and while PIE is live or queued. A plugin copy without `ConfigurePIENet` is refused with the rebuild instruction, never started as whatever layout the editor last had.
+
+**Getting every client signed in to EOS (Redpoint).** Under the DevAuthTool graph, Redpoint asks the tool (default `localhost:6300`) for a credential named `Context_<PIE instance + 1>`: `Context_1` for the first client, `Context_2` for the second (a dedicated server hosted in the editor shifts the numbering so the first client is still `Context_1`). For a `-game` client launched from the editor the instance number comes from its `GameUserSettingsINI=PIEGameUserSettings<N>` argument, and `-DevAuthToolName=<name>` overrides the name in non-shipping builds. A client whose name has no credential falls back to `DevAuthToolDefaultCredentialName`, so every client signs in as the **same** account and the second is rejected ("The connecting user has not signed into EOS"). No setting makes this automatic: open the DevAuthTool once, add one credential per client named `Context_1` .. `Context_N`, each logged in to a **different** account. `pie start` prints the names it expects in `devauth_credentials`.
+
 ### VR Preview (`StartPIEMode`, `uap pie start --mode vr`)
 
 `uap pie start` gives **flat PIE**, which never takes the HMD code path. Two whole classes of bug are invisible there:

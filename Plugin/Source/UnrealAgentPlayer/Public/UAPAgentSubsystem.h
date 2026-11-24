@@ -48,6 +48,21 @@ public:
     UFUNCTION(BlueprintCallable, Category="Agent|PIE")
     FString StartPIEMode(FString Mode);
 
+    // Sets the PIE multiplayer layout for the NEXT start: NetMode "standalone" (every client is its
+    // own standalone game, so each signs in to Photon/EOS separately), "listen" (listen server +
+    // clients) or "client" (in-process dedicated server + clients); Clients = PlayNumberOfClients
+    // (1..16); bRunUnderOneProcess = the "Run Under One Process" checkbox. Writes ULevelEditorPlaySettings
+    // IN MEMORY (never SaveConfig, so the user's ini is not dirtied) and remembers the values it
+    // replaced; RestorePIENet puts them back. Refused while PIE is live (the layout is read at start).
+    // Returns {"ok":true,"net_mode":..,"clients":N,"one_process":bool,"previous":{...}} or {"ok":false,"error":..}.
+    UFUNCTION(BlueprintCallable, Category="Agent|PIE")
+    FString ConfigurePIENet(FString NetMode, int32 Clients, bool bRunUnderOneProcess);
+
+    // Restores the settings ConfigurePIENet replaced. Idempotent: with nothing saved it is a no-op
+    // ({"ok":true,"restored":false}). Call it after `pie stop`.
+    UFUNCTION(BlueprintCallable, Category="Agent|PIE")
+    FString RestorePIENet();
+
     // Stops Play-In-Editor. Cancels any QUEUED play-session request first, then requests end-play
     // if a play world exists. Returns false only if the editor is unusable. It cannot report that
     // PIE is GONE -- teardown happens on a later editor tick -- so poll IsPIEInProgress() to
@@ -339,4 +354,13 @@ private:
 
     TArray<FAgentHelperDescriptor> HelperCache;
     void RefreshHelperCache();
+
+    // Shared by RestorePIENet and StopPIEEx (a stop restores the layout in the same call).
+    TSharedRef<class FJsonObject> RestorePIENetObject();
+
+    // What ConfigurePIENet replaced, for RestorePIENet.
+    bool bHasSavedPIENet = false;
+    int32 SavedPIENetMode = 0;
+    int32 SavedPIEClients = 1;
+    bool bSavedPIEOneProcess = true;
 };
