@@ -551,8 +551,29 @@ bool FAgentInput::InjectMouseButtonAt(EAgentMouseButton Btn, bool bPressed, FVec
             }
         }
     }
-    if (bPressed) { return App.ProcessMouseButtonDownEvent(nullptr, Evt); }
-    return App.ProcessMouseButtonUpEvent(Evt);
+    // NEVER App.ProcessMouseButtonDownEvent / UpEvent here (owner report 2026-11-24, agents seemed
+    // to click the real desktop): the engine route re-hit-tests every top-level window, calls
+    // PlatformApplication->SetCapture and, on an ACTIVE app, lets the reply lock/warp the OS
+    // cursor. Route along an explicit Slate path instead; no OS call, no window activation.
+    // A held pointer capture keeps its captor (an in-progress drag, a button's own up).
+    const TSharedPtr<FSlateUser> RouteUser = App.GetUser(User);
+    if (RouteUser.IsValid() && RouteUser->HasCapture(Evt.GetPointerIndex()))
+    {
+        const TArray<FWidgetPath> Captors = RouteUser->GetCaptorPaths();
+        if (Captors.Num() > 0 && Captors[0].IsValid())
+        {
+            const FReply Reply = bPressed ? App.RoutePointerDownEvent(Captors[0], Evt)
+                                          : App.RoutePointerUpEvent(Captors[0], Evt);
+            return Reply.IsEventHandled();
+        }
+    }
+    const FWidgetPath Path = App.LocateWindowUnderMouse(
+        ScreenPos, App.GetInteractiveTopLevelWindows(), /*bIgnoreEnabledStatus*/ false, User);
+    if (!Path.IsValid()) { return false; }
+    const FReply Reply = bPressed ? App.RoutePointerDownEvent(Path, Evt)
+                                  : App.RoutePointerUpEvent(Path, Evt);
+    if (bPressed) { UAPGrantCaptureWhileInactive(App, Reply, Path, Evt); }
+    return Reply.IsEventHandled();
 }
 
 FString FAgentInput::DescribeWidgetsAt(FVector2D ScreenPos, int32 UserIndex)

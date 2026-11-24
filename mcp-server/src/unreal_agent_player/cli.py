@@ -2271,6 +2271,19 @@ _MOUSE_BUTTONS = {"left": "Left", "right": "Right", "middle": "Middle",
                   "xbutton1": "XButton1", "xbutton2": "XButton2"}
 
 
+def _mouse_standalone_refusal(args, target: dict | None) -> str | None:
+    """`input mouse move|click` takes ABSOLUTE SCREEN pixels. Against a `-game` standalone client
+    (a foreground-capable window of its own) that is the one verb whose coordinates can mean the
+    human's desktop, so it is refused there. Use `uap click <label>` or `vrmenu.dev.press`."""
+    if not _standalone_instance_selected(args, target):
+        return None
+    return ("refusing `input mouse` against a -game standalone client: it sends ABSOLUTE SCREEN "
+            "coordinates through Slate and can reach the human's real desktop (owner rule "
+            "2026-11-11, report 2026-11-24). Nothing was sent. Press menu buttons in-engine: "
+            "`uap click <label> --instance pid:<n>` or `uap rc ExecuteConsoleCommand "
+            "Command=\"vrmenu.dev.press <label>\" --instance pid:<n>`.")
+
+
 def _input_mouse(args) -> int:
     """Position and click the mouse inside a viewport that holds mouse capture.
 
@@ -2292,6 +2305,13 @@ def _input_mouse(args) -> int:
     sub = args.mouse_cmd
     t0 = time.monotonic()
     body: dict = {"ok": True, "action": f"mouse {sub}"}
+    refusal = _mouse_standalone_refusal(args, _INSTANCE_TARGET[0])
+    if refusal:
+        # Zero side effects: nothing is sent. Owner report 2026-11-24 (agents seemed to click on
+        # the real desktop during a two-client run that used this verb on -game standalones).
+        body = {"ok": False, "action": f"mouse {sub}", "clicked": False, "error": refusal}
+        _emit(body)
+        return 1
     try:
         if sub == "move":
             body.update(_rc_json("SetMousePosition", {"X": args.x, "Y": args.y},
