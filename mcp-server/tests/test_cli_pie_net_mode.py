@@ -150,8 +150,9 @@ def test_client_count_bounds(monkeypatch, capsys, n):
 
 def test_plugin_header_declares_the_verbs():
     """The contract-skew check reads this header; the verbs the CLI calls must be in it."""
-    from unreal_agent_player import contract
     import pathlib
+
+    from unreal_agent_player import contract
     root = pathlib.Path(__file__).resolve().parents[2]
     text = (root / "Plugin/Source/UnrealAgentPlayer/Public/UAPAgentSubsystem.h").read_text()
     for verb in ("ConfigurePIENet", "RestorePIENet"):
