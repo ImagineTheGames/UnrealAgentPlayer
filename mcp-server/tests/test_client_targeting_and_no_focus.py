@@ -605,3 +605,29 @@ def test_plugin_runs_a_client_console_command_on_that_clients_local_player_and_h
     assert "LP->Exec(World" in cpp and "GetLocalPlayer()" in cpp
     assert 'TEXT("DEFER ")' in cpp and "FTSTicker" in cpp
     assert "DeferredCommands" not in cpp.replace("GEngine->DeferredCommands.Add", "")
+
+
+# --- `input mouse` (absolute screen coords) is refused against a -game standalone (2026-11-24) ---
+
+def test_input_mouse_refused_for_standalone_and_sends_nothing(monkeypatch, capsys):
+    sent = []
+    monkeypatch.setattr(cli, "_rc_json", lambda *a, **k: sent.append(a) or {"ok": True, "hit": "x"})
+    monkeypatch.setattr(cli, "_INSTANCE_TARGET", [{"role": "game"}])
+    args = cli.argparse.Namespace(mouse_cmd="click", x=100.0, y=200.0, button="left",
+                                  instance="pid:1234", project=None)
+    assert cli._input_mouse(args) == 1
+    out = json.loads(capsys.readouterr().out)
+    assert out["ok"] is False and out["clicked"] is False
+    assert "standalone" in out["error"] and "vrmenu.dev.press" in out["error"]
+    assert sent == []
+
+
+def test_input_mouse_not_refused_for_the_editor():
+    args = cli.argparse.Namespace(instance=None, project=None)
+    assert cli._mouse_standalone_refusal(args, None) is None
+
+
+def test_mouse_injection_never_uses_engine_button_route():
+    src = (REPO / "Plugin/Source/UnrealAgentPlayerRuntime/Private/AgentInput.cpp").read_text(encoding="utf-8")
+    code = "\n".join(l for l in src.splitlines() if not l.strip().startswith(("//", "*", "/*")))
+    assert "ProcessMouseButtonDownEvent" not in code and "ProcessMouseButtonUpEvent" not in code
