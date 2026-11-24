@@ -82,6 +82,9 @@ def all_headers() -> list[str]:
 # generic phrasing -- it never degrades to a false "up to date".
 PURPOSE = {
     "StartPIEMode": "`pie start --mode vr` (the HMD code path; flat PIE cannot show HMD-only bugs)",
+    "ConfigurePIENet": "`pie start --clients N --net-mode standalone|listen|client` (the PIE "
+                       "multiplayer layout; without it every multi-client test is a listen server)",
+    "RestorePIENet": "`pie stop` restoring the editor's multiplayer layout after `pie start --clients`",
     "StopPIEEx": "`pie stop` teardown confirmation (a stop that is not confirmed can be a no-op)",
     "IsPIEInProgress": "`pie stop` / lease-release confirmation that the editor is really free",
     "HoldKey": "`input hold` -- sustained in-engine input; a single injected event is not a hold",

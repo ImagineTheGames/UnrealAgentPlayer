@@ -12,6 +12,7 @@
 #include "HAL/FileManager.h"
 #include "Modules/ModuleManager.h"
 #include "LevelEditorSubsystem.h"
+#include "Settings/LevelEditorPlaySettings.h"
 #include "PlayInEditorDataTypes.h"
 #include "HAL/PlatformTime.h"
 #include "DynamicRHI.h"
@@ -267,6 +268,115 @@ FString UUAPAgentSubsystem::StartPIEMode(FString Mode)
 
 namespace
 {
+    FString UAPPIENetJson(const TSharedRef<FJsonObject>& O)
+    {
+        FString Out;
+        TSharedRef<TJsonWriter<>> W = TJsonWriterFactory<>::Create(&Out);
+        FJsonSerializer::Serialize(O, W);
+        return Out;
+    }
+
+    FString UAPPIENetName(int32 Mode)
+    {
+        switch (static_cast<EPlayNetMode>(Mode))
+        {
+        case PIE_Standalone: return TEXT("standalone");
+        case PIE_ListenServer: return TEXT("listen");
+        case PIE_Client: return TEXT("client");
+        default: return TEXT("unknown");
+        }
+    }
+
+    FString UAPPIENetError(const FString& Error)
+    {
+        TSharedRef<FJsonObject> O = MakeShared<FJsonObject>();
+        O->SetBoolField(TEXT("ok"), false);
+        O->SetStringField(TEXT("error"), Error);
+        return UAPPIENetJson(O);
+    }
+}
+
+FString UUAPAgentSubsystem::ConfigurePIENet(FString NetMode, int32 Clients, bool bRunUnderOneProcess)
+{
+    UAP_ACTIVITY(TEXT("pie net"), NetMode);
+    const FString Wanted = NetMode.ToLower();
+    EPlayNetMode Mode = PIE_Standalone;
+    if (Wanted == TEXT("standalone")) { Mode = PIE_Standalone; }
+    else if (Wanted == TEXT("listen")) { Mode = PIE_ListenServer; }
+    else if (Wanted == TEXT("client")) { Mode = PIE_Client; }
+    else { return UAPPIENetError(TEXT("net mode must be 'standalone', 'listen' or 'client'")); }
+    if (Clients < 1 || Clients > 16) { return UAPPIENetError(TEXT("clients must be 1..16")); }
+    if (!GEditor) { return UAPPIENetError(TEXT("no GEditor")); }
+    if (GEditor->IsPlaySessionInProgress())
+    {
+        return UAPPIENetError(TEXT("PIE is live or queued; the net layout is read at start. `uap pie stop` first"));
+    }
+    ULevelEditorPlaySettings* Settings = GetMutableDefault<ULevelEditorPlaySettings>();
+    if (!Settings) { return UAPPIENetError(TEXT("no ULevelEditorPlaySettings")); }
+
+    EPlayNetMode PrevMode = PIE_Standalone;
+    int32 PrevClients = 1;
+    bool bPrevOne = true;
+    Settings->GetPlayNetMode(PrevMode);
+    Settings->GetPlayNumberOfClients(PrevClients);
+    Settings->GetRunUnderOneProcess(bPrevOne);
+    if (!bHasSavedPIENet)
+    {
+        // Keep the ORIGINAL values across repeated Configure calls; a second call must not make
+        // the first call's layout the one Restore brings back.
+        bHasSavedPIENet = true;
+        SavedPIENetMode = static_cast<int32>(PrevMode);
+        SavedPIEClients = PrevClients;
+        bSavedPIEOneProcess = bPrevOne;
+    }
+    Settings->SetPlayNetMode(Mode);
+    Settings->SetPlayNumberOfClients(Clients);
+    Settings->SetRunUnderOneProcess(bRunUnderOneProcess);
+
+    TSharedRef<FJsonObject> O = MakeShared<FJsonObject>();
+    O->SetBoolField(TEXT("ok"), true);
+    O->SetStringField(TEXT("net_mode"), Wanted);
+    O->SetNumberField(TEXT("clients"), Clients);
+    O->SetBoolField(TEXT("one_process"), bRunUnderOneProcess);
+    TSharedRef<FJsonObject> Prev = MakeShared<FJsonObject>();
+    Prev->SetStringField(TEXT("net_mode"), UAPPIENetName(SavedPIENetMode));
+    Prev->SetNumberField(TEXT("clients"), SavedPIEClients);
+    Prev->SetBoolField(TEXT("one_process"), bSavedPIEOneProcess);
+    O->SetObjectField(TEXT("previous"), Prev);
+    return UAPPIENetJson(O);
+}
+
+FString UUAPAgentSubsystem::RestorePIENet()
+{
+    UAP_ACTIVITY(TEXT("pie net restore"), TEXT(""));
+    return UAPPIENetJson(RestorePIENetObject());
+}
+
+TSharedRef<FJsonObject> UUAPAgentSubsystem::RestorePIENetObject()
+{
+    TSharedRef<FJsonObject> O = MakeShared<FJsonObject>();
+    O->SetBoolField(TEXT("ok"), true);
+    if (!bHasSavedPIENet)
+    {
+        O->SetBoolField(TEXT("restored"), false);
+        return O;
+    }
+    if (ULevelEditorPlaySettings* Settings = GetMutableDefault<ULevelEditorPlaySettings>())
+    {
+        Settings->SetPlayNetMode(static_cast<EPlayNetMode>(SavedPIENetMode));
+        Settings->SetPlayNumberOfClients(SavedPIEClients);
+        Settings->SetRunUnderOneProcess(bSavedPIEOneProcess);
+    }
+    bHasSavedPIENet = false;
+    O->SetBoolField(TEXT("restored"), true);
+    O->SetStringField(TEXT("net_mode"), UAPPIENetName(SavedPIENetMode));
+    O->SetNumberField(TEXT("clients"), SavedPIEClients);
+    O->SetBoolField(TEXT("one_process"), bSavedPIEOneProcess);
+    return O;
+}
+
+namespace
+{
     // The actual stop, shared by StopPIE (legacy bool) and StopPIEEx (JSON envelope).
     //
     // A PIE START IS QUEUED, NOT IMMEDIATE. RequestPlaySession only sets GEditor's
@@ -347,6 +457,12 @@ FString UUAPAgentSubsystem::StopPIEEx()
     O->SetBoolField(TEXT("cancelled_queued_start"), bCancelled);
     O->SetBoolField(TEXT("in_progress"), bInProgress);
     if (!Error.IsEmpty()) { O->SetStringField(TEXT("error"), Error); }
+    if (bOk && bHasSavedPIENet)
+    {
+        // `pie start --clients` changed the editor's multiplayer layout; put it back with the stop
+        // (the layout is only read at start, so restoring while teardown runs is safe).
+        O->SetObjectField(TEXT("net_restored"), RestorePIENetObject());
+    }
     FString Out;
     TSharedRef<TJsonWriter<>> W = TJsonWriterFactory<>::Create(&Out);
     FJsonSerializer::Serialize(O, W);

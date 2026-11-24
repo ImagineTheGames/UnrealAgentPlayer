@@ -1269,6 +1269,73 @@ def _exec_file(args) -> int:
                                     allow_pie_writes=getattr(args, "allow_pie_writes", False)))
 
 
+def _pie_net_wanted(args) -> tuple[str, int, bool] | None:
+    """(net_mode, clients, one_process) when the caller asked for a multi-client layout, else None.
+
+    `--clients N` alone means a listen server + N-1 clients (the editor's own multi-client default);
+    `--net-mode` alone means 2 clients. `--net-mode standalone` is the one that matters for
+    Photon / EOS: each client is its OWN standalone game, so each signs in separately, whereas a
+    listen-server client is a net client that never runs the login flow.
+    """
+    clients = getattr(args, "clients", None)
+    net_mode = getattr(args, "net_mode", None)
+    if clients is None and net_mode is None:
+        return None
+    if clients is not None and not 1 <= clients <= 16:
+        raise AgentError(ErrorCode.SCHEMA_VALIDATION, "--clients must be 1..16", recoverable=False)
+    if (getattr(args, "mode", "flat") or "flat") == "vr":
+        raise AgentError(ErrorCode.SCHEMA_VALIDATION,
+                         "--clients / --net-mode need flat PIE; VR Preview drives one HMD",
+                         recoverable=False)
+    return (net_mode or "listen", clients if clients is not None else 2,
+            not getattr(args, "separate_processes", False))
+
+
+def _devauth_credentials(net_mode: str, clients: int) -> list[str]:
+    """The DevAuthTool credential NAMES Redpoint EOS will look up for each PIE client.
+
+    Redpoint's FTryPIEDeveloperAuthenticationEASCredentialsNode asks the DevAuthTool for
+    `Context_<PIEInstance + 1>` (a dedicated server hosted in the editor shifts the numbering so
+    the first client is still Context_1). A client with no such credential falls back to
+    DevAuthToolDefaultCredentialName, so every client signs in as the SAME account and the second
+    is rejected. Create one credential per name in the DevAuthTool (port 6300), logged in to a
+    DIFFERENT account each. No setting makes this automatic.
+    """
+    return [f"Context_{i + 1}" for i in range(clients)]
+
+
+def _pie_configure_net(wanted: tuple[str, int, bool], project: str | None) -> dict:
+    net_mode, clients, one_process = wanted
+    try:
+        raw = _rc_call("ConfigurePIENet", {"NetMode": net_mode, "Clients": clients,
+                                           "bRunUnderOneProcess": one_process}, project)
+    except AgentError as exc:
+        if _is_missing_verb(exc):
+            raise _skew_error("ConfigurePIENet", project,
+                              "`pie start --clients/--net-mode` sets the multiplayer layout; "
+                              "without it the session would start with whatever layout the "
+                              "editor last had") from None
+        raise
+    res = json.loads(raw) if isinstance(raw, str) else (raw or {})
+    if not res.get("ok", False):
+        raise AgentError(ErrorCode.SCHEMA_VALIDATION,
+                         res.get("error", "ConfigurePIENet failed"), recoverable=False)
+    return res
+
+
+def _pie_restore_net(project: str | None) -> dict | None:
+    """Put back the layout `pie start --clients` replaced. None when the plugin predates the verb
+    (then nothing was ever changed). Never raises: a stop must not fail on its own cleanup."""
+    try:
+        raw = _rc_call("RestorePIENet", {}, project)
+    except AgentError:
+        return None
+    try:
+        return json.loads(raw) if isinstance(raw, str) else (raw or {})
+    except json.JSONDecodeError:
+        return None
+
+
 def _pie_start(mode: str, project: str | None) -> dict:
     """Start PIE in `mode`, tolerating a plugin copy that predates StartPIEMode -- for FLAT
     only.
@@ -1423,6 +1490,8 @@ def _pie_stop(project: str | None, timeout: float) -> dict:
                  "confirmed_with": "IsInPIE" if degraded else "IsPIEInProgress"}
     if res.get("via"):
         out["via"] = res["via"]
+    if res.get("net_restored"):
+        out["net_restored"] = res["net_restored"]   # `pie start --clients` layout put back
     if degraded:
         out["degraded"] = True
         out["note"] = _DEGRADED_NOTE
@@ -1540,7 +1609,13 @@ def _pie(args) -> int:
     try:
         if sub == "start":
             requested_at = _coord._now()
+            net = _pie_net_wanted(args)
+            if net:
+                body["net"] = _pie_configure_net(net, args.project)
+                body["devauth_credentials"] = _devauth_credentials(net[0], net[1])
             body.update(_pie_start(getattr(args, "mode", "flat") or "flat", args.project))
+            if net and not body.get("ok"):
+                _pie_restore_net(args.project)   # the start never happened; undo the layout
             if body.get("ok"):
                 # Recorded BEFORE the wait: a start that times out is still queued, and still ours.
                 _note_pie_started(args.project, getattr(args, "agent", None), requested_at, None,
@@ -3525,6 +3600,8 @@ REPORT (a verification is NOT done until `report finish` emits the HTML report; 
      either way.
 
 PLAY-IN-EDITOR
+  uap pie start --clients 2 --net-mode standalone   N clients, each its OWN standalone game (separate
+                                  Photon/EOS sign-in); `pie stop` restores the editor layout. See docs/capabilities.md
   uap pie start                   start PIE and BLOCK until the play world is live (default; a
                                   normal start is 1-5s). Answers playing:true + waited_seconds,
                                   the same shape `pie stop` answers with. On timeout (60s,
@@ -4431,6 +4508,17 @@ def build_parser() -> argparse.ArgumentParser:
                     help="'vr' uses the editor's VR Preview -- the HMD code path (OpenXR input, "
                          "IsHeadMountedDisplayEnabled branches) that flat PIE never takes. "
                          "Needs a connected headset; fails with a reason if there is none.")
+    ps.add_argument("--clients", type=int, default=None, metavar="N",
+                    help="PlayNumberOfClients (1..16). Alone: listen server + N-1 clients. The "
+                         "previous editor layout is restored by `uap pie stop`.")
+    ps.add_argument("--net-mode", choices=["standalone", "listen", "client"], default=None,
+                    help="PlayNetMode. 'standalone' = every client is its own standalone game, so "
+                         "each signs in to Photon/EOS separately (a listen-server client never "
+                         "runs the login flow). Create one DevAuthTool credential per client, "
+                         "named Context_1..Context_N. Default clients with this flag: 2.")
+    ps.add_argument("--separate-processes", action="store_true",
+                    help="clear 'Run Under One Process' (each client a separate OS process). "
+                         "Default is one process, which uap input/--client can drive.")
     ps.add_argument("--no-wait", action="store_true",
                     help="return as soon as the session is QUEUED instead of waiting for the "
                          "play world. Fire-and-forget: the world does not exist when it returns, "
