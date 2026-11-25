@@ -68,6 +68,8 @@ private:
     FString ReqPackage;
     FString ReqFilename;
     bool bReqDiscard = false;
+    // True once the details panels were emptied and one settle tick has passed (see TickOpen).
+    bool bDetailsQuiesced = false;
     FString MapBefore;
     FString ResultJson;      // the last finished request, as the status payload
     FString ClearedGlobals;  // the sweep payload of the pending/last request
