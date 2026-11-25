@@ -599,7 +599,7 @@ _INSTANCE_TARGET: list = [None]
 _RUNTIME_PRESET = "UAP_RuntimePreset"
 _UAPRCPORT_RE = re.compile(r"-UAPRCPort=(\d+)", re.IGNORECASE)
 # The verbs the runtime subsystem serves, i.e. the ones a standalone client can be driven with.
-_INSTANCE_RC_CMDS = frozenset({"input", "xr", "pawn", "click", "tab", "nav", "read-ui", "rc", "sample", "log", "screenshot"})
+_INSTANCE_RC_CMDS = frozenset({"input", "xr", "pawn", "actor", "click", "tab", "nav", "read-ui", "rc", "sample", "log", "screenshot"})
 
 
 def _resolve_instance_target(instance: str | None, project: str | None) -> dict | None:
@@ -2130,6 +2130,42 @@ def _pawn(args) -> int:
         body = _err(exc)
     _capture(f"pawn:{sub}", {k: v for k, v in vars(args).items()
                              if k in ("x", "y", "z", "yaw", "player", "actor", "dist", "bearing")},
+             body, int((time.monotonic() - t0) * 1000))
+    _emit(body)
+    return 0 if body.get("ok") else 1
+
+
+def _actor(args) -> int:
+    """`uap actor teleport <name|label|class> [--x --y --z] [--yaw D] [--world server|client] [--all]`.
+
+    Moves ANY actor of the PIE world (default: the server world) IN-ENGINE with K2_TeleportTo, then
+    stops its pawn/controller movement and AI path. The PIE-safe replacement for `set_actor_location`
+    in `uap exec`, which the PIE-write guard refuses. No property write; PIE world only; logged."""
+    from unreal_agent_player import actor_move as _am
+    t0 = time.monotonic()
+    body: dict = {"ok": True, "action": "actor teleport", "actor": args.actor}
+    try:
+        if args.x is None and args.y is None and args.z is None and args.yaw is None:
+            raise AgentError(ErrorCode.SCHEMA_VALIDATION,
+                             "actor teleport wants at least one of --x --y --z --yaw", recoverable=False)
+        world = args.world
+        if world == "server":
+            _CLIENT[0] = "0"
+        elif world == "client" and not _CLIENT[0]:
+            _CLIENT[0] = "1"
+        body["world"] = world
+        res = _exec_probe(_am.teleport_code(args.actor, args.x, args.y, args.z, args.yaw, args.all), args)
+        body.update(res)
+        if str(res.get("error", "")).startswith("the editor-side probe printed nothing"):
+            body["error"] = ("no PIE world to move an actor in (start PIE first: `uap pie start`); probe said: "
+                             + str(res["error"])[:200])
+        if not res.get("ok"):
+            body["ok"] = False
+            body.setdefault("error", "actor teleport failed")
+    except (AgentError, json.JSONDecodeError) as exc:
+        body = _err(exc)
+    _capture("actor:teleport", {k: v for k, v in vars(args).items()
+                                if k in ("actor", "x", "y", "z", "yaw", "world", "all")},
              body, int((time.monotonic() - t0) * 1000))
     _emit(body)
     return 0 if body.get("ok") else 1
@@ -3733,6 +3769,8 @@ PIE WRITES FROM EXEC (refused -- CRASH-0BD72FF1, 2026-11-23)
   Rare, understood case only: --allow-pie-writes (prints a loud warning to stderr).
   Move the PIE pawn with `uap pawn teleport <x> <y> <z> [--yaw D] [--player N]` or
   `uap pawn place <actor> --dist CM [--bearing D]` (in-engine K2_TeleportTo, PIE world only, logged).
+  Move ANY PIE actor (e.g. a janitor between floors): `uap actor teleport <name|label|class> --x --y --z
+  [--yaw D] [--world server|client] [--all]` (in-engine, stops the actor's movement + AI path, logged).
   Allowlist: `exec-file` of Scripts/GripView/gv_rig.py (Grip View's rig) may write; more scripts via
   $UAP_PIE_WRITE_ALLOW (path suffixes). attach_* / rerun_construction_scripts stay refused there.
 
@@ -4099,7 +4137,7 @@ def _help(args) -> int:
 # Editor-touching verbs auto-wait while another agent is rebuilding this editor (see main()).
 _REBUILD_GUARDED = {"status", "rc", "exec", "exec-file", "pie", "level",
                     "read-ui", "click", "tab", "nav", "screenshot", "viewport",
-                    "input", "xr", "pawn", "sample", "log", "helpers"}
+                    "input", "xr", "pawn", "actor", "sample", "log", "helpers"}
 
 # ...and additionally wait out ANY other agent's exclusive lease (pie / level / rebuild).
 # `status` is deliberately exempt: it is the health probe you reach for WHILE diagnosing a
@@ -4118,7 +4156,7 @@ _LEASE_GUARDED = _REBUILD_GUARDED - {"status"}
 # behaviour change than the clash being fixed. They remain governed by the per-project lease --
 # except for the `rc` functions and `exec` Python that ARE one of these verbs by another name
 # (start / stop PIE, inject input); see `_machine_guard`.
-_MACHINE_GUARDED = {"pie", "input", "xr", "pawn", "screenshot", "click", "tab", "nav", "read-ui"}
+_MACHINE_GUARDED = {"pie", "input", "xr", "pawn", "actor", "screenshot", "click", "tab", "nav", "read-ui"}
 
 # `uap rc <func>` reaches the same plugin verbs the guarded verbs use, so the functions that start
 # PIE, stop it, or inject input / need the foreground are gated exactly like `pie start`,
@@ -4761,6 +4799,24 @@ def build_parser() -> argparse.ArgumentParser:
                     help="world direction FROM the actor TO the pawn, degrees (0 = +X, 90 = +Y; default 180)")
     pp.add_argument("--player", type=int, default=0, help="player controller index (default 0)")
     pp.set_defaults(func=_pawn)
+
+    # Any-actor teleport: the PIE-safe way to move a janitor / prop / AI between floors.
+    ac = sub.add_parser("actor", help="move ANY PIE actor in-engine (teleport)")
+    acs = ac.add_subparsers(dest="actor_cmd", required=True)
+    at = acs.add_parser("teleport", parents=[proj],
+                        help="teleport an actor (name, label or class) of the PIE world to --x/--y/--z "
+                             "(omitted axes keep their value); stops its movement + AI path. "
+                             "No property write (safe vs the exec PIE-write guard)")
+    at.add_argument("actor", help="actor name, label or class (e.g. BP_Janitor_C); must match one actor unless --all")
+    at.add_argument("--x", type=float, default=None, help="world X, cm")
+    at.add_argument("--y", type=float, default=None, help="world Y, cm")
+    at.add_argument("--z", type=float, default=None, help="world Z, cm")
+    at.add_argument("--yaw", type=float, default=None, help="world yaw in degrees")
+    at.add_argument("--world", choices=("server", "client"), default="server",
+                    help="server = the listen-server world (PIE client 0, default); client = --client N's "
+                         "world (default 1)")
+    at.add_argument("--all", action="store_true", default=False, help="move every actor that matches")
+    at.set_defaults(func=_actor)
 
     # Mouse position inside a CAPTURED viewport. Not a hold -- a position, which is a different
     # problem: while PIE holds the mouse the pointer cannot be moved at all (Win32 SetCursorPos
