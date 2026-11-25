@@ -22,6 +22,8 @@
 #include "Serialization/JsonSerializer.h"
 #include "Serialization/JsonWriter.h"
 #include "Modules/ModuleManager.h"
+#include "PropertyEditorModule.h"
+#include "Selection.h"
 
 namespace
 {
@@ -30,6 +32,8 @@ namespace
     // queued it (Python remote-exec included), never nested inside it.
     constexpr float GLevelOpenDelaySeconds = 0.25f;
     constexpr int32 GMaxDirtyNames = 8;
+    // Settle pause between emptying the details panels and the load (>= 2 editor ticks).
+    constexpr float GLevelOpenSettleSeconds = 0.3f;
 
     FString UAPLevelToJson(const TSharedRef<FJsonObject>& Obj)
     {
@@ -308,6 +312,7 @@ FString UUAPAgentLevelSubsystem::OpenLevel(FString Map, bool bDiscard)
     MapBefore = CurrentMapPackage();
     ResultJson.Empty();
     ClearedGlobals.Empty();
+    bDetailsQuiesced = false;
 
     if (TickHandle.IsValid()) { FTSTicker::GetCoreTicker().RemoveTicker(TickHandle); }
     TickHandle = FTSTicker::GetCoreTicker().AddTicker(
@@ -345,6 +350,29 @@ bool UUAPAgentLevelSubsystem::TickOpen(float /*DeltaTime*/)
     {
         FinishOpen(false, FString::Printf(TEXT("the open map became dirty before the load ran (%s); level not changed"),
             *FString::Join(DirtyNames, TEXT(", "))), CurrentMapPackage(), 0.0);
+        return false;
+    }
+
+    // CRASH-CF399BD9: LoadMap with an actor of the outgoing world shown in a details panel left a
+    // stale FDetailLayoutBuilderImpl queued for deletion; SDetailsViewBase::HandlePendingCleanup
+    // then destroyed it on the next tick with a dangling FPropertyHandleVector (access violation).
+    // So first drop the selection and empty every property view, then wait one settle pass so the
+    // layouts are torn down (and their pending-delete lists flushed) in a quiet frame, and only
+    // THEN load the map.
+    if (!bDetailsQuiesced)
+    {
+        bDetailsQuiesced = true;
+        if (GEditor)
+        {
+            GEditor->SelectNone(/*bNoteSelectionChange=*/true, /*bDeselectBSPSurfs=*/true, /*WarnAboutManyActors=*/false);
+            GEditor->NoteSelectionChange();
+        }
+        if (FPropertyEditorModule* PropModule = FModuleManager::GetModulePtr<FPropertyEditorModule>("PropertyEditor"))
+        {
+            PropModule->UpdatePropertyViews(TArray<UObject*>());
+        }
+        TickHandle = FTSTicker::GetCoreTicker().AddTicker(
+            FTickerDelegate::CreateUObject(this, &UUAPAgentLevelSubsystem::TickOpen), GLevelOpenSettleSeconds);
         return false;
     }
 
