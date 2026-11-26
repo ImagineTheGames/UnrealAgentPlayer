@@ -9,8 +9,12 @@
 #include "AgentMotionController.h"
 #include "AgentUIReader.h"
 #include "AgentWorld.h"
+#include "UAPReachProbe.h"
 #include "Engine/Engine.h"
 #include "Engine/World.h"
+#include "Engine/GameViewportClient.h"
+#include "Containers/Ticker.h"
+#include "Widgets/SWindow.h"
 #include "HAL/IConsoleManager.h"
 #include "JsonObjectConverter.h"
 #include "Dom/JsonObject.h"
@@ -121,6 +125,60 @@ bool UUAPAgentRuntimeSubsystem::InjectKey(FString KeyName, bool bPressed, bool b
         return false;
     }
     return FAgentInput::OnClients(TEXT("InjectKey"), Client, [&]() { return FAgentInput::InjectKey(Key, bPressed, bRepeat); });
+}
+
+FString UUAPAgentRuntimeSubsystem::CloseGameWindow()
+{
+    UAP_ACTIVITY(TEXT("game close"), FString());
+    auto Reply = [](bool bOk, const FString& Msg, const FString& Title)
+    {
+        TSharedRef<FJsonObject> O = MakeShared<FJsonObject>();
+        O->SetBoolField(TEXT("ok"), bOk);
+        if (bOk)
+        {
+            O->SetBoolField(TEXT("scheduled"), true);
+            O->SetStringField(TEXT("window_title"), Title);
+        }
+        else
+        {
+            O->SetStringField(TEXT("error"), Msg);
+        }
+        FString Out;
+        TSharedRef<TJsonWriter<>> W = TJsonWriterFactory<>::Create(&Out);
+        FJsonSerializer::Serialize(O, W);
+        return Out;
+    };
+
+    if (GIsEditor)
+    {
+        return Reply(false, TEXT("this process is the editor (or has an editor attached): `game close` only closes a standalone -game client. Use `uap pie stop` for PIE."), FString());
+    }
+    UGameViewportClient* GV = FAgentWorld::GetActiveGameViewport();
+    TSharedPtr<SWindow> Window = GV ? GV->GetWindow() : nullptr;
+    if (!Window.IsValid())
+    {
+        return Reply(false, TEXT("no game viewport window to close (client not past engine init, or already closing)"), FString());
+    }
+    const FString Title = Window->GetTitle().ToString();
+    // Next tick, on the game thread: the same RequestDestroyWindow a player's X reaches. Doing it
+    // inside this RemoteControl call would tear the process down before the reply is written.
+    TWeakPtr<SWindow> WeakWindow = Window;
+    FTSTicker::GetCoreTicker().AddTicker(FTickerDelegate::CreateLambda([WeakWindow](float)
+    {
+        if (TSharedPtr<SWindow> W = WeakWindow.Pin())
+        {
+            UE_LOG(LogUAPRuntime, Log, TEXT("game close: SWindow::RequestDestroyWindow on '%s'"), *W->GetTitle().ToString());
+            W->RequestDestroyWindow();
+        }
+        return false;
+    }), 0.1f);
+    return Reply(true, FString(), Title);
+}
+
+FString UUAPAgentRuntimeSubsystem::ReachProbe(FString Hand, FString Target, FString OffsetCsv)
+{
+    UAP_ACTIVITY(TEXT("xr reach probe"), Target);
+    return UAPReachProbeJson(FAgentWorld::GetActiveGameWorld(), Hand, Target, OffsetCsv);
 }
 
 FString UUAPAgentRuntimeSubsystem::ListClients()

@@ -28,6 +28,15 @@ public:
     // value arrives zero-initialised, and "" is the only value that survives that as "default".
     // In-engine only - it never raises, focuses or sends OS input to a window. [17tm466z4a6]
     // ListClients JSON: {"ok":true,"clients":[{client, world, net_mode, default, accepts_input, window_title, pawn}]}
+    // Close a standalone `-game` client's top-level window IN-ENGINE, the path a player's X takes:
+    // SWindow::RequestDestroyWindow on the game viewport's window, run from a game-thread ticker on
+    // the NEXT tick (so the RemoteControl reply is sent before the process starts to exit).
+    // JSON {"ok","window_title","scheduled"}. Refuses inside the editor (`uap pie stop` ends PIE;
+    // closing the editor's own window is not a test verb). No OS input, no WM_CLOSE, no focus.
+    UFUNCTION(BlueprintCallable, Category="Agent|Status") FString CloseGameWindow();
+    // Runtime twin of the editor-Python reach probe (`uap xr reach`): item point, hand grab sphere and the
+    // tracking-space delta, read from this process's game world so a -game client can answer. JSON, see UAPReachProbe.h.
+    UFUNCTION(BlueprintCallable, Category="Agent|XR") FString ReachProbe(FString Hand, FString Target, FString OffsetCsv);
     UFUNCTION(BlueprintCallable, Category="Agent|Input") FString ListClients();
     UFUNCTION(BlueprintCallable, Category="Agent|Input") bool InjectKey(FString KeyName, bool bPressed, bool bRepeat, FString Client);
     UFUNCTION(BlueprintCallable, Category="Agent|Input") bool InjectMouseMove(float X, float Y, bool bAbsolute, FString Client);
