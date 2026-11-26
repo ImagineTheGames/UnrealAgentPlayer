@@ -9,6 +9,7 @@
 #include "AgentMotionController.h"
 #include "AgentUIReader.h"
 #include "AgentWorld.h"
+#include "UAPReachProbe.h"
 #include "Engine/Engine.h"
 #include "Engine/World.h"
 #include "Engine/GameViewportClient.h"
@@ -172,6 +173,12 @@ FString UUAPAgentRuntimeSubsystem::CloseGameWindow()
         return false;
     }), 0.1f);
     return Reply(true, FString(), Title);
+}
+
+FString UUAPAgentRuntimeSubsystem::ReachProbe(FString Hand, FString Target, FString OffsetCsv)
+{
+    UAP_ACTIVITY(TEXT("xr reach probe"), Target);
+    return UAPReachProbeJson(FAgentWorld::GetActiveGameWorld(), Hand, Target, OffsetCsv);
 }
 
 FString UUAPAgentRuntimeSubsystem::ListClients()

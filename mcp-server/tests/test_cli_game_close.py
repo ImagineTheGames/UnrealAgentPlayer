@@ -49,10 +49,44 @@ def test_close_relays_plugin_refusal(monkeypatch, capsys):
     assert rc == 1 and _out(capsys)["error"] == "editor"
 
 
-def test_reach_on_game_client_explains_instead_of_no_pawn(monkeypatch, capsys):
+def test_reach_on_game_client_uses_runtime_probe(monkeypatch, capsys):
     monkeypatch.setattr(cli, "_resolve_instance_target",
                         lambda i, p: {"port": 1, "preset": "x", "pid": 1, "role": "game"})
     monkeypatch.setattr(cli, "_exec_probe", lambda *a, **k: pytest.fail("no editor python in -game"))
-    rc = cli.main(["xr", "reach", "right", "Ball", "--instance", "pid:1"])
+    monkeypatch.setattr(cli, "_REACH_SETTLE_S", 0)
+    state = {"grab": [10.0, 0.0, 0.0]}
+    calls = []
+
+    def probe(func, params, project=None, *, needs=None):
+        calls.append((func, params))
+        return {"ok": True, "actor": "Ball", "target_how": "actor location", "target": [0.0, 0.0, 0.0],
+                "grab": list(state["grab"]), "grab_component": "GrabSphere", "grab_radius": 5.0,
+                "controller": "GripR", "delta_tracking": [-10.0, 0.0, 0.0],
+                "ctrl_rel_loc": [1.0, 2.0, 3.0], "ctrl_rel_rot": [0.0, 0.0, 0.0]}
+
+    def rc(func, params, project=None):
+        assert func == "InjectXRControllerPose"
+        state["grab"] = [0.0, 0.0, 0.0]
+        return True
+
+    monkeypatch.setattr(cli, "_rc_json", probe)
+    monkeypatch.setattr(cli, "_rc_call", rc)
+    rc_code = cli.main(["xr", "reach", "right", "Ball", "--instance", "pid:1"])
     out = _out(capsys)
-    assert rc == 1 and "no editor world" in out["error"]
+    assert rc_code == 0 and out["reached"] and out["actor"] == "Ball"
+    assert calls[0] == ("ReachProbe", {"Hand": "right", "Target": "Ball", "OffsetCsv": ""})
+
+
+def test_reach_game_probe_passes_offset(monkeypatch, capsys):
+    monkeypatch.setattr(cli, "_resolve_instance_target",
+                        lambda i, p: {"port": 1, "preset": "x", "pid": 1, "role": "game"})
+    seen = {}
+
+    def probe(func, params, project=None, *, needs=None):
+        seen.update(params)
+        return {"ok": False, "error": "stop"}
+
+    monkeypatch.setattr(cli, "_rc_json", probe)
+    cli.main(["xr", "reach", "left", "Ball.Mesh", "--offset", "1,2,3", "--instance", "pid:1"])
+    assert seen["OffsetCsv"] == "1.0,2.0,3.0" and seen["Hand"] == "left"
+    assert _out(capsys)["error"] == "stop"

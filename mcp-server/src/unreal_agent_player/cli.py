@@ -2214,6 +2214,17 @@ def _exec_probe(code: str, args) -> dict:
     return _xrr.parse_probe(lines)
 
 
+def _reach_probe(args, offset, is_game: bool) -> dict:
+    """The reach geometry. A -game client has no editor world for the Python probe, so it is asked
+    through the runtime plugin's C++ ReachProbe (same JSON); the editor still uses xr_reach.py."""
+    from unreal_agent_player import xr_reach as _xrr
+    if is_game:
+        csv = "" if offset is None else ",".join(repr(float(v)) for v in offset)
+        return _rc_json("ReachProbe", {"Hand": args.hand, "Target": args.target, "OffsetCsv": csv},
+                        args.project, needs="runtime reach probe for a -game client")
+    return _exec_probe(_xrr.reach_code(args.hand, args.target, offset), args)
+
+
 _REACH_SETTLE_S = 0.4
 
 
@@ -2245,15 +2256,8 @@ def _xr_reach(args) -> int:
         hand = _XR_HANDS[args.hand]
         offset = _reach_offset(args)
         tgt = _INSTANCE_TARGET[0]
-        if tgt and tgt.get("role") == "game":
-            raise AgentError(
-                ErrorCode.SCHEMA_VALIDATION,
-                "xr reach reads the pawn/item geometry with editor Python in a PIE world; a -game "
-                "client has no editor world (UAP_WORLD is None, so the probe saw 'no controlled "
-                "pawn') and editor-only Python can kill it (known-issues #31). Pose it by "
-                "coordinates with `uap xr pose --instance ...`. A runtime (C++) reach probe is "
-                "the open work [17tm46799m0].", recoverable=False)
-        probe = _exec_probe(_xrr.reach_code(args.hand, args.target, offset), args)
+        is_game = bool(tgt and tgt.get("role") == "game")
+        probe = _reach_probe(args, offset, is_game)
         if not probe.get("ok"):
             body.update({"ok": False, "error": probe.get("error", "probe failed")})
         else:
@@ -2279,7 +2283,7 @@ def _xr_reach(args) -> int:
                     break
                 tried += 1
                 time.sleep(_REACH_SETTLE_S)
-                probe = _exec_probe(_xrr.reach_code(args.hand, args.target, offset), args)
+                probe = _reach_probe(args, offset, is_game)
                 if not probe.get("ok"):
                     body.update({"ok": False, "error": probe.get("error", "probe failed")})
                     break
