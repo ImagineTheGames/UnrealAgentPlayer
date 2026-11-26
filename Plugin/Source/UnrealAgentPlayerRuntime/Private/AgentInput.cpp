@@ -1438,8 +1438,21 @@ int32 FAgentInput::ReleaseHeld(FKey Key)
     {
         if (Key.IsValid() && GHeldInputs[i].Key != Key) { continue; }
         if (Only && GHeldInputs[i].World.Get() != Only) { continue; }
-        UAPReleaseOne(GHeldInputs[i]);
-        GHeldInputs.RemoveAt(i);
+        if (GHeldInputs[i].bAnalog)
+        {
+            // Do NOT inject the 0 here. If the hold ticker already injected Value this frame,
+            // InputAxis ACCUMULATES: Value + 0 = Value, the entry is gone, nothing injects
+            // again and the axis stays latched at Value [17tm4679bq9]. Expire the entry instead:
+            // the ticker (the only axis injection path) sends exactly 0 next frame, then stops.
+            GHeldInputs[i].Value = 0.f;
+            GHeldInputs[i].EndRealTime = 0.0;
+            UAPEnsureHoldTicker();
+        }
+        else
+        {
+            UAPReleaseOne(GHeldInputs[i]);
+            GHeldInputs.RemoveAt(i);
+        }
         ++Count;
     }
     return Count;
