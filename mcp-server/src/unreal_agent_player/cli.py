@@ -2249,7 +2249,6 @@ def _xr_reach(args) -> int:
     Closed loop: probe (item grip/socket point or bounds centre, the grab sphere, the tracking
     transform), pose the controller, wait a frame or two, read the sphere back, move the pose by
     the remaining error. A following `uap xr grip` then grabs it. Returns distance hand->target."""
-    from unreal_agent_player import xr_reach as _xrr
     t0 = time.monotonic()
     body: dict = {"ok": True, "action": "xr reach", "hand": args.hand, "target": args.target}
     try:
