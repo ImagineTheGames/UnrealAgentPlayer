@@ -1340,13 +1340,21 @@ bool FAgentInput::HoldAxis(FKey Key, float Value, float Seconds, int32 SlateUser
     H.EndRealTime = FPlatformTime::Seconds() + Seconds;
     UAPEnsureHoldTicker();
 
-    const bool bInjected = (SlateUserIndex != INDEX_NONE)
-        ? InjectAxisSlate(Key, Value, SlateUserIndex)
-        : InjectAxisKey(Key, Value);
-    if (!bInjected)
+    // NO immediate inject here. InputAxis ACCUMULATES within a frame (FKeyState raw value adds
+    // each Delta until the PlayerController consumes it), and the hold ticker injects the same
+    // value every frame. Injecting here too delivered 2x on the first frame (0.58 -> 1.16, and
+    // a grip axis read as a press) [17tm4679azq]. The ticker runs once per frame before the
+    // world tick, so the first frame still carries exactly Value. Validate the route now so a
+    // bad Slate user is still refused up front.
+    if (SlateUserIndex != INDEX_NONE)
     {
-        ReleaseHeld(Key);
-        return false;
+        FString UserError;
+        if (ResolveSlateUserIndex(SlateUserIndex, UserError) == INDEX_NONE)
+        {
+            UE_LOG(LogUAPRuntime, Error, TEXT("HoldAxis (%s): %s"), *Key.ToString(), *UserError);
+            ReleaseHeld(Key);
+            return false;
+        }
     }
     return true;
 }
