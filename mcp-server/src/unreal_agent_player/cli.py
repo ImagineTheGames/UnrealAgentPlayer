@@ -599,7 +599,8 @@ _INSTANCE_TARGET: list = [None]
 _RUNTIME_PRESET = "UAP_RuntimePreset"
 _UAPRCPORT_RE = re.compile(r"-UAPRCPort=(\d+)", re.IGNORECASE)
 # The verbs the runtime subsystem serves, i.e. the ones a standalone client can be driven with.
-_INSTANCE_RC_CMDS = frozenset({"input", "xr", "pawn", "actor", "click", "tab", "nav", "read-ui", "rc", "sample", "log", "screenshot"})
+_INSTANCE_RC_CMDS = frozenset({"input", "xr", "pawn", "actor", "click", "tab", "nav", "read-ui", "rc", "sample", "log", "screenshot",
+                                "game"})
 
 
 def _resolve_instance_target(instance: str | None, project: str | None) -> dict | None:
@@ -2102,6 +2103,32 @@ def _xr(args) -> int:
     return 0 if body.get("ok") else 1
 
 
+def _game(args) -> int:
+    """`uap game close --instance <pid:N|name>`: close a standalone -game client's window IN-ENGINE.
+
+    The runtime plugin calls SWindow::RequestDestroyWindow on the game viewport's window (the path
+    a player's X takes) on the next game-thread tick. No OS input, no WM_CLOSE from outside, no
+    window activation. Refuses the editor (the plugin refuses it too). After it answers ok the
+    process exits on its own; poll the pid to confirm."""
+    t0 = time.monotonic()
+    body: dict = {"ok": True, "action": "game close"}
+    try:
+        sel = (getattr(args, "instance", None) or "").strip()
+        if sel.lower() in ("", "editor"):
+            body = {"ok": False, "action": "game close",
+                    "error": "game close needs --instance <pid:N|name> naming a standalone -game client "
+                             "(`uap instances` lists them); it never closes the editor"}
+        else:
+            body.update(_rc_json("CloseGameWindow", {}, args.project,
+                                 needs="in-engine window close for a -game client"))
+    except AgentError as exc:
+        body = _err(exc)
+    _capture("game:close", {"instance": getattr(args, "instance", None)}, body,
+             int((time.monotonic() - t0) * 1000))
+    _emit(body)
+    return 0 if body.get("ok") else 1
+
+
 def _pawn(args) -> int:
     """`uap pawn teleport <x> <y> <z> [--yaw D] [--player N]` / `uap pawn place <actor> --dist CM`.
 
@@ -2217,6 +2244,15 @@ def _xr_reach(args) -> int:
     try:
         hand = _XR_HANDS[args.hand]
         offset = _reach_offset(args)
+        tgt = _INSTANCE_TARGET[0]
+        if tgt and tgt.get("role") == "game":
+            raise AgentError(
+                ErrorCode.SCHEMA_VALIDATION,
+                "xr reach reads the pawn/item geometry with editor Python in a PIE world; a -game "
+                "client has no editor world (UAP_WORLD is None, so the probe saw 'no controlled "
+                "pawn') and editor-only Python can kill it (known-issues #31). Pose it by "
+                "coordinates with `uap xr pose --instance ...`. A runtime (C++) reach probe is "
+                "the open work [17tm46799m0].", recoverable=False)
         probe = _exec_probe(_xrr.reach_code(args.hand, args.target, offset), args)
         if not probe.get("ok"):
             body.update({"ok": False, "error": probe.get("error", "probe failed")})
@@ -4779,6 +4815,13 @@ def build_parser() -> argparse.ArgumentParser:
         xg.set_defaults(func=_xr)
 
     # PIE pawn placement: the PIE-safe way to put the pawn next to a test object.
+    gm = sub.add_parser("game", help="control a standalone -game client (needs --instance)")
+    gms = gm.add_subparsers(dest="game_cmd", required=True)
+    gc = gms.add_parser("close", parents=[proj],
+                        help="close the client's window in-engine (RequestDestroyWindow, the path a "
+                             "player's X takes); no OS input, no activation")
+    gc.add_argument("--window", action="store_true", help="accepted for clarity; the window is what closes")
+    gc.set_defaults(func=_game)
     pw = sub.add_parser("pawn", help="move the PIE pawn in-engine (teleport / place next to an actor)")
     pws = pw.add_subparsers(dest="pawn_cmd", required=True)
     pt = pws.add_parser("teleport", parents=[proj],
