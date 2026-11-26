@@ -100,3 +100,12 @@ def _no_exec_callback_release(monkeypatch):
     Python-remote-exec client (UDP discovery). A test run must never go looking for an editor.
     Tests of the release itself import the real function at module import time."""
     monkeypatch.setattr(cli, "_release_exec_callbacks", lambda project, agent: None)
+
+
+@pytest.fixture(autouse=True)
+def _no_default_head(monkeypatch):
+    """`pie start` places a standing head over RC; tests with strict RC stubs must not see it.
+
+    tests/test_cli_pie_default_head.py opts back in by restoring the real function."""
+    from unreal_agent_player import cli
+    monkeypatch.setattr(cli, "_pie_default_head", lambda args: {"applied": False, "skipped": "test"})

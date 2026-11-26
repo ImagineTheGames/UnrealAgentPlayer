@@ -1517,6 +1517,43 @@ def _pie_start_timed_out(seconds: float) -> str:
     )
 
 
+# A VR pawn in PIE with no headset has its HMD at the tracking origin, so the camera sits ON THE
+# FLOOR and every screenshot / editor view shows the floor. `pie start` therefore places a standing
+# head for every PIE client once the world is live. The plugin re-applies the head each frame and
+# re-targets after possession / respawn, and drops it when the session ends, so this one call
+# lasts the whole session. A test overrides it with `uap xr pose head ...`, or stops it with
+# `uap xr clear head` / `pie start --no-head`.
+_DEFAULT_EYE_HEIGHT_CM = 170.0
+
+
+def _default_head_height(args) -> float:
+    explicit = getattr(args, "head_height", None)
+    if explicit is not None:
+        return float(explicit)
+    return _float_env("UAP_HEAD_HEIGHT", _DEFAULT_EYE_HEIGHT_CM)
+
+
+def _pie_default_head(args) -> dict:
+    """Best-effort standing head for a flat PIE session. Never fails the start: reports instead."""
+    z = _default_head_height(args)
+    info: dict = {"eye_height_cm": z}
+    try:
+        _xr_require_head_support(args.project)
+        params = {"Hand": "Head", "Position": {"X": 0.0, "Y": 0.0, "Z": z},
+                  "Orientation": {"Pitch": 0.0, "Yaw": 0.0, "Roll": 0.0}, "bTracked": True,
+                  "Client": "all"}
+        try:
+            applied = bool(_rc_call("InjectXRControllerPose", params, args.project))
+        except AgentError:
+            params.pop("Client")
+            applied = bool(_rc_call("InjectXRControllerPose", params, args.project))
+        info["applied"] = applied
+    except AgentError as exc:
+        info["applied"] = False
+        info["note"] = f"default head not placed: {exc}"
+    return info
+
+
 def _pie(args) -> int:
     """Start/stop PIE via the plugin's version-correct RC verbs, so agents never touch the raw,
     version-fragile engine subsystem.
@@ -1573,6 +1610,9 @@ def _pie(args) -> int:
                     if waited["playing"]:
                         _note_pie_started(args.project, getattr(args, "agent", None),
                                           requested_at, _coord._now(), "pie start")
+                        if (getattr(args, "mode", "flat") or "flat") == "flat" \
+                                and not getattr(args, "no_head", False):
+                            body["default_head"] = _pie_default_head(args)
                     if not waited["playing"]:
                         # A start we could not confirm IS still queued -- say so here, where it is
                         # true, and never as a cheerful ok.
@@ -3695,6 +3735,10 @@ PLAY-IN-EDITOR
                                   --timeout / $UAP_PIE_START_TIMEOUT) it FAILS and says the
                                   session may still be queued -- never a cheerful ok.
                                   (Version-correct; do NOT use PlayWorldEditorSubsystem.)
+                                  Flat PIE also places a standing HEAD (170 cm, every client,
+                                  kept across respawn) so a VR pawn's camera is not on the floor;
+                                  --head-height CM / $UAP_HEAD_HEIGHT, --no-head, or override with
+                                  `uap xr pose head`.
   uap pie start --no-wait         fire-and-forget: return as soon as the session is QUEUED
                                   (queued:true, confirmed:false). The world does NOT exist when it
                                   returns -- follow with `pie wait` and never end a turn on it.
@@ -4612,6 +4656,13 @@ def build_parser() -> argparse.ArgumentParser:
                          "$UAP_PIE_START_TIMEOUT). A normal start is 1-5s. On timeout the verb "
                          "FAILS and says the session may still be queued, rather than acking a "
                          "start that has not happened.")
+    ps.add_argument("--no-head", dest="no_head", action="store_true",
+                    help="do not place the default standing head. A VR pawn in flat PIE has no "
+                         "HMD, so its camera would sit on the floor; by default `pie start` puts "
+                         "the head at eye height (every client, kept across respawn).")
+    ps.add_argument("--head-height", dest="head_height", type=float, default=None,
+                    help="eye height of the default head, tracking-space cm "
+                         "(default 170, $UAP_HEAD_HEIGHT)")
     ps.set_defaults(func=_pie)
     pst = pie.add_parser("stop", parents=[proj])
     pst.add_argument("--timeout", type=float, default=None,
