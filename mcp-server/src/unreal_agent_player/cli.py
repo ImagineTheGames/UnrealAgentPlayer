@@ -3558,7 +3558,7 @@ def _net_emulation_refusal(text: str, project: str | None, *, scan: bool) -> str
 
 
 _LEVEL_OPEN_TIMEOUT = 180.0
-_LEVEL_POLL_PROBE_TIMEOUT = 3.0
+_LEVEL_POLL_PROBE_TIMEOUT = 8.0  # 3.0 -> abandoned polls -> editor socket_send_failure Error
 
 
 def _level_open(args) -> dict:
