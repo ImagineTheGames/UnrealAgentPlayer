@@ -190,15 +190,23 @@ def test_stale_down_since_plus_one_lone_failure_never_evicts(monkeypatch):
 
 
 def test_eviction_needs_repeat_failures_not_one(monkeypatch):
-    monkeypatch.setenv("UAP_RC_STREAK_GAP", "10")
+    """Deterministic (fake clock): the evict grace has passed after reading 1, yet only the
+    third continuous unreachable reading voids the lease."""
+    clock = [1000.0]
+    def _tick():
+        clock[0] += 0.002           # keeps acquire's own wait loop finite
+        return clock[0]
+    monkeypatch.setattr(co, "_now", _tick)
+    monkeypatch.setenv("UAP_RC_STREAK_GAP", "100")
     rc = Rc(monkeypatch, True)
     assert _ask("verify", "pie")["granted"]
     rc.answer = False
-    _ask("w", "pie", wait=30, max_block=0.01)
-    time.sleep(2.2)                                    # grace passed, only 1 reading so far
-    _ask("w", "pie", wait=30, max_block=0.01)          # 2nd reading
+    _ask("w", "pie", wait=30, max_block=0.01)          # reading 1
+    clock[0] += 60
+    _ask("w", "pie", wait=30, max_block=0.01)          # reading 2
+    clock[0] += 60                                     # 120s down, past the 2s grace
     assert co.status(PROJ)["exclusive"]["agent"] == "verify"
-    _ask("w", "pie", wait=30, max_block=0.01)          # 3rd confirms
+    _ask("w", "pie", wait=30, max_block=0.01)          # reading 3 confirms
     ev = co.status(PROJ)["last_eviction"]
     assert ev and ev["why"] == co.EVICT_EDITOR_UNRESPONSIVE
     assert ev["evidence"]["unreachable_readings"] == 3
