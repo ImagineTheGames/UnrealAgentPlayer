@@ -662,6 +662,17 @@ _editor_probe: Callable[[str | None], bool | None] = editor_running
 EVICT_EDITOR_UNRESPONSIVE = "editor_unresponsive"
 RC_DOWN_GRACE = 30.0
 RC_EVICT_GRACE = 120.0
+# An eviction needs CONFIRMED, CONTINUOUS evidence, not one old timestamp (2026-11-28: a holder's
+# lease was voided "121s unreachable" although its own Remote Control calls were answered 37s
+# earlier -- `rc_down_since` outlived the stall because only a waiter's own probe ever cleared it,
+# and the next lone unreachable reading was added onto it). So: at least RC_EVICT_CONFIRMS
+# unreachable readings, each at most RC_STREAK_GAP after the previous one (a longer silence means
+# nobody was watching, so the streak restarts), spaced RC_CONFIRM_SPACING apart (the 3 s probe
+# cache must not count one reading twice), and the evicting call must itself have just read
+# "unreachable".
+RC_EVICT_CONFIRMS = 3
+RC_STREAK_GAP = 45.0
+RC_CONFIRM_SPACING = 5.0
 _RC_PROBE_OFF = {"0", "false", "no", "off"}
 _RC_UP_CACHE_SECONDS = 5.0
 _RC_DOWN_CACHE_SECONDS = 3.0
@@ -682,6 +693,18 @@ def rc_down_grace() -> float:
 
 def rc_evict_grace() -> float:
     return _env_seconds("UAP_RC_EVICT_GRACE", RC_EVICT_GRACE)
+
+
+def rc_evict_confirms() -> int:
+    return max(1, int(_env_seconds("UAP_RC_EVICT_CONFIRMS", RC_EVICT_CONFIRMS)))
+
+
+def rc_streak_gap() -> float:
+    return _env_seconds("UAP_RC_STREAK_GAP", RC_STREAK_GAP)
+
+
+def rc_confirm_spacing() -> float:
+    return _env_seconds("UAP_RC_CONFIRM_SPACING", RC_CONFIRM_SPACING)
 
 
 def _probe_rc_live(project: str | None) -> bool | None:
@@ -726,10 +749,22 @@ def rc_reachable(project: str | None) -> bool | None:
 
 
 def _note_rc(state: dict, rc: bool | None) -> None:
+    now = _now()
     if rc is True:
-        state.pop("rc_down_since", None)
+        for k in ("rc_down_since", "rc_down_last", "rc_down_count"):
+            state.pop(k, None)
+        state["rc_last_up"] = now
     elif rc is False:
-        state.setdefault("rc_down_since", _now())
+        last = state.get("rc_down_last")
+        if (not state.get("rc_down_since") or last is None
+                or now - float(last) > rc_streak_gap()):
+            # No continuous watch: an old sighting says nothing about the silence since.
+            state["rc_down_since"] = now
+            state["rc_down_count"] = 1
+            state["rc_down_last"] = now
+        elif now - float(last) >= rc_confirm_spacing():
+            state["rc_down_count"] = int(state.get("rc_down_count", 1)) + 1
+            state["rc_down_last"] = now
 
 
 def _rc_down_for(state: dict) -> float:
@@ -856,7 +891,8 @@ def _mid_rebuild(state: dict) -> bool:
     return any(h and _is_rebuild_reason(h.get("reason")) for h in held)
 
 
-def _evict_dead_editor(state: dict, project: str | None) -> dict | None:
+def _evict_dead_editor(state: dict, project: str | None,
+                       rc: bool | None = None) -> dict | None:
     """Void a `pie`/`level` exclusive lease whose editor is gone. Returns the eviction record.
 
     Leaves a note for the evicted holder (`evicted`, consumed by `take_eviction_notice`) and a
@@ -879,20 +915,33 @@ def _evict_dead_editor(state: dict, project: str | None) -> dict | None:
         down = _rc_down_for(state)
         if not (down > 0 and down >= rc_evict_grace()):
             return None
+        count = int(state.get("rc_down_count", 0))
+        last = state.get("rc_down_last")
+        if (rc is not False or count < rc_evict_confirms() or last is None
+                or _now() - float(last) > rc_streak_gap()):
+            return None                  # one stale/lone reading is not a hang
+        evidence = {"unreachable_readings": count, "first_unreachable_s_ago": round(down),
+                    "last_unreachable_s_ago": round(_now() - float(last)),
+                    "last_answered_s_ago": (round(_now() - float(state["rc_last_up"]))
+                                            if state.get("rc_last_up") else None)}
         why = EVICT_EDITOR_UNRESPONSIVE
         msg = (f"lease_evicted: {EVICT_EDITOR_UNRESPONSIVE} -- the {key} editor process is up but "
-               f"Remote Control has not answered for {round(down)}s (hung, e.g. a GPU device "
-               f"hang), so your '{ex.get('reason')}' lease protected nothing and was released. "
+               f"Remote Control has not answered for {round(down)}s ({count} consecutive "
+               f"unreachable probes, last {evidence['last_unreachable_s_ago']}s ago; last answer "
+               f"seen by the lease: {evidence['last_answered_s_ago']}s ago) (hung, e.g. a GPU "
+               f"device hang), so your '{ex.get('reason')}' lease protected nothing and was "
+               f"released. "
                f"A relaunch (Restart-Editor.ps1) is queued or needed. Re-acquire once the "
                f"editor is back.")
     else:
         why = EVICT_EDITOR_NOT_RUNNING
+        evidence = {"process_probe": "editor process not found"}
         msg = (f"lease_evicted: {EVICT_EDITOR_NOT_RUNNING} -- the {key} editor process is "
                f"gone, so your '{ex.get('reason')}' lease protected nothing and was "
                f"voided. Any PIE session or loaded level died with the editor. "
                f"Re-acquire once the editor is back.")
     rec = {"agent": ex.get("agent"), "held_reason": ex.get("reason"),
-           "why": why, "evicted_at": _now(),
+           "why": why, "evicted_at": _now(), "evidence": evidence,
            "acquired_at": ex.get("acquired_at"), "project": key, "message": msg}
     state["exclusive"] = None
     now = _now()
@@ -958,7 +1007,7 @@ def _refresh(project: str | None, rc: bool | None = None) -> tuple[dict, dict | 
     state = _evict_stale(state)
     if aged_out is not None and state.get("exclusive") is None:
         _note_pending_reap(state, aged_out)
-    evicted = _evict_dead_editor(state, project)
+    evicted = _evict_dead_editor(state, project, rc)
     _evict_stale_waiters(state)
     _prune_records(state)
     _rebuild_first(state, project)

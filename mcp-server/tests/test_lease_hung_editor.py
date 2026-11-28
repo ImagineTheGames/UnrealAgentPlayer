@@ -23,6 +23,8 @@ def _env(tmp_path, monkeypatch):
     monkeypatch.setenv("UAP_PIE_REAPER", "0")
     monkeypatch.setenv("UAP_RC_DOWN_GRACE", "0.2")
     monkeypatch.setenv("UAP_RC_EVICT_GRACE", "2.0")
+    monkeypatch.setenv("UAP_RC_CONFIRM_SPACING", "0")
+    monkeypatch.setenv("UAP_RC_STREAK_GAP", "1.0")
     monkeypatch.setattr(co, "POLL_SECONDS", 0.05)
     monkeypatch.setattr(co, "_RC_UP_CACHE_SECONDS", 0.0)
     monkeypatch.setattr(co, "_RC_DOWN_CACHE_SECONDS", 0.0)
@@ -115,13 +117,18 @@ def test_pie_lease_on_a_hung_editor_is_released_after_the_grace(monkeypatch):
     rc.answer = False
     _ask("rl", "relaunch-preflight", wait=30, max_block=0.01)     # notices: down_since set
     assert co.status(PROJ)["exclusive"]["agent"] == "tooltips", "evicted inside the grace"
-    time.sleep(2.2)                                                  # past the 2s evict grace
+    for _ in range(4):                                # a continuous watch, each reading < gap
+        time.sleep(0.55)
+        _ask("rl", "relaunch-preflight", wait=30, max_block=0.01)
     r = _ask("rl", "relaunch-preflight", wait=0.5, max_block=0.4)
     assert r["granted"], r
     ev = co.status(PROJ)["last_eviction"]
     assert ev["why"] == co.EVICT_EDITOR_UNRESPONSIVE and ev["agent"] == "tooltips"
     note = co.take_eviction_notice(PROJ, agent="tooltips")
     assert note and "relaunch" in note["message"].lower()
+    # The eviction names its evidence.
+    assert ev["evidence"]["unreachable_readings"] >= 3, ev
+    assert "consecutive" in note["message"] and "probes" in note["message"]
 
 
 def test_a_brief_stall_that_recovers_never_evicts_or_refuses(monkeypatch):
@@ -163,3 +170,52 @@ def test_undecidable_probe_changes_nothing(monkeypatch):
     r = _ask("w", "pie")
     assert r["busy"] and not r.get("editor_down")
     assert co.status(PROJ)["exclusive"]["agent"] == "holder"
+
+
+def test_stale_down_since_plus_one_lone_failure_never_evicts(monkeypatch):
+    """2026-11-28 (job 45d5874f): a sighting made while the editor stalled stayed stored after
+    the editor recovered (the holder's own calls were answered, nobody probed True), and the next
+    lone unreachable reading counted as 121 s of continuous silence and voided a live lease."""
+    rc = Rc(monkeypatch, True)
+    assert _ask("verify", "pie")["granted"]
+    rc.answer = False
+    _ask("w", "pie", wait=30, max_block=0.01)          # stall seen once: down_since set
+    rc.answer = None                                   # recovered, but no waiter probed it
+    time.sleep(2.5)                                    # past the evict grace AND the streak gap
+    rc.answer = False                                  # one new transient failure
+    _ask("w", "pie", wait=30, max_block=0.01)
+    _ask("rl", "relaunch-preflight", wait=0.3, max_block=0.1)
+    assert co.status(PROJ)["exclusive"]["agent"] == "verify", co.status(PROJ)
+    assert co.status(PROJ).get("last_eviction") is None
+
+
+def test_eviction_needs_repeat_failures_not_one(monkeypatch):
+    """Deterministic (fake clock): the evict grace has passed after reading 1, yet only the
+    third continuous unreachable reading voids the lease."""
+    clock = [1000.0]
+    def _tick():
+        clock[0] += 0.002           # keeps acquire's own wait loop finite
+        return clock[0]
+    monkeypatch.setattr(co, "_now", _tick)
+    monkeypatch.setenv("UAP_RC_STREAK_GAP", "100")
+    rc = Rc(monkeypatch, True)
+    assert _ask("verify", "pie")["granted"]
+    rc.answer = False
+    _ask("w", "pie", wait=30, max_block=0.01)          # reading 1
+    clock[0] += 60
+    _ask("w", "pie", wait=30, max_block=0.01)          # reading 2
+    clock[0] += 60                                     # 120s down, past the 2s grace
+    assert co.status(PROJ)["exclusive"]["agent"] == "verify"
+    _ask("w", "pie", wait=30, max_block=0.01)          # reading 3 confirms
+    ev = co.status(PROJ)["last_eviction"]
+    assert ev and ev["why"] == co.EVICT_EDITOR_UNRESPONSIVE
+    assert ev["evidence"]["unreachable_readings"] == 3
+
+
+def test_an_answer_resets_the_streak():
+    st = {}
+    for _ in range(3):
+        co._note_rc(st, False)
+    assert st["rc_down_since"] and st["rc_down_last"]
+    co._note_rc(st, True)
+    assert "rc_down_count" not in st and "rc_down_since" not in st and st["rc_last_up"]
