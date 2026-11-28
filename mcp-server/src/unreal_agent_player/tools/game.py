@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 import subprocess
 from typing import Any
@@ -15,6 +16,36 @@ from unreal_agent_player.tools import machine as _machine
 
 _PROCS: dict[str, subprocess.Popen] = {}
 _REG_FILES: dict[str, Any] = {}
+# Per-project default launch args. A project drops this file next to its .uproject; every uap
+# game launch for that project then carries those args, so a project-wide trap (e.g. a login flow
+# that opens a browser on the human's screen) is fixed once, in the project, not per caller.
+# Shape: {"default_args": ["-flag", ...]}. Opt out per call (default_args=False) or with
+# UAP_NO_PROJECT_LAUNCH_ARGS=1, for tests of the real flow the defaults suppress.
+LAUNCH_ARGS_FILE = "uap-launch.json"
+
+
+def project_launch_args() -> list[str]:
+    """Default args from <uproject dir>/uap-launch.json. Missing/unreadable file -> []."""
+    if os.environ.get("UAP_NO_PROJECT_LAUNCH_ARGS", "").strip() not in ("", "0"):
+        return []
+    uproject = os.environ.get("UAP_UPROJECT", r"E:\ImagineGames\SchoolsOutVR\SchoolsOut.uproject")
+    path = os.path.join(os.path.dirname(uproject), LAUNCH_ARGS_FILE)
+    try:
+        with open(path, encoding="utf-8-sig") as fh:
+            data = json.load(fh)
+        args = data.get("default_args", []) if isinstance(data, dict) else []
+        return [str(a) for a in args if str(a).strip()]
+    except (OSError, ValueError):
+        return []
+
+
+def merge_launch_args(defaults: list[str], extra: list[str] | None) -> list[str]:
+    """Defaults first; an explicit extra arg with the same key (text before '=') wins."""
+    given = {a.split("=", 1)[0].lower() for a in (extra or [])}
+    kept = [a for a in defaults if a.split("=", 1)[0].lower() not in given]
+    return kept + list(extra or [])
+
+
 _RUNTIME_OBJ = "/Script/UnrealAgentPlayerRuntime.Default__UAPAgentRuntimeSubsystem"
 
 
@@ -78,6 +109,7 @@ async def game_launch(
     *, registry: InstanceRegistry, rc: Any = None, py_exec: Any = None,
     target: str = "standalone", map: str | None = None,
     extra_args: list[str] | None = None, no_vr: bool = True,
+    default_args: bool = True,
 ) -> dict[str, Any]:
     # A game client is a game window: it needs the machine-wide lock exactly as PIE does, and holds
     # it for as long as the process lives (the hold tracks its pid and frees itself on exit).
@@ -85,6 +117,8 @@ async def game_launch(
     if refusal is not None:
         return refusal
     port = registry.next_free_port()
+    if default_args:
+        extra_args = merge_launch_args(project_launch_args(), extra_args)
     try:
         proc = _spawn(port, map, extra_args, no_vr)
     except Exception:

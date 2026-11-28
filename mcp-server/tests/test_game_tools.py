@@ -75,3 +75,52 @@ async def test_game_tools_registered(tmp_path):
     names = {t.name for t in tools}
     assert {"game_launch", "game_attach", "game_list", "game_stop"} <= names
     assert any(t.name == "input_key" and "target" in t.inputSchema.get("properties", {}) for t in tools)
+
+
+def _capture(monkeypatch):
+    seen = {}
+    def _fake(port, mapname, extra, no_vr=True):
+        seen["extra"] = extra
+        return FakeProc()
+    monkeypatch.setattr(game_mod, "_spawn", _fake)
+    async def _ready(port): return True
+    monkeypatch.setattr(game_mod, "_wait_rc_ready", _ready)
+    return seen
+
+
+def _project(tmp_path, monkeypatch, args):
+    import json
+    (tmp_path / "uap-launch.json").write_text(json.dumps({"default_args": args}))
+    monkeypatch.setenv("UAP_UPROJECT", str(tmp_path / "P.uproject"))
+    monkeypatch.delenv("UAP_NO_PROJECT_LAUNCH_ARGS", raising=False)
+
+
+@pytest.mark.asyncio
+async def test_game_launch_applies_project_default_args(monkeypatch, tmp_path):
+    _project(tmp_path, monkeypatch, ["-ini:Engine:[X]:Y=Anonymous"])
+    seen = _capture(monkeypatch)
+    r = await game_mod.game_launch(registry=InstanceRegistry(editor_port=30010), extra_args=["-foo"])
+    assert r["ok"] and seen["extra"] == ["-ini:Engine:[X]:Y=Anonymous", "-foo"]
+
+
+@pytest.mark.asyncio
+async def test_game_launch_default_args_opt_out(monkeypatch, tmp_path):
+    _project(tmp_path, monkeypatch, ["-bar"])
+    seen = _capture(monkeypatch)
+    await game_mod.game_launch(registry=InstanceRegistry(editor_port=30010), default_args=False)
+    assert not seen["extra"]
+    monkeypatch.setenv("UAP_NO_PROJECT_LAUNCH_ARGS", "1")
+    await game_mod.game_launch(registry=InstanceRegistry(editor_port=30010))
+    assert not seen["extra"]
+
+
+def test_merge_explicit_arg_overrides_default():
+    assert game_mod.merge_launch_args(["-a=1", "-b"], ["-a=2"]) == ["-b", "-a=2"]
+
+
+def test_missing_or_bad_launch_file_is_empty(monkeypatch, tmp_path):
+    monkeypatch.setenv("UAP_UPROJECT", str(tmp_path / "P.uproject"))
+    monkeypatch.delenv("UAP_NO_PROJECT_LAUNCH_ARGS", raising=False)
+    assert game_mod.project_launch_args() == []
+    (tmp_path / "uap-launch.json").write_text("{nope")
+    assert game_mod.project_launch_args() == []
